@@ -1,148 +1,146 @@
 use crate::tools::{ProjectManager, dispatch_tool};
-use anyhow::Result;
+use crate::watcher;
+use anyhow::{Context, Result};
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    model::{
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    },
+    service::{NotificationContext, RequestContext},
+    transport,
+};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Read, Write};
+use std::future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
-pub fn serve(manager: Arc<ProjectManager>) -> Result<()> {
-    let stdin = io::stdin();
-    let mut reader = io::BufReader::new(stdin.lock());
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
+pub fn serve(manager: Arc<ProjectManager>, watch_enabled: bool) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to create MCP async runtime")?;
+    runtime.block_on(async move {
+        let server = CodedbServer::new(manager, watch_enabled);
+        let running = rmcp::serve_server(server, transport::stdio()).await?;
+        let _ = running.waiting().await?;
+        Ok(())
+    })
+}
 
-    while let Some(message) = read_message(&mut reader)? {
-        if message.trim().is_empty() {
-            continue;
-        }
-        let parsed: Value = match serde_json::from_str(&message) {
-            Ok(value) => value,
-            Err(err) => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": format!("parse error: {err}")},
-                });
-                write_message(&mut writer, &response)?;
-                continue;
+fn start_background_services(
+    manager: Arc<ProjectManager>,
+    watch_enabled: bool,
+) -> Result<Vec<JoinHandle<()>>> {
+    let mut handles = Vec::new();
+    handles.push(start_initial_index(manager.clone())?);
+    if watch_enabled {
+        handles.push(watcher::start_project_watcher(manager)?);
+    }
+    Ok(handles)
+}
+
+fn start_initial_index(manager: Arc<ProjectManager>) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("codebase-mcp-initial-index".to_string())
+        .spawn(move || {
+            if let Err(err) = manager.reindex_default() {
+                eprintln!("codebase-mcp initial index failed: {err:#}");
             }
+        })
+        .context("failed to spawn initial index thread")
+}
+
+struct CodedbServer {
+    manager: Arc<ProjectManager>,
+    watch_enabled: bool,
+    startup_started: AtomicBool,
+}
+
+impl CodedbServer {
+    fn new(manager: Arc<ProjectManager>, watch_enabled: bool) -> Self {
+        Self {
+            manager,
+            watch_enabled,
+            startup_started: AtomicBool::new(false),
+        }
+    }
+
+    fn start_background_services_once(&self) {
+        if self
+            .startup_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let Err(err) = start_background_services(self.manager.clone(), self.watch_enabled) {
+            eprintln!("codebase-mcp background startup failed: {err:#}");
+        }
+    }
+}
+
+impl ServerHandler for CodedbServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codedb-mcp", env!("CARGO_PKG_VERSION")))
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        future::ready(list_tools_result())
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        tools_from_json()
+            .ok()
+            .and_then(|tools| tools.into_iter().find(|tool| tool.name == name))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let text = dispatch_tool(self.manager.as_ref(), request.name.as_ref(), &args);
+        let is_error = text.starts_with("error:");
+        let content = vec![Content::text(text)];
+        let result = if is_error {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
         };
-
-        if let Some(batch) = parsed.as_array() {
-            let responses = batch
-                .iter()
-                .filter_map(|request| handle_request(&manager, request))
-                .collect::<Vec<_>>();
-            if !responses.is_empty() {
-                write_message(&mut writer, &Value::Array(responses))?;
-            }
-        } else if let Some(response) = handle_request(&manager, &parsed) {
-            write_message(&mut writer, &response)?;
-        }
+        future::ready(Ok(result))
     }
-    Ok(())
+
+    fn on_initialized(
+        &self,
+        _context: NotificationContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        self.start_background_services_once();
+        future::ready(())
+    }
 }
 
-fn handle_request(manager: &ProjectManager, request: &Value) -> Option<Value> {
-    let id = request.get("id").cloned();
-    let method = request
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let is_notification = id.is_none();
+fn list_tools_result() -> Result<ListToolsResult, McpError> {
+    tools_from_json().map(ListToolsResult::with_all_items)
+}
 
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": {
-                "name": "codebase-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "tools": {"listChanged": false}
-            }
-        })),
-        "notifications/initialized" | "notifications/cancelled" => return None,
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list()),
-        "tools/call" => {
-            let params = request.get("params").unwrap_or(&Value::Null);
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = params.get("arguments").unwrap_or(&Value::Null);
-            if name.is_empty() {
-                Ok(tool_text("error: missing tool name".to_string(), true))
-            } else {
-                let text = dispatch_tool(manager, name, args);
-                let is_error = text.starts_with("error:");
-                Ok(tool_text(text, is_error))
-            }
-        }
-        _ => Err((-32601, format!("method not found: {method}"))),
+fn tools_from_json() -> Result<Vec<Tool>, McpError> {
+    let Some(tools_value) = tools_list().get("tools").cloned() else {
+        return Err(McpError::internal_error("codedb tool list is malformed", None));
     };
-
-    if is_notification {
-        return None;
-    }
-    let id = id.unwrap_or(Value::Null);
-    Some(match result {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": code, "message": message},
-        }),
+    serde_json::from_value(tools_value).map_err(|err| {
+        McpError::internal_error(format!("failed to build codedb MCP tool list: {err}"), None)
     })
 }
 
-fn tool_text(text: String, is_error: bool) -> Value {
-    json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": is_error
-    })
-}
-
-fn read_message<R: BufRead + Read>(reader: &mut R) -> Result<Option<String>> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        if !line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-        let len = value.trim().parse::<usize>()?;
-        loop {
-            line.clear();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-        }
-        let mut body = vec![0u8; len];
-        reader.read_exact(&mut body)?;
-        return Ok(Some(String::from_utf8_lossy(&body).to_string()));
-    }
-
-    Ok(Some(trimmed.to_string()))
-}
-
-fn write_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
-}
-
-pub fn tools_list() -> Value {
+fn tools_list() -> Value {
     json!({
         "tools": [
             {

@@ -8,7 +8,7 @@ use crate::search::hybrid_search;
 use crate::tokens::has_whole_word;
 use crate::types::{FileEntry, SearchHit, Symbol};
 use anyhow::{Result, anyhow};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -22,18 +22,24 @@ pub struct ProjectManager {
     default_root: PathBuf,
     options: IndexOptions,
     cache: RwLock<HashMap<String, Arc<Codebase>>>,
+    build_lock: Mutex<()>,
 }
 
 impl ProjectManager {
     pub fn new(default_root: PathBuf, options: IndexOptions) -> Result<Self> {
-        let manager = Self {
-            default_root,
-            options,
-            cache: RwLock::new(HashMap::new()),
-        };
+        let manager = Self::new_lazy(default_root, options);
         let root = manager.default_root.clone();
         manager.reindex(&root)?;
         Ok(manager)
+    }
+
+    pub fn new_lazy(default_root: PathBuf, options: IndexOptions) -> Self {
+        Self {
+            default_root,
+            options,
+            cache: RwLock::new(HashMap::new()),
+            build_lock: Mutex::new(()),
+        }
     }
 
     pub fn get(&self, project: Option<&str>) -> Result<Arc<Codebase>> {
@@ -43,6 +49,10 @@ impl ProjectManager {
         }
         .canonicalize()?;
         let key = root.display().to_string();
+        if let Some(index) = self.cache.read().get(&key) {
+            return Ok(index.clone());
+        }
+        let _guard = self.build_lock.lock();
         if let Some(index) = self.cache.read().get(&key) {
             return Ok(index.clone());
         }
@@ -56,6 +66,7 @@ impl ProjectManager {
     pub fn reindex(&self, path: &Path) -> Result<Arc<Codebase>> {
         let root = path.canonicalize()?;
         let key = root.display().to_string();
+        let _guard = self.build_lock.lock();
         let old = self.cache.read().get(&key).cloned();
         let mut index = Codebase::index(&root, self.options.clone())?;
         index.changed_files = match old.as_deref() {

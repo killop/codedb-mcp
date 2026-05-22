@@ -31,7 +31,7 @@ Read `references/mcp-install.md` when registering the server. The essential comm
 <skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
 ```
 
-For an agent MCP config, register the executable as the command and pass the remaining items as args. Keep the server alive for editor/agent workflows; one-shot process startup includes index load time and is not representative of warm tool latency.
+For an agent MCP config, register the executable as the command and pass the remaining items as args. MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first, and builds the default project index in the background; early tool calls may wait until that initial index is ready. Keep the server alive for editor/agent workflows because warm tool latency is the representative number.
 
 ## Tool Use
 

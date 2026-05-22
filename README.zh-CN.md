@@ -2,9 +2,160 @@
 
 [English README](README.md)
 
-`codebase-mcp` 是一个 Rust 实现的本地 MCP Server，提供兼容 `codedb_*` 的工具接口，用于在大型代码库上做代码搜索、符号大纲、引用查找、依赖分析、图分析和本地 DeepWiki 生成。
+`codebase-mcp` 是一个 Rust 实现的本地 MCP Server，提供兼容 `codedb_*` 的工具接口，用于大型代码库的代码搜索、符号大纲、引用查找、依赖分析、图分析和本地 DeepWiki 生成。
 
-核心目标是：数据本地化、配置显式化、索引可复用、工具响应快，并且可以作为独立 skill 复制到其他环境中使用。
+推荐的部署方式是 skill-first：先安装或复制 `skills/codedb-mcp`，再让这个 skill 指导 agent 初始化 `.codedb-mcp` 并显式注册 MCP。setup 脚本只准备本地文件并打印 MCP 命令，不会偷偷修改全局 MCP 配置。
+
+## Benchmark 速览
+
+测试目标：`u3dclient`。
+
+当前 C#/Java 配置索引状态：
+
+- 18,975 indexed files
+- 129,165 chunks
+- 275,878 symbols
+- 295,753 graph nodes
+- 688,566 graph edges
+- Model2Vec `minishlab/potion-code-16M`
+- Vicinity HNSW file vectors
+- 存储目录：`u3dclient\.codedb-mcp`
+
+索引耗时：
+
+| 场景 | Cache | 耗时 | 说明 |
+|---|---|---:|---|
+| tree-sitter cold build | miss | 44.876s | scan、tree-sitter 声明解析、embedding、graph、BM25、HNSW、cache save |
+| 不变文件再次打开 | hit | 39.546s | 复用 parsed files、chunks、semantic units、embeddings；重建运行时 graph/BM25/HNSW |
+| 单次 CLI `codedb_status` | hit | 39.4s | 包含进程启动和 index load；真实使用应保持 MCP 常驻 |
+
+Java 工程 `gameserver`：
+
+| 场景 | Files | Chunks | Symbols | 耗时 |
+|---|---:|---:|---:|---:|
+| cold build | 6,940 | 55,057 | 245,238 | 16.919s |
+| cache hit | 6,940 | 55,057 | 245,238 | 11.527s |
+
+多语言 smoke benchmark：C#、Java、Python、TypeScript、C++ 共 5 个文件，5 chunks，12 symbols，1.147s。
+
+下面的 warm MCP 工具耗时都不包含 MCP 进程启动和 index load。
+
+## MCP vs rg
+
+对于精确文本和 regex 搜索，`codedb_search regex=true` 和 `rg` 都能回答。`rg` 基准使用 `--no-ignore`，因为这个 Unity 项目刻意包含 `Library/PackageCache`。
+
+| 场景 | MCP tool | MCP hits | MCP 耗时 | rg baseline | rg hits | rg 耗时 |
+|---|---|---:|---:|---|---:|---:|
+| Exact `PoolManager` | `codedb_search regex=true` | 154 | 0.2234s | `rg --no-ignore -n -i -F` | 154 | 1.7201s |
+| Exact `Joystick` | `codedb_search regex=true` | 938 | 0.2343s | `rg --no-ignore -n -i -F` | 938 | 1.9419s |
+| Exact `NetworkListenerManager` | `codedb_search regex=true` | 14 | 0.1973s | `rg --no-ignore -n -i -F` | 14 | 1.7486s |
+| Exact `GameObjectPoolMgr` | `codedb_search regex=true` | 8 | 0.2210s | `rg --no-ignore -n -i -F` | 8 | 2.1606s |
+| Exact `AllianceManager` | `codedb_search regex=true` | 16 | 0.2190s | `rg --no-ignore -n -i -F` | 16 | 1.7719s |
+| Joystick Pack 内 scoped `Joystick` | `codedb_search regex=true path_glob=...` | 46 | 0.0063s | scoped `rg --no-ignore -n -i -F` | 46 | 0.0415s |
+| UnityNativeTools 内 scoped `NetworkListenerManager` | `codedb_search regex=true path_glob=...` | 14 | 0.0064s | scoped `rg --no-ignore -n -i -F` | 14 | 0.0414s |
+| `Assets/Scripts` 内 Alliance UI/proto regex | `codedb_search regex=true path_glob=...` | 409 | 0.0635s | scoped `rg --no-ignore -n -i` | 409 | 0.4137s |
+| Alliance UI `.cs` 文件 glob | `codedb_glob` | 52 | 0.0044s | `rg --files --no-ignore -g` | 52 | 0.5748s |
+
+功能对比：
+
+| 能力 | codedb-mcp | rg |
+|---|---|---|
+| 原始精确 grep | 支持，`codedb_search regex=true` 走索引 | 支持 |
+| Regex 行搜索 | 支持，限定在配置源码语料 | 支持，直接扫文件系统 |
+| 路径/文件范围过滤 | 支持，`path_glob`、`codedb_find`、`codedb_query` | 支持，`-g` 和路径参数 |
+| 模糊文件查找 | 支持，`codedb_find` 排名 | 不直接支持 |
+| 词法 + 向量混合搜索 | 支持，BM25 + Model2Vec + Vicinity | 不支持 |
+| 符号大纲 | 支持，`codedb_outline` 读预计算 tree-sitter symbols | 不支持 |
+| 定义锚定引用查找 | 支持，`codedb_callers` | 不支持语义锚定 |
+| 文件依赖图 | 支持，`codedb_deps` | 不支持 |
+| 代码图分析/导出 | 支持，`codedb_graph`、`codedb_analyze`、`codedb_export` | 不支持 |
+| 一次 MCP 请求内批量调用 | 支持，batch 参数和 `codedb_bundle` | 不适用 |
+| 任意未索引文件/二进制/普通文本 | 不适合，只索引配置里的源码扩展 | 适合 |
+
+MCP-only 实测能力：
+
+| 场景 | MCP tool | 结果 | 耗时 | rg 等价能力 |
+|---|---|---:|---:|---|
+| `PoolManager` 相关 chunk 混合搜索 | `codedb_search` | 20 | 0.0198s | 无 |
+| `Joystick` 相关 chunk 混合搜索 | `codedb_search` | 20 | 0.0666s | 无 |
+| `NetworkListenerManager` 相关 chunk 混合搜索 | `codedb_search` | 20 | 0.0271s | 无 |
+| `Assets/Scripts` 下业务语义搜索：`alliance member ranking donation gift` | `codedb_search path_glob=...` | 20 | 0.0358s | 无 |
+| `PoolManager.cs:26` 定义锚定引用 | `codedb_callers` | 7 | 0.0045s | 无 |
+| `Joystick.cs:8` 定义锚定引用 | `codedb_callers` | 7 | 0.0069s | 无 |
+
+结论：`rg` 仍然适合临时扫任意文件；`codedb-mcp` 适合在配置好的源码语料上做反复、低延迟、代码感知的查询。
+
+## Warm MCP 工具验证
+
+这些调用在一个已经启动的 MCP 进程里测量；精确 regex 搜索都用同范围的 `rg --no-ignore` 做了命中数校验。
+
+| 场景 | Tool | 准确性 | avg | p95 |
+|---|---|---:|---:|---:|
+| scoped `PoolManager` exact | `codedb_search regex=true` | MCP 52 = rg 52 | 5.813ms | 5.953ms |
+| scoped `Joystick` exact | `codedb_search regex=true` | MCP 46 = rg 46 | 6.371ms | 6.853ms |
+| scoped `NetworkListenerManager` exact | `codedb_search regex=true` | MCP 14 = rg 14 | 6.486ms | 6.707ms |
+| `PoolManager` hybrid | `codedb_search` | 预期文本存在 | 20.826ms | 21.723ms |
+| `Joystick` hybrid | `codedb_search` | 预期文本存在 | 84.755ms | 84.621ms |
+| `alliance member ranking donation gift` | `codedb_search` | Alliance 结果存在 | 39.849ms | 41.138ms |
+| `PoolManager` refs | `codedb_callers` | 7 refs | 4.518ms | 5.464ms |
+| `Joystick` refs | `codedb_callers` | 7 refs | 7.726ms | 8.692ms |
+| `GameObjectPoolMgr.cs depends_on` | `codedb_deps` | 7 files | 0.244ms | 0.318ms |
+| `NetworkListenerManager.cs imported_by` | `codedb_deps` | 3 files | 0.193ms | 0.212ms |
+| `NetworkListenerManager.cs transitive imported_by` | `codedb_deps` | 16 files | 0.192ms | 0.230ms |
+| `NetworkListenerManager.cs` path lookup | `codedb_find` | top1 correct | 20.259ms | 21.108ms |
+| `Joystick Pack Base Joystick` path lookup | `codedb_find` | top1 correct | 17.710ms | 18.054ms |
+| `ResTypDef` typo-ish lookup | `codedb_find` | 目标 rank 3 | 19.109ms | 20.027ms |
+| `find NetworkListenerManager -> outline` | `codedb_query` | outline 存在 | 20.173ms | 20.505ms |
+| `filter Joystick Pack -> limit 3 -> outline` | `codedb_query` | outline 存在 | 8.017ms | 9.206ms |
+| `filter UnityNativeTools -> search NetworkListenerManager` | `codedb_query` | 结果存在 | 9.650ms | 10.755ms |
+| `find GameObjectPoolMgr -> search PoolManager` | `codedb_query` | 结果存在 | 22.019ms | 23.469ms |
+
+其他工具耗时：
+
+| Tool / 场景 | 结果 | 耗时 |
+|---|---:|---:|
+| `codedb_deps` `GameObjectPoolMgr.cs depends_on` | 7 files | 0.0002s |
+| `codedb_deps` `NetworkListenerManager.cs imported_by` | 3 files | 0.0002s |
+| `codedb_deps` `AndroidPlatform.cs depends_on` | 3 files | 0.0002s |
+| `codedb_outline` `NetworkListenerManager.cs` | 1 symbol | 0.3ms |
+| `codedb_outline` `Joystick.cs` | 17 symbols | 0.3ms |
+| `codedb_outline` `PoolManager.cs` | 32 symbols | 0.2ms |
+| `codedb_outline` `NEON_AArch64.cs` | 2,211 symbols | 1.4ms |
+| 100 次 `codedb_outline compact=true` | p95 | 0.3ms |
+| `codedb_analyze` on `u3dclient` | graph analysis | 约 0.93s |
+
+`codedb_bundle` 一次 MCP 请求最多执行 100 个内部操作；超过 100 个时只执行前 100 个并返回 truncation notice。
+
+| 场景 | 请求内部操作数 | 重复次数 | 实际执行 | 耗时 |
+|---|---:|---:|---:|---:|
+| 快速 metadata/deps/outline/read 混合 bundle | 100 | 1 | 100 | 0.0895s |
+| overflow bundle | 120 | 1 | 100 + truncation notice | 0.0924s |
+| repeated fast bundle | 100 | 50 | 5,000 total | avg 0.0913s, p95 0.1084s |
+| search/callers/deps/outline 混合 bundle | 100 | 1 | 100 | 2.3174s |
+| heavy regex search bundle | 100 | 1 | 100 | 26.0085s |
+
+## 推荐安装流程
+
+1. 先把 `skills/codedb-mcp` 安装或复制到 agent 的 skills 目录。
+2. 在目标项目里，让 agent 使用 `codedb-mcp` skill。
+3. skill 会运行 setup 脚本，创建 `<repo-root>\.codedb-mcp`，写入 `<repo-root>\.codedb-mcp\codedb-mcp.toml`。
+4. setup 脚本会打印 MCP 注册命令，但不会自动安装 MCP。
+5. agent 根据打印的命令，显式把 MCP server 注册到自己的 MCP 配置里。
+6. 重启 agent/Codex session，然后检查 `/mcp`。
+
+从已复制的 skill 初始化目标项目：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File <skill-root>\scripts\setup.ps1 -ProjectRoot <repo-root>
+```
+
+skill 打印的 MCP 命令形态：
+
+```text
+<skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
+```
+
+这个项目刻意保持安装显式化：脚本只初始化项目本地文件，agent/user 决定何时、在哪里注册 MCP。
 
 ## 主要能力
 
@@ -27,7 +178,7 @@
 5. **代码语义增强层**：C#/Java 上继续做 namespace/package import、别名、静态 using、注解、属性后缀、限定名引用等轻量语义推断。
 6. **搜索索引层**：构建 chunks、identifier word hits、symbol definition chunks、BM25、Model2Vec embeddings、Vicinity HNSW。
 7. **依赖与图层**：构建文件、namespace/package、symbol、dependency、reference 等节点和边；Louvain community 懒加载并缓存。
-8. **MCP 工具层**：工具运行在 warm in-process index 上，支持 batch 和 bundle，减少 MCP 往返成本。
+8. **MCP 工具层**：基于 Rust `rmcp` SDK 的 stdio server 实现；工具运行在 warm in-process index 上，支持 batch 和 bundle，减少 MCP 往返成本。
 9. **Skill 打包层**：`skills/codedb-mcp` 内包含最新 `codebase-mcp.exe`、setup 脚本、配置模板和 MCP 安装说明；复制目录即可使用。
 
 ## 配置
@@ -57,43 +208,13 @@ dir = ".codedb-mcp"
 
 `include_paths` 会覆盖被跳过的父目录，例如 Unity 项目中可以跳过 `Library`，但保留 `Library/PackageCache`。
 
-## 构建
+## 构建与 CLI
 
 ```powershell
 cargo build --release
 ```
 
-构建产物：
-
-```text
-target/release/codebase-mcp.exe
-```
-
-当前最新 exe 已同步到：
-
-```text
-skills/codedb-mcp/assets/codebase-mcp.exe
-```
-
-## 安装到目标项目
-
-使用 skill 的 setup 脚本初始化目标项目：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File skills\codedb-mcp\scripts\setup.ps1 -ProjectRoot u3dclient
-```
-
-脚本会：
-
-- 创建 `<repo-root>/.codedb-mcp`
-- 写入 `<repo-root>/.codedb-mcp/codedb-mcp.toml`
-- 打印 MCP 注册命令
-- 迁移旧 `.codebase-mcp` 数据到 `.codedb-mcp`
-- 将旧 `codebase-mcp.toml` 改名为 `codedb-mcp.toml`
-
-脚本不会自动修改全局 MCP 配置。MCP 注册应由 agent 或用户显式完成。
-
-## MCP 启动
+直接启动 MCP：
 
 ```powershell
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml mcp u3dclient
@@ -105,6 +226,8 @@ CLI 快速检查：
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml index u3dclient
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
+
+MCP 模式会先完成协议握手，再在后台构建默认项目索引；如果索引还没完成，早期工具调用会等待首次构建结束。文件监听默认开启，源码变更后会 debounce 并后台重建索引。
 
 ## 工具简介
 
@@ -125,84 +248,15 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml -
 | `codedb_hot` | 最近修改的索引文件 |
 | `codedb_status` | 索引健康状态和统计 |
 
-## Benchmark
+## Skills
 
-测试环境中的大型 Unity 项目：
+`skills/` 目录可以作为独立包复制。
 
-```text
-u3dclient
-```
-
-当前 C#/Java 配置索引状态：
-
-- 18,975 indexed files
-- 129,165 chunks
-- 275,878 symbols
-- 295,753 graph nodes
-- 688,566 graph edges
-- Model2Vec `minishlab/potion-code-16M`
-- Vicinity HNSW file vectors
-
-索引耗时：
-
-| 场景 | Cache | 耗时 |
-|---|---|---:|
-| tree-sitter cold build | miss | 44.876s |
-| 不变文件再次打开 | hit | 39.546s |
-| 单次 CLI `codedb_status` | hit | 39.4s |
-
-Java 工程：
-
-```text
-gameserver
-```
-
-| 场景 | Files | Chunks | Symbols | 耗时 |
-|---|---:|---:|---:|---:|
-| cold build | 6,940 | 55,057 | 245,238 | 16.919s |
-| cache hit | 6,940 | 55,057 | 245,238 | 11.527s |
-
-warm MCP 工具耗时，不包含 MCP 进程启动和 index load：
-
-| 场景 | Tool | 准确性 | avg | p95 |
-|---|---|---:|---:|---:|
-| scoped `PoolManager` exact | `codedb_search regex=true` | MCP 52 = rg 52 | 5.813ms | 5.953ms |
-| scoped `Joystick` exact | `codedb_search regex=true` | MCP 46 = rg 46 | 6.371ms | 6.853ms |
-| scoped `NetworkListenerManager` exact | `codedb_search regex=true` | MCP 14 = rg 14 | 6.486ms | 6.707ms |
-| `PoolManager` refs | `codedb_callers` | 7 refs | 4.518ms | 5.464ms |
-| `Joystick` refs | `codedb_callers` | 7 refs | 7.726ms | 8.692ms |
-| `GameObjectPoolMgr.cs depends_on` | `codedb_deps` | 7 files | 0.244ms | 0.318ms |
-| `NetworkListenerManager.cs imported_by` | `codedb_deps` | 3 files | 0.193ms | 0.212ms |
-| `NetworkListenerManager.cs` path lookup | `codedb_find` | top1 correct | 20.259ms | 21.108ms |
-| `find -> outline` | `codedb_query` | expected outline | 20.173ms | 20.505ms |
-
-## codedb-mcp Skill
-
-`skills/codedb-mcp` 可以作为独立目录复制到其他机器或项目中。目录包含：
-
-- `assets/codebase-mcp.exe`
-- `assets/codedb-mcp.toml.template`
-- `scripts/setup.ps1`
-- `references/mcp-install.md`
-- `references/tools.md`
-- `SKILL.md`
-
-安装 MCP 时，脚本只打印命令，不自动写入全局 MCP 配置。这是为了让 agent 显式安装，避免隐藏副作用。
-
-## deepwiki Skill
-
-`skills/deepwiki` 用本地 `codedb_*` 工具和当前 agent 的推理能力生成 DeepWiki-style 文档，不配置独立大模型 API。
-
-生成目录默认是：
-
-```text
-<repo-root>/.codedb-mcp/deepwiki
-```
-
-设计重点是业务模块优先：基础设施页保持简单，业务模块页更详细，并通过 `codedb_search`、`codedb_deps`、`codedb_callers`、`codedb_graph` 提供代码证据。
+- `skills/codedb-mcp`：包含 `assets/codebase-mcp.exe`、setup 脚本、配置模板、MCP 安装说明和工具使用建议。
+- `skills/deepwiki`：使用本地 `codedb_*` 工具和当前 agent 的推理能力生成 DeepWiki-style 文档，强调业务模块边界，而不是只按文件夹或 community 分组。
 
 ## 发布说明
 
-- 推荐发布时带上 `skills/codedb-mcp`，这样用户复制 skill 后即可初始化项目和注册 MCP。
+- 推荐发布时带上 `skills/codedb-mcp`，让用户先安装 skill，再由 skill 指导 agent 初始化项目和显式注册 MCP。
 - `.codedb-mcp/index.bin`、`.codedb-mcp/manifest.json`、`.codedb-mcp/*.bin` 是项目本地生成物，不建议提交。
 - 旧 `.codebase-mcp` 名称已经迁移为 `.codedb-mcp`；配置文件名也统一为 `codedb-mcp.toml`。

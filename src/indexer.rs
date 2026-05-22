@@ -725,14 +725,7 @@ fn is_skipped_entry(
     for part in parts {
         if matches!(
             part.as_str(),
-            ".git"
-                | ".hg"
-                | ".svn"
-                | ".vs"
-                | ".idea"
-                | ".gradle"
-                | ".codedb-mcp"
-                | "node_modules"
+            ".git" | ".hg" | ".svn" | ".vs" | ".idea" | ".gradle" | ".codedb-mcp" | "node_modules"
         ) {
             return true;
         }

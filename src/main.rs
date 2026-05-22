@@ -74,9 +74,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Mcp { path }) => {
-            let manager = Arc::new(ProjectManager::new(path, options)?);
-            let _watcher = start_watcher_if_enabled(manager.clone(), watch_enabled)?;
-            mcp::serve(manager)
+            let manager = Arc::new(ProjectManager::new_lazy(path, options));
+            mcp::serve(manager, watch_enabled)
         }
         Some(Command::Index { path }) => {
             let manager = ProjectManager::new(path, options)?;
@@ -113,20 +112,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         None => {
-            let manager = Arc::new(ProjectManager::new(cli.root, options)?);
-            let _watcher = start_watcher_if_enabled(manager.clone(), watch_enabled)?;
-            mcp::serve(manager)
+            let manager = Arc::new(ProjectManager::new_lazy(cli.root, options));
+            mcp::serve(manager, watch_enabled)
         }
-    }
-}
-
-fn start_watcher_if_enabled(
-    manager: Arc<ProjectManager>,
-    enabled: bool,
-) -> Result<Option<std::thread::JoinHandle<()>>> {
-    if enabled {
-        watcher::start_project_watcher(manager).map(Some)
-    } else {
-        Ok(None)
     }
 }

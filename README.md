@@ -4,6 +4,157 @@
 
 Rust MCP server with a `codedb_*` compatible tool surface and a local Minish-style search core for tree-sitter indexed codebases.
 
+The intended distribution model is skill-first: install or copy `skills/codedb-mcp`, then let that skill guide the agent to initialize `.codedb-mcp` and explicitly register the MCP server. The setup script prepares local files and prints the command; MCP registration remains an explicit agent/user action.
+
+## Benchmark Snapshot
+
+Benchmark target: `u3dclient`.
+
+Current index status with the existing C#/Java config:
+
+- Indexed files: 18,975.
+- Chunks: 129,165.
+- Symbols: 275,878.
+- Graph: 295,753 nodes and 688,566 edges.
+- Vector index: Vicinity HNSW over Model2Vec `minishlab/potion-code-16M`.
+- Storage: `u3dclient\.codedb-mcp`.
+
+Index timings on this machine:
+
+| Scenario | Cache | Internal total | Notes |
+|---|---|---:|---|
+| Cold tree-sitter `.codedb-mcp` build | miss | 44.876s wall | scan, tree-sitter declaration parse, embeddings, graph, BM25, HNSW, cache save |
+| Reopen with unchanged files/config | hit | 39.546s wall | reuses parsed files, chunks, semantic units, embeddings; rebuilds runtime graph/BM25/HNSW |
+| One-shot `codedb_status` CLI | hit | 39.4s wall | includes process startup and index load; persistent MCP is the intended mode |
+
+Java smoke benchmark on `gameserver`:
+
+| Scenario | Files | Chunks | Symbols | Time |
+|---|---:|---:|---:|---:|
+| Cold tree-sitter build | 6,940 | 55,057 | 245,238 | 16.919s |
+| Reopen with unchanged files/config | 6,940 | 55,057 | 245,238 | 11.527s |
+
+Multi-language smoke benchmark with C#, Java, Python, TypeScript, and C++ files: 5 files, 5 chunks, 12 symbols, 1.147s.
+
+Warm persistent MCP tool timings below do not include server startup or index load.
+
+## MCP vs rg
+
+For exact text and regex search, `codedb_search regex=true` and `rg` can both answer the query. The `rg` baseline used `--no-ignore` because this Unity project intentionally includes `Library/PackageCache`.
+
+| Scenario | MCP tool | MCP hits | MCP time | rg baseline | rg hits | rg time |
+|---|---|---:|---:|---|---:|---:|
+| Exact `PoolManager` | `codedb_search regex=true` | 154 | 0.2234s | `rg --no-ignore -n -i -F` | 154 | 1.7201s |
+| Exact `Joystick` | `codedb_search regex=true` | 938 | 0.2343s | `rg --no-ignore -n -i -F` | 938 | 1.9419s |
+| Exact `NetworkListenerManager` | `codedb_search regex=true` | 14 | 0.1973s | `rg --no-ignore -n -i -F` | 14 | 1.7486s |
+| Exact `GameObjectPoolMgr` | `codedb_search regex=true` | 8 | 0.2210s | `rg --no-ignore -n -i -F` | 8 | 2.1606s |
+| Exact `AllianceManager` | `codedb_search regex=true` | 16 | 0.2190s | `rg --no-ignore -n -i -F` | 16 | 1.7719s |
+| Scoped `Joystick` in Joystick Pack | `codedb_search regex=true path_glob=...` | 46 | 0.0063s | scoped `rg --no-ignore -n -i -F` | 46 | 0.0415s |
+| Scoped `NetworkListenerManager` in UnityNativeTools | `codedb_search regex=true path_glob=...` | 14 | 0.0064s | scoped `rg --no-ignore -n -i -F` | 14 | 0.0414s |
+| Alliance UI/proto regex in `Assets/Scripts` | `codedb_search regex=true path_glob=...` | 409 | 0.0635s | scoped `rg --no-ignore -n -i` | 409 | 0.4137s |
+| Alliance UI `.cs` file glob | `codedb_glob` | 52 | 0.0044s | `rg --files --no-ignore -g` | 52 | 0.5748s |
+
+Feature comparison:
+
+| Capability | codedb-mcp | rg |
+|---|---|---|
+| Raw exact grep | yes, indexed via `codedb_search regex=true` | yes |
+| Regex line search | yes, indexed source corpus | yes, direct filesystem scan |
+| Scoped file/path filtering | yes, `path_glob`, `codedb_find`, `codedb_query` | yes, `-g`, shell paths |
+| Fuzzy file lookup | yes, `codedb_find` | no direct fuzzy ranking |
+| Hybrid lexical + vector search | yes, BM25 + Model2Vec + Vicinity | no |
+| Symbol outline | yes, `codedb_outline` from precomputed tree-sitter symbols | no |
+| Definition-anchored callers | yes, `codedb_callers` | no semantic anchor |
+| File dependency graph | yes, `codedb_deps` | no |
+| Code graph export/analysis | yes, `codedb_graph`, `codedb_analyze`, `codedb_export` | no |
+| Batch calls in one MCP round trip | yes, batch params and `codedb_bundle` | no MCP batching |
+| Arbitrary non-indexed binary/text corpus | no, source extensions from config | yes |
+
+MCP-only measured features:
+
+| Scenario | MCP tool | Results | Time | rg equivalent |
+|---|---|---:|---:|---|
+| Hybrid search for `PoolManager` related chunks | `codedb_search` | 20 | 0.0198s | none |
+| Hybrid search for `Joystick` related chunks | `codedb_search` | 20 | 0.0666s | none |
+| Hybrid search for `NetworkListenerManager` related chunks | `codedb_search` | 20 | 0.0271s | none |
+| Business semantic search: `alliance member ranking donation gift` under `Assets/Scripts` | `codedb_search path_glob=...` | 20 | 0.0358s | none |
+| Definition-anchored references for `PoolManager` at `PoolManager.cs:26` | `codedb_callers` | 7 | 0.0045s | none |
+| Definition-anchored references for `Joystick` at `Joystick.cs:8` | `codedb_callers` | 7 | 0.0069s | none |
+
+`rg` remains the better tool for ad hoc raw filesystem grep across arbitrary file types. `codedb-mcp` is for repeated code-aware work inside a configured source corpus.
+
+## Warm Tool Validation
+
+These calls were measured through one already-started MCP process on `u3dclient`; exact regex searches were checked against `rg --no-ignore` on the same scoped corpus.
+
+| Scenario | Tool | Accuracy Check | avg | p95 |
+|---|---|---:|---:|---:|
+| Scoped exact `PoolManager` | `codedb_search regex=true` | MCP 52 = rg 52 | 5.813ms | 5.953ms |
+| Scoped exact `Joystick` | `codedb_search regex=true` | MCP 46 = rg 46 | 6.371ms | 6.853ms |
+| Scoped exact `NetworkListenerManager` | `codedb_search regex=true` | MCP 14 = rg 14 | 6.486ms | 6.707ms |
+| Hybrid `PoolManager` | `codedb_search` | expected text present | 20.826ms | 21.723ms |
+| Hybrid `Joystick` | `codedb_search` | expected text present | 84.755ms | 84.621ms |
+| Business phrase `alliance member ranking donation gift` | `codedb_search` | Alliance results present | 39.849ms | 41.138ms |
+| Definition refs for `PoolManager` | `codedb_callers` | 7 refs | 4.518ms | 5.464ms |
+| Definition refs for `Joystick` | `codedb_callers` | 7 refs | 7.726ms | 8.692ms |
+| `GameObjectPoolMgr.cs depends_on` | `codedb_deps` | 7 files, expected deps present | 0.244ms | 0.318ms |
+| `NetworkListenerManager.cs imported_by` | `codedb_deps` | 3 files, expected importers present | 0.193ms | 0.212ms |
+| `NetworkListenerManager.cs transitive imported_by` | `codedb_deps` | 16 files | 0.192ms | 0.230ms |
+| `NetworkListenerManager.cs` path lookup | `codedb_find` | top1 correct | 20.259ms | 21.108ms |
+| `Joystick Pack Base Joystick` path lookup | `codedb_find` | top1 correct | 17.710ms | 18.054ms |
+| `ResTypDef` typo-ish lookup | `codedb_find` | target rank 3 | 19.109ms | 20.027ms |
+| `find NetworkListenerManager -> outline` | `codedb_query` | expected outline present | 20.173ms | 20.505ms |
+| `filter Joystick Pack -> limit 3 -> outline` | `codedb_query` | expected outlines present | 8.017ms | 9.206ms |
+| `filter UnityNativeTools -> search NetworkListenerManager` | `codedb_query` | expected results present | 9.650ms | 10.755ms |
+| `find GameObjectPoolMgr -> search PoolManager` | `codedb_query` | expected results present | 22.019ms | 23.469ms |
+
+Additional tool timings:
+
+| Tool / Scenario | Result | Time |
+|---|---:|---:|
+| `codedb_deps` `GameObjectPoolMgr.cs depends_on` | 7 files | 0.0002s |
+| `codedb_deps` `NetworkListenerManager.cs imported_by` | 3 files | 0.0002s |
+| `codedb_deps` `AndroidPlatform.cs depends_on` | 3 files | 0.0002s |
+| `codedb_outline` `NetworkListenerManager.cs` | 1 symbol | 0.3ms |
+| `codedb_outline` `Joystick.cs` | 17 symbols | 0.3ms |
+| `codedb_outline` `PoolManager.cs` | 32 symbols | 0.2ms |
+| `codedb_outline` `NEON_AArch64.cs` | 2,211 symbols | 1.4ms |
+| 100 `codedb_outline compact=true` calls | p95 | 0.3ms |
+| `codedb_analyze` on `u3dclient` | graph analysis | about 0.93s |
+
+`codedb_bundle` runs up to 100 inner operations in one MCP request. Requests above 100 execute the first 100 and include a truncation notice.
+
+| Scenario | Inner ops requested | Repeats | Inner ops executed | Time |
+|---|---:|---:|---:|---:|
+| Fast mixed metadata/deps/outline/read bundle | 100 | 1 | 100 | 0.0895s |
+| Overflow bundle | 120 | 1 | 100 + truncation notice | 0.0924s |
+| Repeated fast bundle | 100 | 50 | 5,000 total | avg 0.0913s, p95 0.1084s |
+| Mixed search/callers/deps/outline bundle | 100 | 1 | 100 | 2.3174s |
+| Heavy regex search bundle | 100 | 1 | 100 | 26.0085s |
+
+## Recommended Installation Flow
+
+1. Install or copy the `skills/codedb-mcp` skill into the agent's skill directory.
+2. In the target repo, ask the agent to use the `codedb-mcp` skill.
+3. The skill runs its setup script to create `<repo-root>\.codedb-mcp` and write `<repo-root>\.codedb-mcp\codedb-mcp.toml`.
+4. The setup script prints the MCP command. It does not install MCP globally.
+5. The agent explicitly registers the MCP server in its MCP configuration using that printed command.
+6. Restart the agent/Codex session and check `/mcp`.
+
+Standalone setup command from a copied skill:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File <skill-root>\scripts\setup.ps1 -ProjectRoot <repo-root>
+```
+
+The MCP command shape printed by the skill is:
+
+```text
+<skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
+```
+
+This project intentionally keeps installation explicit: scripts initialize local project files, while the agent/user chooses when and where to register MCP.
+
 ## What It Does
 
 - Exposes local MCP tools for code search, outlines, symbols, typed callers, dependencies, file discovery, graph analysis, batching, and exports.
@@ -23,7 +174,7 @@ Rust MCP server with a `codedb_*` compatible tool surface and a local Minish-sty
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Other languages currently provide indexed search, outlines, imports/includes, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: builds chunks, exact identifier hits, symbol-definition chunk hits, dependency references, BM25 lexical search, Model2Vec file embeddings, and a Vicinity HNSW vector index.
 7. **Graph layer**: builds a graphify-style graph with file, namespace/package, symbol, dependency, and reference edges. Louvain communities and subcommunities are computed lazily on first request and cached under `.codedb-mcp`.
-8. **MCP runtime**: tools operate against a warm in-process index. Batch-capable tools and `codedb_bundle` reduce MCP round trips.
+8. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.
 9. **Skills package**: `skills/codedb-mcp` is standalone and includes the executable, setup script, config template, install notes, and tool guidance. `skills/deepwiki` builds local DeepWiki-style docs from MCP evidence plus the active agent's reasoning.
 
 ## Configuration
@@ -55,143 +206,7 @@ dir = ".codedb-mcp"
 
 There are no environment-variable toggles. Edit the config file explicitly.
 
-## Benchmarks: MCP vs rg on u3dclient
-
-Benchmark target: `u3dclient`.
-
-Current index status with the existing u3dclient C#/Java config:
-
-- Indexed files: 18,975.
-- Chunks: 129,165.
-- Symbols: 275,878.
-- Graph: 295,753 nodes and 688,566 edges.
-- Vector index: Vicinity HNSW over Model2Vec `minishlab/potion-code-16M`.
-- Storage: `u3dclient\.codedb-mcp`.
-
-Latest index timings on this machine:
-
-| Scenario | Cache | Internal total | Notes |
-|---|---|---:|---|
-| Cold tree-sitter `.codedb-mcp` build | miss | 44.876s wall | Includes scan, tree-sitter declaration parse, embeddings, graph, BM25, HNSW, cache save |
-| Reopen with unchanged files/config | hit | 39.546s wall | Reuses parsed files, chunks, semantic units, embeddings; rebuilds runtime graph/BM25/HNSW |
-| One-shot `codedb_status` CLI | hit | 39.4s wall | Includes process startup and index load; persistent MCP is the intended mode |
-
-Java smoke benchmark on `gameserver` with 6,940 Java files:
-
-| Scenario | Files | Chunks | Symbols | Time |
-|---|---:|---:|---:|---:|
-| Cold tree-sitter build | 6,940 | 55,057 | 245,238 | 16.919s |
-| Reopen with unchanged files/config | 6,940 | 55,057 | 245,238 | 11.527s |
-
-Multi-language smoke benchmark with C#, Java, Python, TypeScript, and C++ files: 5 files, 5 chunks, 12 symbols, 1.147s.
-
-Warm persistent MCP tool timings below do not include server startup or index load.
-
-### Latest Warm Tool Validation
-
-These calls were measured through one already-started MCP process on `u3dclient`; `codedb_search regex=true` was checked against `rg --no-ignore` on the same scoped corpus.
-
-| Scenario | Tool | Accuracy Check | avg | p95 |
-|---|---|---:|---:|---:|
-| Scoped exact `PoolManager` | `codedb_search regex=true` | MCP 52 = rg 52 | 5.813ms | 5.953ms |
-| Scoped exact `Joystick` | `codedb_search regex=true` | MCP 46 = rg 46 | 6.371ms | 6.853ms |
-| Scoped exact `NetworkListenerManager` | `codedb_search regex=true` | MCP 14 = rg 14 | 6.486ms | 6.707ms |
-| Hybrid `PoolManager` | `codedb_search` | expected text present | 20.826ms | 21.723ms |
-| Hybrid `Joystick` | `codedb_search` | expected text present | 84.755ms | 84.621ms |
-| Business phrase `alliance member ranking donation gift` | `codedb_search` | Alliance results present | 39.849ms | 41.138ms |
-| Definition refs for `PoolManager` | `codedb_callers` | 7 refs | 4.518ms | 5.464ms |
-| Definition refs for `Joystick` | `codedb_callers` | 7 refs | 7.726ms | 8.692ms |
-| `GameObjectPoolMgr.cs depends_on` | `codedb_deps` | 7 files, expected deps present | 0.244ms | 0.318ms |
-| `NetworkListenerManager.cs imported_by` | `codedb_deps` | 3 files, expected importers present | 0.193ms | 0.212ms |
-| `NetworkListenerManager.cs transitive imported_by` | `codedb_deps` | 16 files | 0.192ms | 0.230ms |
-| `NetworkListenerManager.cs` path lookup | `codedb_find` | top1 correct | 20.259ms | 21.108ms |
-| `Joystick Pack Base Joystick` path lookup | `codedb_find` | top1 correct | 17.710ms | 18.054ms |
-| `ResTypDef` typo-ish lookup | `codedb_find` | target rank 3 | 19.109ms | 20.027ms |
-| `find NetworkListenerManager -> outline` | `codedb_query` | expected outline present | 20.173ms | 20.505ms |
-| `filter Joystick Pack -> limit 3 -> outline` | `codedb_query` | expected outlines present | 8.017ms | 9.206ms |
-| `filter UnityNativeTools -> search NetworkListenerManager` | `codedb_query` | expected results present | 9.650ms | 10.755ms |
-| `find GameObjectPoolMgr -> search PoolManager` | `codedb_query` | expected results present | 22.019ms | 23.469ms |
-
-### Shared Exact Search Features
-
-For exact text and regex search, `codedb_search regex=true` and `rg` can both answer the query. The `rg` baseline used `--no-ignore` because this Unity project intentionally includes `Library/PackageCache`.
-
-| Scenario | MCP tool | MCP hits | MCP time | rg baseline | rg hits | rg time |
-|---|---|---:|---:|---|---:|---:|
-| Exact `PoolManager` | `codedb_search regex=true` | 154 | 0.2234s | `rg --no-ignore -n -i -F` | 154 | 1.7201s |
-| Exact `Joystick` | `codedb_search regex=true` | 938 | 0.2343s | `rg --no-ignore -n -i -F` | 938 | 1.9419s |
-| Exact `NetworkListenerManager` | `codedb_search regex=true` | 14 | 0.1973s | `rg --no-ignore -n -i -F` | 14 | 1.7486s |
-| Exact `GameObjectPoolMgr` | `codedb_search regex=true` | 8 | 0.2210s | `rg --no-ignore -n -i -F` | 8 | 2.1606s |
-| Exact `AllianceManager` | `codedb_search regex=true` | 16 | 0.2190s | `rg --no-ignore -n -i -F` | 16 | 1.7719s |
-| Scoped `Joystick` in Joystick Pack | `codedb_search regex=true path_glob=...` | 46 | 0.0063s | scoped `rg --no-ignore -n -i -F` | 46 | 0.0415s |
-| Scoped `NetworkListenerManager` in UnityNativeTools | `codedb_search regex=true path_glob=...` | 14 | 0.0064s | scoped `rg --no-ignore -n -i -F` | 14 | 0.0414s |
-| Alliance UI/proto regex in `Assets/Scripts` | `codedb_search regex=true path_glob=...` | 409 | 0.0635s | scoped `rg --no-ignore -n -i` | 409 | 0.4137s |
-| Alliance UI `.cs` file glob | `codedb_glob` | 52 | 0.0044s | `rg --files --no-ignore -g` | 52 | 0.5748s |
-
-### MCP-Only Features
-
-`rg` remains the right tool for ad hoc raw filesystem grep across arbitrary file types. The MCP layer adds indexed code-aware features that `rg` does not model:
-
-| Scenario | MCP tool | Results | Time | rg equivalent |
-|---|---|---:|---:|---|
-| Hybrid search for `PoolManager` related chunks | `codedb_search` | 20 | 0.0198s | none |
-| Hybrid search for `Joystick` related chunks | `codedb_search` | 20 | 0.0666s | none |
-| Hybrid search for `NetworkListenerManager` related chunks | `codedb_search` | 20 | 0.0271s | none |
-| Business semantic search: `alliance member ranking donation gift` under `Assets/Scripts` | `codedb_search path_glob=...` | 20 | 0.0358s | none |
-| Definition-anchored references for `PoolManager` at `PoolManager.cs:26` | `codedb_callers` | 7 | 0.0045s | none |
-| Definition-anchored references for `Joystick` at `Joystick.cs:8` | `codedb_callers` | 7 | 0.0069s | none |
-
-### Dependency, Query, Outline, Analyze
-
-`codedb_deps` reads the precomputed dependency graph:
-
-| Scenario | Result | Time |
-|---|---:|---:|
-| `GameObjectPoolMgr.cs depends_on` | 7 files | 0.0002s |
-| `NetworkListenerManager.cs imported_by` | 3 files | 0.0002s |
-| `AndroidPlatform.cs depends_on` | 3 files | 0.0002s |
-
-`codedb_find` and `codedb_query`:
-
-| Scenario | Tool | Result | Time |
-|---|---|---:|---:|
-| Exact file-path lookup `NetworkListenerManager.cs` | `codedb_find` | 1 path, top1 correct | 0.0203s |
-| Exact file-path lookup `GameObjectPoolMgr` | `codedb_find` | 1 path | 0.0197s |
-| Human phrase `Joystick Pack Base Joystick` | `codedb_find` | 1 path, top1 correct | 0.0177s |
-| Typo-ish query `ResTypDef` | `codedb_find` | 5 ranked paths, expected target rank 3 | 0.0191s |
-| `find NetworkListenerManager.cs -> outline` | `codedb_query` | 1 outline | 0.0202s |
-| `filter Joystick Pack -> limit 3 -> outline` | `codedb_query` | 3 outlines | 0.0080s |
-| `filter UnityNativeTools -> search NetworkListenerManager` | `codedb_query` | 16 chunks | 0.0097s |
-| `find GameObjectPoolMgr -> search PoolManager` | `codedb_query` | 17 chunks | 0.0220s |
-| 105 mixed `codedb_query` calls | `codedb_query` | avg/p95 | 0.0186s / 0.0297s |
-
-`codedb_outline` reads precomputed symbols and does not reparse files at request time:
-
-| File | Size | Lines | Symbols | Time |
-|---|---:|---:|---:|---:|
-| `NetworkListenerManager.cs` | 609 B | 28 | 1 | 0.3ms |
-| `Joystick.cs` | 5.2 KB | 162 | 17 | 0.3ms |
-| `PoolManager.cs` | 20 KB | 534 | 32 | 0.2ms |
-| `GameObjectPoolMgr.cs` | 21 KB | 482 | 21 | 0.2ms |
-| `NEON_AArch64.cs` | 1.33 MB | 12,398 | 2,211 | 1.4ms |
-
-Batching 100 `codedb_outline compact=true` calls in one MCP process produced avg 0.191ms, p50 0.2ms, p95 0.3ms, max 0.4ms.
-
-`codedb_analyze` on `u3dclient` costs about 0.93s per call; 100 mixed calls averaged 0.9446s with p95 1.0073s.
-
-### Bundle Stress Test
-
-`codedb_bundle` runs up to 100 inner operations in one MCP request. Requests above 100 execute the first 100 and include a truncation notice.
-
-| Scenario | Inner ops requested | Repeats | Inner ops executed | Time |
-|---|---:|---:|---:|---:|
-| Fast mixed metadata/deps/outline/read bundle | 100 | 1 | 100 | 0.0895s |
-| Overflow bundle | 120 | 1 | 100 + truncation notice | 0.0924s |
-| Repeated fast bundle | 100 | 50 | 5,000 total | avg 0.0913s, p95 0.1084s |
-| Mixed search/callers/deps/outline bundle | 100 | 1 | 100 | 2.3174s |
-| Heavy regex search bundle | 100 | 1 | 100 | 26.0085s |
-
-## Usage
+## Build And CLI
 
 Build:
 
@@ -199,14 +214,7 @@ Build:
 cargo build --release
 ```
 
-Create or edit the target repo config:
-
-```powershell
-New-Item -ItemType Directory -Force u3dclient\.codedb-mcp
-Copy-Item .codedb-mcp\codedb-mcp.toml u3dclient\.codedb-mcp\codedb-mcp.toml
-```
-
-Run MCP:
+Run MCP directly:
 
 ```powershell
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml mcp u3dclient
@@ -220,7 +228,7 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml s
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
 
-MCP mode watches indexed extensions by default. When a configured source file changes, the server debounces events, rebuilds the project index in the background, and swaps in the new index after it is ready. Use `--no-watch` for static benchmark runs.
+MCP mode answers the protocol handshake before the initial index finishes, then builds the default project index in the background. Early tool calls may wait for that first build. It also watches indexed extensions by default; when a configured source file changes, the server debounces events, rebuilds the project index in the background, and swaps in the new index after it is ready. Use `--no-watch` for static benchmark runs.
 
 ## Batch Examples
 
@@ -279,11 +287,3 @@ The `skills/` directory is intended to be copied as a standalone package.
 
 - `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a setup script, config template, MCP install reference, and tool guidance.
 - `skills/deepwiki`: creates DeepWiki-style local documentation using local `codedb_*` tools plus the active agent's reasoning. It emphasizes business module boundaries over folder-only or community-only grouping.
-
-Recommended setup from a copied skill:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <skill-root>\scripts\setup.ps1 -ProjectRoot <repo-root>
-```
-
-Then register MCP manually in the agent's MCP config using the command printed by the script.

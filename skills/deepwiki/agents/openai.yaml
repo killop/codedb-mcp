@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepWiki Local"
+  short_description: "Build local DeepWiki docs"
+  default_prompt: "Build or refresh a local DeepWiki-style codebase wiki using codedb-mcp tools."

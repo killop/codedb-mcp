@@ -1,0 +1,58 @@
+# codedb-mcp project configuration.
+# Copy this file to <repo-root>/.codedb-mcp/codedb-mcp.toml.
+
+[scan]
+# Source extensions to index through the unified tree-sitter parser layer.
+extensions = ["cs", "java", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
+
+# Skip extremely large generated files before parsing or embedding.
+max_file_bytes = 50000000
+
+# Respect .gitignore for the normal tree walk. Unity PackageCache is included
+# explicitly through include_paths below, so ignored packages can still be indexed.
+respect_gitignore = true
+
+# Extra paths to include even when the normal scan would ignore them.
+include_paths = ["Library/PackageCache"]
+
+# Directory names to skip. A path listed in include_paths is still scanned even
+# when one of its parent directories is skipped here.
+skip_dirs = [
+  ".git",
+  ".hg",
+  ".svn",
+  ".vs",
+  ".idea",
+  ".gradle",
+  "node_modules",
+  ".codedb-mcp",
+  "Library",
+  "Temp",
+  "Logs",
+  "obj",
+  "bin",
+  "Build",
+  "Builds",
+  "UserSettings",
+]
+
+[embedding]
+# Model2Vec model loaded through model2vec-rs. Use a local path if needed.
+model = "minishlab/potion-code-16M"
+
+[diagnostics]
+# Set timing=true only while benchmarking; it writes stage timings to stderr.
+timing = false
+
+# Emit a slow-file parse log for files at or above this many ms. 0 disables it.
+slow_file_ms = 0
+
+[watch]
+# MCP mode watches configured extensions and rebuilds after a short debounce.
+enabled = true
+
+[storage]
+# Store generated data under the target project. Deleting this directory removes
+# all local codedb-mcp data for that project.
+enabled = true
+dir = ".codedb-mcp"

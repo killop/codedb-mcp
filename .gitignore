@@ -1,0 +1,6 @@
+/target
+.mcp_data/
+.codedb-mcp/index.bin
+.codedb-mcp/manifest.json
+.codedb-mcp/*.tmp
+.codedb-mcp/*.bin

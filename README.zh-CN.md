@@ -80,7 +80,7 @@ skills/codedb-mcp/assets/codebase-mcp.exe
 使用 skill 的 setup 脚本初始化目标项目：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File skills\codedb-mcp\scripts\setup.ps1 -ProjectRoot F:\workspace\main\Unicorn\u3dclient
+powershell -ExecutionPolicy Bypass -File skills\codedb-mcp\scripts\setup.ps1 -ProjectRoot u3dclient
 ```
 
 脚本会：
@@ -96,14 +96,14 @@ powershell -ExecutionPolicy Bypass -File skills\codedb-mcp\scripts\setup.ps1 -Pr
 ## MCP 启动
 
 ```powershell
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml mcp F:\workspace\main\Unicorn\u3dclient
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml mcp u3dclient
 ```
 
 CLI 快速检查：
 
 ```powershell
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml index F:\workspace\main\Unicorn\u3dclient
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml --root F:\workspace\main\Unicorn\u3dclient tool codedb_status "{}"
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml index u3dclient
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
 
 ## 工具简介
@@ -130,7 +130,7 @@ target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.co
 测试环境中的大型 Unity 项目：
 
 ```text
-F:\workspace\main\Unicorn\u3dclient
+u3dclient
 ```
 
 当前 C#/Java 配置索引状态：
@@ -154,7 +154,7 @@ F:\workspace\main\Unicorn\u3dclient
 Java 工程：
 
 ```text
-F:\workspace\main\Unicorn\gameserver
+gameserver
 ```
 
 | 场景 | Files | Chunks | Symbols | 耗时 |

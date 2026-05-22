@@ -57,7 +57,7 @@ There are no environment-variable toggles. Edit the config file explicitly.
 
 ## Benchmarks: MCP vs rg on u3dclient
 
-Benchmark target: `F:\workspace\main\Unicorn\u3dclient`.
+Benchmark target: `u3dclient`.
 
 Current index status with the existing u3dclient C#/Java config:
 
@@ -66,7 +66,7 @@ Current index status with the existing u3dclient C#/Java config:
 - Symbols: 275,878.
 - Graph: 295,753 nodes and 688,566 edges.
 - Vector index: Vicinity HNSW over Model2Vec `minishlab/potion-code-16M`.
-- Storage: `F:\workspace\main\Unicorn\u3dclient\.codedb-mcp`.
+- Storage: `u3dclient\.codedb-mcp`.
 
 Latest index timings on this machine:
 
@@ -76,7 +76,7 @@ Latest index timings on this machine:
 | Reopen with unchanged files/config | hit | 39.546s wall | Reuses parsed files, chunks, semantic units, embeddings; rebuilds runtime graph/BM25/HNSW |
 | One-shot `codedb_status` CLI | hit | 39.4s wall | Includes process startup and index load; persistent MCP is the intended mode |
 
-Java smoke benchmark on `F:\workspace\main\Unicorn\gameserver` with 6,940 Java files:
+Java smoke benchmark on `gameserver` with 6,940 Java files:
 
 | Scenario | Files | Chunks | Symbols | Time |
 |---|---:|---:|---:|---:|
@@ -202,22 +202,22 @@ cargo build --release
 Create or edit the target repo config:
 
 ```powershell
-New-Item -ItemType Directory -Force F:\workspace\main\Unicorn\u3dclient\.codedb-mcp
-Copy-Item .codedb-mcp\codedb-mcp.toml F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml
+New-Item -ItemType Directory -Force u3dclient\.codedb-mcp
+Copy-Item .codedb-mcp\codedb-mcp.toml u3dclient\.codedb-mcp\codedb-mcp.toml
 ```
 
 Run MCP:
 
 ```powershell
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml mcp F:\workspace\main\Unicorn\u3dclient
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml mcp u3dclient
 ```
 
 Quick CLI checks:
 
 ```powershell
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml index F:\workspace\main\Unicorn\u3dclient
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml search "network listener manager" F:\workspace\main\Unicorn\u3dclient -k 5
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml --root F:\workspace\main\Unicorn\u3dclient tool codedb_status "{}"
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml index u3dclient
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml search "network listener manager" u3dclient -k 5
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
 
 MCP mode watches indexed extensions by default. When a configured source file changes, the server debounces events, rebuilds the project index in the background, and swaps in the new index after it is ready. Use `--no-watch` for static benchmark runs.
@@ -267,8 +267,8 @@ MCP mode watches indexed extensions by default. When a configured source file ch
 `codedb_communities` uses lazy Louvain clustering:
 
 ```powershell
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml --root F:\workspace\main\Unicorn\u3dclient tool codedb_communities "{`"community_limit`":10}"
-target\release\codebase-mcp.exe --config F:\workspace\main\Unicorn\u3dclient\.codedb-mcp\codedb-mcp.toml --root F:\workspace\main\Unicorn\u3dclient tool codedb_communities "{`"community_id`":0,`"children`":true,`"community_limit`":20}"
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_communities "{`"community_limit`":10}"
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_communities "{`"community_id`":0,`"children`":true,`"community_limit`":20}"
 ```
 
 Overview calls return community IDs, labels, member counts, and cohesion. Add `children=true` or `subcommunities=true` with a `community_id` to split only that community's subgraph; child clusters are cached in `.codedb-mcp/louvain-subcommunities.bin`.

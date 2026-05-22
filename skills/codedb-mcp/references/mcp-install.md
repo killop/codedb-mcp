@@ -12,12 +12,12 @@ Codex-style TOML shape:
 
 ```toml
 [mcp_servers.codedb-mcp]
-command = "C:\\path\\to\\skills\\codedb-mcp\\assets\\codebase-mcp.exe"
+command = "<skill-root>\\assets\\codebase-mcp.exe"
 args = [
   "--config",
-  "C:\\path\\to\\repo\\.codedb-mcp\\codedb-mcp.toml",
+  "<repo-root>\\.codedb-mcp\\codedb-mcp.toml",
   "mcp",
-  "C:\\path\\to\\repo",
+  "<repo-root>",
 ]
 ```
 
@@ -26,10 +26,10 @@ Use `--no-watch` only when the host agent or benchmark needs a static index:
 ```toml
 args = [
   "--config",
-  "C:\\path\\to\\repo\\.codedb-mcp\\codedb-mcp.toml",
+  "<repo-root>\\.codedb-mcp\\codedb-mcp.toml",
   "--no-watch",
   "mcp",
-  "C:\\path\\to\\repo",
+  "<repo-root>",
 ]
 ```
 

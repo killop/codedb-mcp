@@ -363,3 +363,8 @@ The `skills/` directory is intended to be copied as a standalone package.
 - `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a config template, MCP registration reference, and tool guidance. It does not own setup.
 - `skills/deepwiki`: creates DeepWiki-style local documentation using local `codedb_*` tools plus the active agent's reasoning. It emphasizes business module boundaries over folder-only or community-only grouping.
 - `skills/code-module-atlas`: creates a local 3D module/file atlas webpage by calling `codedb_module_atlas`, then adapting the bundled meet-blog-style viewer. Generated repo-specific JSON stays ignored.
+
+## Acknowledgements
+
+- [meet-blog.buyixiao.xyz](https://meet-blog.buyixiao.xyz/) inspired the Code Module Atlas visual style and viewer experience.
+- [justrach/codedb](https://github.com/justrach/codedb) inspired the original MCP tool interface direction.

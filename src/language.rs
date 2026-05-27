@@ -5,6 +5,7 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
     match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
         "cs" => Some("csharp"),
         "java" => Some("java"),
+        "rs" => Some("rust"),
         "py" | "pyw" => Some("python"),
         "js" | "mjs" | "cjs" => Some("javascript"),
         "jsx" => Some("jsx"),
@@ -138,6 +139,105 @@ public class App {
                 .symbols
                 .iter()
                 .any(|s| s.kind == "method" && s.name == "run")
+        );
+    }
+
+    #[test]
+    fn rust_tree_sitter_extracts_outline_and_imports() {
+        let parsed = analyze_source(
+            "rust",
+            r#"
+use std::collections::HashMap;
+use crate::core::{Engine, Runner};
+
+pub mod guide {
+    pub struct GuideManager;
+    pub enum GuideType {
+        Main,
+        Side,
+    }
+
+    pub trait Runnable {
+        fn run(&self);
+    }
+
+    impl GuideManager {
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    pub fn start() {}
+    pub type GuideId = u64;
+    pub const DEFAULT_GUIDE: GuideId = 1;
+    pub static ENABLED: bool = true;
+    macro_rules! guide_macro {
+        () => {};
+    }
+}
+"#,
+        );
+
+        assert!(
+            parsed
+                .imports
+                .contains(&"std.collections.HashMap".to_string())
+        );
+        assert!(parsed.imports.contains(&"crate.core.Engine".to_string()));
+        assert!(parsed.imports.contains(&"crate.core.Runner".to_string()));
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "module" && s.name == "guide")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "struct" && s.name == "GuideManager")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "enum" && s.name == "GuideType")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "trait" && s.name == "Runnable")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "function" && s.name == "start")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "type_alias" && s.name == "GuideId")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "const" && s.name == "DEFAULT_GUIDE")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "static" && s.name == "ENABLED")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "macro" && s.name == "guide_macro")
         );
     }
 

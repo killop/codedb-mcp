@@ -1,4 +1,4 @@
 interface:
   display_name: "codedb-mcp"
   short_description: "Use local codedb MCP search"
-  default_prompt: "Set up and use the local codedb-mcp server for this repository."
+  default_prompt: "Use the configured local codedb-mcp server for this repository."

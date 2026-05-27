@@ -1,6 +1,8 @@
-# MCP Installation
+# MCP Registration
 
-Register `assets/codebase-mcp.exe` as an MCP stdio server. The setup script prints the exact paths; it does not edit global MCP settings.
+Use this reference only after the repository-level `setup-for-agent.md` has created `.codedb-mcp/codedb-mcp.toml` and placed the Model2Vec model in the configured explicit cache path.
+
+Do not silently edit global MCP settings. Ask the human whether this specific agent should register the server, then use that agent's normal MCP mechanism.
 
 Generic command:
 
@@ -33,4 +35,4 @@ args = [
 ]
 ```
 
-After registration, call `codedb_status`. A healthy server reports file count, extensions, graph stats, vector count, embedding model, storage dir, and cache state.
+After registration, restart or reload the agent MCP session and call `codedb_status`. A healthy server reports file count, extensions, graph stats, vector count, embedding model, storage dir, and cache state.

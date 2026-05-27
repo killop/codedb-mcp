@@ -4,18 +4,24 @@
 
 Rust MCP server with a `codedb_*` compatible tool surface and a local Minish-style search core for tree-sitter indexed codebases.
 
-The intended distribution model is skill-first: install or copy `skills/codedb-mcp`, then let that skill guide the agent to initialize `.codedb-mcp` and explicitly register the MCP server. The setup script prepares local files and prints the command; MCP registration remains an explicit agent/user action.
+## Demo
+
+![Code Module Atlas demo](docs/assets/code-module-atlas.gif)
+
+[Watch the MP4 demo](docs/assets/code-module-atlas.mp4)
+
+The intended distribution model is setup-guide first: give an agent `setup-for-agent.md`, let it create `.codedb-mcp`, use the default HuggingFace cache when it already exists, fall back to a second-drive cache when it does not, and then ask the human whether this specific agent should register the MCP server. The `codedb-mcp` skill is for using the tools after setup, not for installing them.
 
 ## Benchmark Snapshot
 
 Benchmark target: `u3dclient`.
 
-Current index status with the existing C#/Java config:
+Current index status with the Unity C# benchmark config:
 
-- Indexed files: 18,975.
-- Chunks: 129,165.
-- Symbols: 275,878.
-- Graph: 295,753 nodes and 688,566 edges.
+- Indexed files: 19,030.
+- Chunks: 129,790.
+- Symbols: 277,008.
+- Graph: 296,941 nodes and 691,419 edges.
 - Vector index: Vicinity HNSW over Model2Vec `minishlab/potion-code-16M`.
 - Storage: `u3dclient\.codedb-mcp`.
 
@@ -23,9 +29,11 @@ Index timings on this machine:
 
 | Scenario | Cache | Internal total | Notes |
 |---|---|---:|---|
-| Cold tree-sitter `.codedb-mcp` build | miss | 44.876s wall | scan, tree-sitter declaration parse, embeddings, graph, BM25, HNSW, cache save |
-| Reopen with unchanged files/config | hit | 39.546s wall | reuses parsed files, chunks, semantic units, embeddings; rebuilds runtime graph/BM25/HNSW |
-| One-shot `codedb_status` CLI | hit | 39.4s wall | includes process startup and index load; persistent MCP is the intended mode |
+| Cold tree-sitter `.codedb-mcp` build | miss | 66.061s wall | scan, tree-sitter declaration parse, embeddings, graph, BM25, HNSW, cache save |
+| Reopen with unchanged files/config | hit | 30.8s wall | reuses parsed files, chunks, semantic units, embeddings; rebuilds runtime graph/BM25/HNSW |
+| One-shot `codedb_status` CLI | hit | 31.0s wall | includes process startup and index load; persistent MCP is the intended mode |
+| One-shot Rust `codedb_module_atlas` export | hit | 42.057s wall | includes cache-hit index load plus atlas JSON export |
+| Warm Rust module atlas generation | ready | 9.746s internal | 1,374 modules and 16,361 plotted files from dependency-connected file graph |
 
 Java smoke benchmark on `gameserver`:
 
@@ -35,6 +43,7 @@ Java smoke benchmark on `gameserver`:
 | Reopen with unchanged files/config | 6,940 | 55,057 | 245,238 | 11.527s |
 
 Multi-language smoke benchmark with C#, Java, Python, TypeScript, and C++ files: 5 files, 5 chunks, 12 symbols, 1.147s.
+Rust smoke check on this repository: 20 indexed files including 17 `.rs` files, 341 chunks, 604 symbols; `codedb_outline`, `codedb_search`, and `codedb_deps` all returned Rust results.
 
 Warm persistent MCP tool timings below do not include server startup or index load.
 
@@ -132,37 +141,33 @@ Additional tool timings:
 | Mixed search/callers/deps/outline bundle | 100 | 1 | 100 | 2.3174s |
 | Heavy regex search bundle | 100 | 1 | 100 | 26.0085s |
 
-## Recommended Installation Flow
+## Recommended Setup Flow
 
-1. Install or copy the `skills/codedb-mcp` skill into the agent's skill directory.
-2. In the target repo, ask the agent to use the `codedb-mcp` skill.
-3. The skill runs its setup script to create `<repo-root>\.codedb-mcp` and write `<repo-root>\.codedb-mcp\codedb-mcp.toml`.
-4. The setup script prints the MCP command. It does not install MCP globally.
-5. The agent explicitly registers the MCP server in its MCP configuration using that printed command.
-6. Restart the agent/Codex session and check `/mcp`.
+1. Give the target agent `setup-for-agent.md`.
+2. The agent creates `<repo-root>\.codedb-mcp` and `<repo-root>\.codedb-mcp\models`.
+3. On Windows, the agent checks the default HuggingFace hub cache first. If `minishlab/potion-code-16M` already has a valid snapshot there, config points to that snapshot. If the hub cache exists but the model is missing, the agent downloads to `C:\Users\<user>\.cache\huggingface\hub\codedb-mcp\models\potion-code-16M`. If the default hub cache does not exist, it uses the second available drive, such as `D:\codedb-mcp-cache\models\potion-code-16M`.
+4. The agent writes `<repo-root>\.codedb-mcp\codedb-mcp.toml` from the demo config, writes the model as an absolute path, and shows the human which languages are configured.
+5. The human can edit `extensions`, `include_paths`, `skip_dirs`, and the model path before first indexing.
+6. The agent runs an index check.
+7. The agent asks whether this specific agent should register MCP. If yes, it uses its own MCP mechanism.
+8. Restart or reload the agent MCP session and check `/mcp`.
 
-Standalone setup command from a copied skill:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <skill-root>\scripts\setup.ps1 -ProjectRoot <repo-root>
-```
-
-The MCP command shape printed by the skill is:
+The MCP command shape is:
 
 ```text
-<skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
+<package-root>\skills\codedb-mcp\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
 ```
 
-This project intentionally keeps installation explicit: scripts initialize local project files, while the agent/user chooses when and where to register MCP.
+This project intentionally keeps installation explicit: setup prepares local project files, while the agent/user chooses when and where to register MCP.
 
 ## What It Does
 
-- Exposes local MCP tools for code search, outlines, symbols, typed callers, dependencies, file discovery, graph analysis, batching, and exports.
+- Exposes local MCP tools for code search, outlines, symbols, typed callers, dependencies, file discovery, graph analysis, DeepWiki module planning, module atlas export, batching, and exports.
 - Indexes configured source languages through one explicit config file: `<repo-root>/.codedb-mcp/codedb-mcp.toml`.
 - Stores generated data inside the target repo under `.codedb-mcp`. Delete that directory to remove local cache and generated wiki/index data.
-- Uses a unified tree-sitter parser layer, not Roslyn/JDT. C#, Java, Python, JavaScript, TypeScript/TSX, C, and C++ all emit the same `FileEntry`/`Symbol` model. C#/Java typed callers and dependencies remain the strongest path because their namespace/package import rules are implemented on top of that shared AST output.
-- Uses Minish ecosystem pieces: `model2vec-rs` with `minishlab/potion-code-16M`, file-level semantic units, BM25 lexical ranking, exact identifier indexes, and Vicinity HNSW vectors.
-- Builds a graphify-style code graph and computes Louvain communities lazily for `codedb_communities`.
+- Uses a unified tree-sitter parser layer, not Roslyn/JDT. C#, Java, Rust, Python, JavaScript, TypeScript/TSX, C, and C++ all emit the same `FileEntry`/`Symbol` model. C#/Java typed callers and dependencies remain the strongest path because their namespace/package import rules are implemented on top of that shared AST output.
+- Uses Minish ecosystem pieces: `model2vec-rs` with explicit-path `minishlab/potion-code-16M`, file-level semantic units, BM25 lexical ranking, exact identifier indexes, and Vicinity HNSW vectors.
+- Builds a graphify-style code graph, computes Louvain communities lazily for `codedb_communities`, and exposes Rust-native `codedb_module_map`/`codedb_module_atlas` outputs from a dependency-connected file graph with label propagation, dependency cohesion, cross-folder evidence, semantic-neighbor probes, key symbols, and c-TF-IDF-like labels.
 - Watches configured source extensions in MCP mode and rebuilds after a debounce.
 
 ## Technology Architecture
@@ -170,12 +175,13 @@ This project intentionally keeps installation explicit: scripts initialize local
 1. **Explicit project-local config**: all behavior comes from `.codedb-mcp/codedb-mcp.toml`. There are no environment-variable switches for indexing behavior.
 2. **Project-local storage**: cache payloads, manifests, Louvain caches, and DeepWiki output live under `.codedb-mcp`. Deleting that directory removes all generated data for the repo.
 3. **Scanner**: walks the repo with explicit extensions, max file size, gitignore behavior, skip dirs, and include paths. Unity `Library/PackageCache` can be included while the rest of `Library` is skipped.
-4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Python, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
-5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Other languages currently provide indexed search, outlines, imports/includes, and graph nodes, but not Roslyn/JDT-level semantic binding.
+4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
+5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: builds chunks, exact identifier hits, symbol-definition chunk hits, dependency references, BM25 lexical search, Model2Vec file embeddings, and a Vicinity HNSW vector index.
 7. **Graph layer**: builds a graphify-style graph with file, namespace/package, symbol, dependency, and reference edges. Louvain communities and subcommunities are computed lazily on first request and cached under `.codedb-mcp`.
-8. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.
-9. **Skills package**: `skills/codedb-mcp` is standalone and includes the executable, setup script, config template, install notes, and tool guidance. `skills/deepwiki` builds local DeepWiki-style docs from MCP evidence plus the active agent's reasoning.
+8. **Module atlas layer**: `codedb_module_map` and `codedb_module_atlas` run in Rust. They first split files by dependency-connected components, then do dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary clustering basis. `codedb_module_atlas` exports Embedding Atlas-ready JSON.
+9. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.
+10. **Setup guide and skills package**: `setup-for-agent.md` owns installation guidance. `skills/codedb-mcp` is standalone for tool usage and includes the executable, config template, MCP reference, and tool guidance. `skills/deepwiki` builds local DeepWiki-style docs from MCP evidence plus the active agent's reasoning. `skills/code-module-atlas` calls `codedb_module_atlas` and packages the local meet-blog-style module/file graph webpage.
 
 ## Configuration
 
@@ -191,20 +197,20 @@ Important defaults:
 
 ```toml
 [scan]
-extensions = ["cs", "java", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
+extensions = ["cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 max_file_bytes = 50000000
 respect_gitignore = true
 include_paths = ["Library/PackageCache"]
 
 [embedding]
-model = "minishlab/potion-code-16M"
+model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
 
 [storage]
 enabled = true
 dir = ".codedb-mcp"
 ```
 
-There are no environment-variable toggles. Edit the config file explicitly.
+There are no environment-variable toggles. Edit the config file explicitly. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive.
 
 ## Build And CLI
 
@@ -281,9 +287,25 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml -
 
 Overview calls return community IDs, labels, member counts, and cohesion. Add `children=true` or `subcommunities=true` with a `community_id` to split only that community's subgraph; child clusters are cached in `.codedb-mcp/louvain-subcommunities.bin`.
 
+`codedb_module_map` is the preferred DeepWiki planning call. It uses the Rust dependency-connected module graph, then adds dependency cohesion, cross-folder roots, semantic-neighbor probes, entry points, key symbols, and c-TF-IDF-like labels:
+
+```powershell
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_module_map "{`"path_prefix`":`"Assets/Scripts`",`"limit`":40,`"min_files`":2,`"semantic_neighbors`":5}"
+```
+
+`codedb_module_atlas` exports module/file graph data. The packaged `code-module-atlas` skill calls this tool, converts the output to the bundled viewer dataset, and prepares the local webpage:
+
+```powershell
+node skills\code-module-atlas\scripts\build-module-atlas.mjs u3dclient
+cd skills\code-module-atlas\assets\viewer
+npm run dev -- --port 5174 --strictPort
+```
+
 ## Skills
 
 The `skills/` directory is intended to be copied as a standalone package.
 
-- `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a setup script, config template, MCP install reference, and tool guidance.
+- `setup-for-agent.md`: installation guide for agents. It reuses the default HuggingFace cache when present, falls back to the second Windows drive when absent, and writes project-local config with an absolute model path.
+- `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a config template, MCP registration reference, and tool guidance. It does not own setup.
 - `skills/deepwiki`: creates DeepWiki-style local documentation using local `codedb_*` tools plus the active agent's reasoning. It emphasizes business module boundaries over folder-only or community-only grouping.
+- `skills/code-module-atlas`: creates a local 3D module/file atlas webpage by calling `codedb_module_atlas`, then adapting the bundled meet-blog-style viewer. Generated repo-specific JSON stays ignored.

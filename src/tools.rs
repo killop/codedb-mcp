@@ -5,18 +5,24 @@ use crate::indexer::{
 };
 use crate::language::{is_comment_or_blank, scope_for_line};
 use crate::search::hybrid_search;
-use crate::tokens::has_whole_word;
+use crate::tokens::{has_whole_word, split_identifier};
 use crate::types::{FileEntry, SearchHit, Symbol};
 use anyhow::{Result, anyhow};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_BATCH_ITEMS: usize = 100;
+const MODULE_HUB_INCOMING_LIMIT: usize = 220;
+const MODULE_MAX_DEPENDENCY_EDGES_PER_FILE: usize = 72;
+const MODULE_MAX_FILES_PER_GROUP: usize = 450;
+const MODULE_LABEL_ITERATIONS: usize = 8;
 
 pub struct ProjectManager {
     default_root: PathBuf,
@@ -197,6 +203,8 @@ fn dispatch_index_tool(index: &Codebase, name: &str, args: &Value) -> Result<Str
         "codedb_explain" => handle_explain(index, args),
         "codedb_path" => handle_path(index, args),
         "codedb_communities" => handle_communities(index, args),
+        "codedb_module_map" => handle_module_map(index, args),
+        "codedb_module_atlas" => handle_module_atlas(index, args),
         "codedb_analyze" => handle_analyze(index, args),
         "codedb_export" => handle_export(index, args),
         _ => Ok(format!("error: unknown tool: {name}")),
@@ -1215,6 +1223,1814 @@ fn handle_communities(index: &Codebase, args: &Value) -> Result<String> {
     ))
     .map_err(Into::into)
 }
+
+#[derive(Debug)]
+struct ModuleRaw {
+    community_id: usize,
+    fallback_label: String,
+    files: Vec<String>,
+    token_counts: BTreeMap<String, usize>,
+    symbol_count: usize,
+    internal_deps: usize,
+    outgoing_deps: usize,
+    incoming_deps: usize,
+}
+
+#[derive(Debug)]
+struct ModuleCandidate {
+    score: f32,
+    file_count: usize,
+    value: Value,
+}
+
+fn handle_module_map(index: &Codebase, args: &Value) -> Result<String> {
+    let limit = get_usize(args, "limit").unwrap_or(40).clamp(1, 200);
+    let min_files = get_usize(args, "min_files").unwrap_or(2).clamp(1, 1000);
+    let max_files_per_module = get_usize(args, "max_files_per_module")
+        .unwrap_or(40)
+        .clamp(1, 1000);
+    let include_files = get_bool(args, "include_files");
+    let semantic_neighbors = get_usize(args, "semantic_neighbors")
+        .unwrap_or(5)
+        .clamp(0, 20);
+    let path_prefix = get_str(args, "path_prefix")
+        .and_then(|prefix| (!prefix.trim().is_empty()).then(|| normalize_dir_prefix(&prefix)));
+
+    let raws = build_file_module_raws(index, min_files, path_prefix.as_deref());
+    let term_document_frequency = module_term_document_frequency(&raws);
+    let total_modules = raws.len();
+    let mut candidates = Vec::new();
+
+    for raw in raws {
+        let terms = ranked_module_terms(&raw.token_counts, &term_document_frequency, total_modules);
+        let label = module_label(&terms, &raw.fallback_label);
+        let file_set = raw.files.iter().cloned().collect::<BTreeSet<_>>();
+        let central_files = central_files_for_module(index, &file_set, 8);
+        let key_symbols = key_symbols_for_module(index, &file_set, 12);
+        let entry_points = entry_points_for_module(index, &file_set, 12);
+        let path_roots = module_path_roots(&raw.files, 8);
+        let semantic_query = semantic_query_for_module(&label, &terms, &key_symbols);
+        let (semantic_items, semantic_density) =
+            semantic_neighbors_for_module(index, &semantic_query, &file_set, semantic_neighbors)?;
+        let boundary_deps = raw.outgoing_deps + raw.incoming_deps;
+        let cohesion = dependency_cohesion(raw.internal_deps, boundary_deps);
+        let cross_folder = path_roots.len() > 1;
+        let score = module_confidence_score(
+            raw.files.len(),
+            cohesion,
+            semantic_density,
+            entry_points.len(),
+            cross_folder,
+        );
+        let files_value = if include_files {
+            json!(
+                raw.files
+                    .iter()
+                    .take(max_files_per_module)
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            Value::Null
+        };
+        let evidence = module_evidence(
+            raw.files.len(),
+            raw.symbol_count,
+            raw.internal_deps,
+            boundary_deps,
+            cohesion,
+            cross_folder,
+            semantic_density,
+        );
+
+        let value = json!({
+            "id": raw.community_id,
+            "label": label,
+            "source": "rust dependency-connected file graph + label propagation + dependency evidence",
+            "confidence": score,
+            "file_count": raw.files.len(),
+            "symbol_count": raw.symbol_count,
+            "cohesion": cohesion,
+            "dependency_edges": {
+                "internal": raw.internal_deps,
+                "outgoing": raw.outgoing_deps,
+                "incoming": raw.incoming_deps,
+                "boundary": boundary_deps,
+            },
+            "cross_folder": cross_folder,
+            "path_roots": path_roots,
+            "terms": terms
+                .iter()
+                .take(8)
+                .map(|(term, score, count)| json!({"term": term, "score": score, "count": count}))
+                .collect::<Vec<_>>(),
+            "entry_points": entry_points,
+            "key_symbols": key_symbols,
+            "central_files": central_files,
+            "semantic_query": semantic_query,
+            "semantic_density": semantic_density,
+            "semantic_neighbors": semantic_items,
+            "files": files_value,
+            "evidence": evidence,
+        });
+        candidates.push(ModuleCandidate {
+            score,
+            file_count: raw.files.len(),
+            value,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| b.file_count.cmp(&a.file_count))
+            .then_with(|| {
+                a.value
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .cmp(&b.value.get("label").and_then(Value::as_str))
+            })
+    });
+    let returned = candidates.len().min(limit);
+    let modules = candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| candidate.value)
+        .collect::<Vec<_>>();
+
+    serde_json::to_string_pretty(&json!({
+        "algorithm": "module-atlas-v2-rust-dependency-components",
+        "purpose": "DeepWiki module planning evidence; final page boundaries should be decided by the agent.",
+        "inspired_by": [
+            "Understand-Anything: separate business-domain planning from structural graph facts",
+            "Understand-Anything: semantic batching and neighbor maps to preserve cross-boundary context",
+            "Embedding Atlas: semantic-neighbor probes, density-style confidence, and c-TF-IDF-like labels"
+        ],
+        "scope": {
+            "path_prefix": path_prefix.as_deref().unwrap_or(""),
+            "min_files": min_files,
+            "include_files": include_files,
+            "semantic_neighbors": semantic_neighbors,
+        },
+        "total_modules": total_modules,
+        "returned_modules": returned,
+        "modules": modules,
+    }))
+    .map_err(Into::into)
+}
+
+fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
+    let started = Instant::now();
+    let limit = get_usize(args, "limit").unwrap_or(2000).clamp(1, 5000);
+    let min_files = get_usize(args, "min_files").unwrap_or(2).clamp(1, 1000);
+    let include_files = get_bool(args, "include_files");
+    let split_files = get_bool(args, "split_files");
+    let path_prefix = get_str(args, "path_prefix")
+        .and_then(|prefix| (!prefix.trim().is_empty()).then(|| normalize_dir_prefix(&prefix)));
+    let raws = build_file_module_raws(index, min_files, path_prefix.as_deref());
+    let term_document_frequency = module_term_document_frequency(&raws);
+    let total_modules = raws.len();
+    let mut modules = raws
+        .into_iter()
+        .map(|raw| {
+            let terms =
+                ranked_module_terms(&raw.token_counts, &term_document_frequency, total_modules);
+            let label = module_label(&terms, &raw.fallback_label);
+            let file_set = raw.files.iter().cloned().collect::<BTreeSet<_>>();
+            let central_files = central_files_for_module_camel(index, &file_set, 5);
+            let key_symbols = key_symbols_for_module_camel(index, &file_set, 4);
+            let entry_points = entry_points_for_module_camel(index, &file_set, 5);
+            let path_roots = module_path_roots_camel(&raw.files, 10);
+            let boundary_deps = raw.outgoing_deps + raw.incoming_deps;
+            let cohesion = dependency_cohesion(raw.internal_deps, boundary_deps);
+            let semantic_density = module_semantic_density(&terms, raw.symbol_count);
+            let confidence = module_confidence_score(
+                raw.files.len(),
+                cohesion,
+                semantic_density,
+                entry_points.len(),
+                path_roots.len() > 1,
+            );
+            ModuleAtlasModule {
+                community_id: raw.community_id,
+                label,
+                file_count: raw.files.len(),
+                symbol_count: raw.symbol_count,
+                confidence,
+                cohesion,
+                semantic_density,
+                cross_folder: path_roots.len() > 1,
+                language_counts: module_language_counts(index, &raw.files),
+                terms: terms
+                    .iter()
+                    .take(6)
+                    .map(|(term, score, count)| {
+                        json!({"term": term, "score": score, "count": count})
+                    })
+                    .collect(),
+                path_roots,
+                entry_points,
+                key_symbols,
+                central_files,
+                files: raw.files,
+            }
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|a, b| {
+        b.file_count
+            .cmp(&a.file_count)
+            .then_with(|| b.confidence.total_cmp(&a.confidence))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    modules.truncate(limit);
+    for (id, module) in modules.iter_mut().enumerate() {
+        module.community_id = id;
+    }
+
+    let layouts = module_layouts(index, &modules);
+    let mut path_to_point_id = HashMap::<String, usize>::new();
+    for module in &modules {
+        for path in &module.files {
+            if index.files.contains_key(path) && !path_to_point_id.contains_key(path) {
+                let id = path_to_point_id.len();
+                path_to_point_id.insert(path.clone(), id);
+            }
+        }
+    }
+    let mut points = Vec::new();
+    for module in &modules {
+        let layout = layouts
+            .get(&module.community_id)
+            .copied()
+            .unwrap_or(ModuleLayout {
+                x: 0.0,
+                y: 0.0,
+                radius: module_layout_radius(module.file_count),
+            });
+        let local_offsets = module_file_offsets(index, module, layout.radius);
+        for path in &module.files {
+            let Some(file) = index.files.get(path) else {
+                continue;
+            };
+            let point_id = path_to_point_id.get(path).copied().unwrap_or(points.len());
+            let local = local_offsets.get(path).copied().unwrap_or((0.0, 0.0));
+            points.push(json!({
+                "id": point_id,
+                "path": path,
+                "language": file.language,
+                "languageLabel": language_label(&file.language),
+                "moduleId": module.community_id,
+                "moduleLabel": module.label,
+                "x": layout.x + local.0,
+                "y": layout.y + local.1,
+                "category": module.community_id % 12,
+                "symbols": file.symbols.iter().take(12).map(|symbol| symbol.name.clone()).collect::<Vec<_>>(),
+                "lineCount": file.line_count,
+                "depIn": index.deps_reverse.get(path).map(Vec::len).unwrap_or(0),
+                "depOut": index.deps_forward.get(path).map(Vec::len).unwrap_or(0),
+                "depInIds": atlas_dependency_ids(index.deps_reverse.get(path), &path_to_point_id, 80),
+                "depOutIds": atlas_dependency_ids(index.deps_forward.get(path), &path_to_point_id, 80),
+            }));
+        }
+    }
+
+    let modules_json = modules
+        .iter()
+        .map(|module| {
+            let files = if include_files {
+                json!(module.files)
+            } else {
+                Value::Null
+            };
+            let layout = layouts
+                .get(&module.community_id)
+                .copied()
+                .unwrap_or(ModuleLayout {
+                    x: 0.0,
+                    y: 0.0,
+                    radius: module_layout_radius(module.file_count),
+                });
+            json!({
+                "id": module.community_id,
+                "label": module.label,
+                "fileCount": module.file_count,
+                "symbolCount": module.symbol_count,
+                "confidence": module.confidence,
+                "cohesion": module.cohesion,
+                "semanticDensity": module.semantic_density,
+                "crossFolder": module.cross_folder,
+                "languageCounts": module.language_counts,
+                "terms": module.terms,
+                "pathRoots": module.path_roots,
+                "entryPoints": module.entry_points,
+                "keySymbols": module.key_symbols,
+                "centralFiles": module.central_files,
+                "layout": {
+                    "x": round2_local(layout.x),
+                    "y": round2_local(layout.y),
+                    "radius": round2_local(layout.radius),
+                },
+                "files": files,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut metadata = json!({
+        "project": index.root.file_name().and_then(|name| name.to_str()).unwrap_or("project"),
+        "root": index.root.display().to_string().replace('\\', "/"),
+        "generatedAt": chrono_like_timestamp(),
+        "extensions": index.options.extensions.clone(),
+        "languages": language_counts(index).keys().cloned().collect::<Vec<_>>(),
+        "languageCounts": language_counts(index),
+        "totalFiles": index.files.len(),
+        "totalModules": modules_json.len(),
+        "graph": {
+            "nodes": index.graph.nodes.len(),
+            "edges": index.graph.edges.len(),
+        },
+        "algorithm": "rust dependency-connected file graph + label propagation",
+        "generationMs": started.elapsed().as_millis() as u64,
+        "projection": "dependency-aware organic module layout + dependency-aware intra-module file layout; rendered by embedding-atlas EmbeddingView",
+    });
+    if split_files {
+        metadata["pointsPath"] = Value::String("module-atlas-points.json".to_string());
+    }
+
+    let data = json!({
+        "metadata": {
+            "project": metadata["project"].clone(),
+            "root": metadata["root"].clone(),
+            "generatedAt": metadata["generatedAt"].clone(),
+            "extensions": metadata["extensions"].clone(),
+            "languages": metadata["languages"].clone(),
+            "languageCounts": metadata["languageCounts"].clone(),
+            "totalFiles": metadata["totalFiles"].clone(),
+            "totalModules": metadata["totalModules"].clone(),
+            "graph": metadata["graph"].clone(),
+            "algorithm": metadata["algorithm"].clone(),
+            "generationMs": metadata["generationMs"].clone(),
+            "projection": metadata["projection"].clone(),
+            "pointsPath": metadata.get("pointsPath").cloned().unwrap_or(Value::Null),
+        },
+        "modules": modules_json,
+        "points": if split_files { Value::Null } else { Value::Array(points.clone()) },
+    });
+    let content = serde_json::to_string(&data)?;
+    if let Some(output_path) = get_str(args, "output_path") {
+        let output_path = resolve_output_path(&index.root, &output_path);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&output_path, content)?;
+        if split_files {
+            let points_path = output_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("module-atlas-points.json");
+            fs::write(&points_path, serde_json::to_string(&points)?)?;
+        }
+        Ok(format!(
+            "exported module atlas to {}",
+            output_path.display()
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
+#[derive(Debug)]
+struct ModuleAtlasModule {
+    community_id: usize,
+    label: String,
+    file_count: usize,
+    symbol_count: usize,
+    confidence: f32,
+    cohesion: f32,
+    semantic_density: f32,
+    cross_folder: bool,
+    language_counts: Vec<Value>,
+    terms: Vec<Value>,
+    path_roots: Vec<Value>,
+    entry_points: Vec<Value>,
+    key_symbols: Vec<Value>,
+    central_files: Vec<Value>,
+    files: Vec<String>,
+}
+
+fn build_file_module_raws(
+    index: &Codebase,
+    min_files: usize,
+    path_prefix: Option<&str>,
+) -> Vec<ModuleRaw> {
+    let allowed = index
+        .files
+        .keys()
+        .filter(|path| path_prefix.is_none_or(|prefix| path_matches_prefix(path, prefix)))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    let communities = detect_file_dependency_modules(index, &allowed);
+    communities
+        .into_iter()
+        .enumerate()
+        .filter_map(|(community_id, files)| {
+            if files.len() < min_files {
+                return None;
+            }
+            let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+            let token_counts = module_token_counts(index, &files);
+            let symbol_count = files
+                .iter()
+                .filter_map(|path| index.files.get(path))
+                .map(|file| file.symbols.len())
+                .sum();
+            let (internal_deps, outgoing_deps, incoming_deps) =
+                module_dependency_counts(index, &file_set);
+            Some(ModuleRaw {
+                community_id,
+                fallback_label: module_label_from_files(index, &files),
+                files,
+                token_counts,
+                symbol_count,
+                internal_deps,
+                outgoing_deps,
+                incoming_deps,
+            })
+        })
+        .collect()
+}
+
+fn detect_file_dependency_modules(
+    index: &Codebase,
+    allowed: &BTreeSet<String>,
+) -> Vec<Vec<String>> {
+    let mut label_ids = BTreeMap::<String, usize>::new();
+    let mut next_label_id = 0usize;
+    let mut labels = HashMap::<String, usize>::new();
+    let mut own_labels = HashMap::<String, usize>::new();
+    for path in allowed {
+        let label = index
+            .files
+            .get(path)
+            .map(dominant_feature_for_file)
+            .unwrap_or_else(|| module_path_root(path));
+        let id = *label_ids.entry(label).or_insert_with(|| {
+            let id = next_label_id;
+            next_label_id += 1;
+            id
+        });
+        labels.insert(path.clone(), id);
+        own_labels.insert(path.clone(), id);
+    }
+
+    let hub_targets = index
+        .deps_reverse
+        .iter()
+        .filter(|(path, sources)| {
+            allowed.contains(*path) && sources.len() > MODULE_HUB_INCOMING_LIMIT
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut adjacency = HashMap::<String, Vec<(String, f32)>>::new();
+    for path in allowed {
+        let mut emitted = 0usize;
+        for dep in index.deps_forward.get(path).into_iter().flatten() {
+            if emitted >= MODULE_MAX_DEPENDENCY_EDGES_PER_FILE {
+                break;
+            }
+            if !allowed.contains(dep) || hub_targets.contains(dep) || dep == path {
+                continue;
+            }
+            adjacency
+                .entry(path.clone())
+                .or_default()
+                .push((dep.clone(), 6.0));
+            adjacency
+                .entry(dep.clone())
+                .or_default()
+                .push((path.clone(), 4.0));
+            emitted += 1;
+        }
+    }
+
+    let mut modules = Vec::new();
+    for component in dependency_components(allowed, &adjacency) {
+        let component_set = component.iter().cloned().collect::<BTreeSet<_>>();
+        let mut order = component.clone();
+        order.sort_by(|a, b| {
+            adjacency
+                .get(b)
+                .map(Vec::len)
+                .unwrap_or(0)
+                .cmp(&adjacency.get(a).map(Vec::len).unwrap_or(0))
+                .then_with(|| a.cmp(b))
+        });
+        for _ in 0..MODULE_LABEL_ITERATIONS {
+            let mut changed = false;
+            for path in &order {
+                let mut votes = BTreeMap::<usize, f32>::new();
+                if let Some(own) = own_labels.get(path).copied() {
+                    *votes.entry(own).or_default() += 2.5;
+                }
+                for (neighbor, weight) in adjacency.get(path).into_iter().flatten() {
+                    if !component_set.contains(neighbor) {
+                        continue;
+                    }
+                    if let Some(label) = labels.get(neighbor).copied() {
+                        *votes.entry(label).or_default() += *weight;
+                    }
+                }
+                let Some((best, _)) = votes
+                    .into_iter()
+                    .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                else {
+                    continue;
+                };
+                if labels.get(path).copied() != Some(best) {
+                    labels.insert(path.clone(), best);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut grouped = BTreeMap::<usize, Vec<String>>::new();
+        for path in component {
+            let label = labels.get(&path).copied().unwrap_or(0);
+            grouped.entry(label).or_default().push(path);
+        }
+        for (_, files) in grouped {
+            split_dependency_module_group(index, files, &mut modules);
+        }
+    }
+    modules.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    modules
+}
+
+fn dependency_components(
+    allowed: &BTreeSet<String>,
+    adjacency: &HashMap<String, Vec<(String, f32)>>,
+) -> Vec<Vec<String>> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut components = Vec::new();
+    for path in allowed {
+        if seen.contains(path) {
+            continue;
+        }
+        let mut queue = VecDeque::from([path.clone()]);
+        let mut component = Vec::new();
+        seen.insert(path.clone());
+        while let Some(current) = queue.pop_front() {
+            component.push(current.clone());
+            for (neighbor, _) in adjacency.get(&current).into_iter().flatten() {
+                if allowed.contains(neighbor) && seen.insert(neighbor.clone()) {
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+        component.sort();
+        components.push(component);
+    }
+    components.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    components
+}
+
+fn split_dependency_module_group(index: &Codebase, files: Vec<String>, out: &mut Vec<Vec<String>>) {
+    if files.len() <= MODULE_MAX_FILES_PER_GROUP {
+        out.push(files);
+        return;
+    }
+    let mut by_feature = BTreeMap::<String, Vec<String>>::new();
+    for path in files {
+        let feature = index
+            .files
+            .get(&path)
+            .map(dominant_feature_for_file)
+            .unwrap_or_else(|| module_path_root(&path));
+        by_feature.entry(feature).or_default().push(path);
+    }
+    for (_, mut group) in by_feature {
+        group.sort();
+        if group.len() <= MODULE_MAX_FILES_PER_GROUP {
+            out.push(group);
+        } else {
+            for chunk in group.chunks(MODULE_MAX_FILES_PER_GROUP) {
+                out.push(chunk.to_vec());
+            }
+        }
+    }
+}
+
+fn dominant_feature_for_file(file: &FileEntry) -> String {
+    top_terms_from_counts(&file_module_token_counts(file), 1)
+        .into_iter()
+        .next()
+        .map(|(term, _)| term)
+        .unwrap_or_else(|| module_path_root(&file.path))
+}
+
+fn module_label_from_files(index: &Codebase, files: &[String]) -> String {
+    let counts = module_token_counts(index, files);
+    let terms = top_terms_from_counts(&counts, 2)
+        .into_iter()
+        .map(|(term, _)| term)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        files
+            .first()
+            .map(|path| module_path_root(path))
+            .unwrap_or_else(|| "module".to_string())
+    } else {
+        terms.join("/")
+    }
+}
+
+fn module_term_document_frequency(raws: &[ModuleRaw]) -> BTreeMap<String, usize> {
+    let mut document_frequency = BTreeMap::new();
+    for raw in raws {
+        for term in raw.token_counts.keys() {
+            *document_frequency.entry(term.clone()).or_default() += 1;
+        }
+    }
+    document_frequency
+}
+
+fn ranked_module_terms(
+    counts: &BTreeMap<String, usize>,
+    document_frequency: &BTreeMap<String, usize>,
+    total_modules: usize,
+) -> Vec<(String, f32, usize)> {
+    let total_modules = total_modules.max(1) as f32;
+    let mut terms = counts
+        .iter()
+        .filter_map(|(term, count)| {
+            let df = *document_frequency.get(term).unwrap_or(&1) as f32;
+            let idf = (1.0 + total_modules / df).ln();
+            let score = (*count as f32) * idf;
+            (score > 0.0).then(|| (term.clone(), round2_local(score), *count))
+        })
+        .collect::<Vec<_>>();
+    terms.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    terms
+}
+
+fn module_label(terms: &[(String, f32, usize)], fallback: &str) -> String {
+    let selected = terms
+        .iter()
+        .map(|(term, _, _)| term.as_str())
+        .take(2)
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        fallback.to_string()
+    } else {
+        selected.join("/")
+    }
+}
+
+fn module_token_counts(index: &Codebase, files: &[String]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for path in files {
+        for part in path.split(['/', '.', '-', ' ', '+']) {
+            add_module_token(part, 1, &mut counts);
+        }
+        let Some(file) = index.files.get(path) else {
+            continue;
+        };
+        if let Some(namespace) = &file.namespace {
+            for part in namespace.split('.') {
+                add_module_token(part, 2, &mut counts);
+            }
+        }
+        for symbol in &file.symbols {
+            let weight = if matches!(
+                symbol.kind.as_str(),
+                "class" | "interface" | "struct" | "enum" | "record"
+            ) {
+                4
+            } else {
+                2
+            };
+            for part in split_identifier(&symbol.name) {
+                add_module_token(&part, weight, &mut counts);
+            }
+        }
+    }
+    counts
+}
+
+fn add_module_token(token: &str, weight: usize, counts: &mut BTreeMap<String, usize>) {
+    for part in split_identifier(token) {
+        if is_module_token(&part) {
+            *counts.entry(part).or_default() += weight;
+        }
+    }
+}
+
+fn is_module_token(token: &str) -> bool {
+    token.len() >= 3
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        && !token.chars().all(|ch| ch.is_ascii_digit())
+        && !MODULE_TERM_STOPWORDS.contains(&token)
+}
+
+fn module_dependency_counts(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+) -> (usize, usize, usize) {
+    let mut internal = 0usize;
+    let mut outgoing = 0usize;
+    let mut incoming = 0usize;
+    for path in file_paths {
+        for dep in index.deps_forward.get(path).into_iter().flatten() {
+            if file_paths.contains(dep) {
+                internal += 1;
+            } else {
+                outgoing += 1;
+            }
+        }
+        for source in index.deps_reverse.get(path).into_iter().flatten() {
+            if !file_paths.contains(source) {
+                incoming += 1;
+            }
+        }
+    }
+    (internal, outgoing, incoming)
+}
+
+fn dependency_cohesion(internal: usize, boundary: usize) -> f32 {
+    let total = internal + boundary;
+    if total == 0 {
+        0.0
+    } else {
+        round2_local(internal as f32 / total as f32)
+    }
+}
+
+fn central_files_for_module(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    let mut items = file_paths
+        .iter()
+        .filter_map(|path| {
+            let file = index.files.get(path)?;
+            let internal_out = index
+                .deps_forward
+                .get(path)
+                .into_iter()
+                .flatten()
+                .filter(|dep| file_paths.contains(*dep))
+                .count();
+            let internal_in = index
+                .deps_reverse
+                .get(path)
+                .into_iter()
+                .flatten()
+                .filter(|source| file_paths.contains(*source))
+                .count();
+            let external_out = index
+                .deps_forward
+                .get(path)
+                .into_iter()
+                .flatten()
+                .filter(|dep| !file_paths.contains(*dep))
+                .count();
+            let external_in = index
+                .deps_reverse
+                .get(path)
+                .into_iter()
+                .flatten()
+                .filter(|source| !file_paths.contains(*source))
+                .count();
+            let score = internal_in * 3
+                + internal_out * 3
+                + external_in
+                + external_out
+                + file.symbols.len();
+            Some((
+                score,
+                json!({
+                    "path": path,
+                    "language": file.language,
+                    "line_count": file.line_count,
+                    "symbols": file.symbols.len(),
+                    "internal_edges": internal_in + internal_out,
+                    "external_edges": external_in + external_out,
+                }),
+            ))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn central_files_for_module_camel(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    central_files_for_module(index, file_paths, limit)
+        .into_iter()
+        .map(|item| {
+            json!({
+                "path": item.get("path").cloned().unwrap_or(Value::Null),
+                "language": item.get("language").cloned().unwrap_or(Value::Null),
+                "lineCount": item.get("line_count").cloned().unwrap_or(Value::Null),
+                "symbols": item.get("symbols").cloned().unwrap_or(Value::Null),
+                "internalEdges": item.get("internal_edges").cloned().unwrap_or(Value::Null),
+                "externalEdges": item.get("external_edges").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn key_symbols_for_module(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    for path in file_paths {
+        let Some(file) = index.files.get(path) else {
+            continue;
+        };
+        for symbol in &file.symbols {
+            let score = symbol_importance(&symbol.kind, &symbol.name);
+            if score == 0 {
+                continue;
+            }
+            items.push((
+                score,
+                json!({
+                    "path": path,
+                    "line": symbol.line_start,
+                    "kind": symbol.kind,
+                    "name": symbol.name,
+                }),
+            ));
+        }
+    }
+    items.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            a.1.get("name")
+                .and_then(Value::as_str)
+                .cmp(&b.1.get("name").and_then(Value::as_str))
+        })
+    });
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn key_symbols_for_module_camel(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    key_symbols_for_module(index, file_paths, limit)
+        .into_iter()
+        .map(|item| {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            let language = index
+                .files
+                .get(path)
+                .map(|file| language_label(&file.language))
+                .unwrap_or("");
+            json!({
+                "path": item.get("path").cloned().unwrap_or(Value::Null),
+                "line": item.get("line").cloned().unwrap_or(Value::Null),
+                "language": language,
+                "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                "name": item.get("name").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn entry_points_for_module(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    for path in file_paths {
+        let Some(file) = index.files.get(path) else {
+            continue;
+        };
+        for symbol in &file.symbols {
+            let score = entry_point_score(&symbol.kind, &symbol.name, path);
+            if score == 0 {
+                continue;
+            }
+            items.push((
+                score,
+                json!({
+                    "path": path,
+                    "line": symbol.line_start,
+                    "kind": symbol.kind,
+                    "name": symbol.name,
+                }),
+            ));
+        }
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn entry_points_for_module_camel(
+    index: &Codebase,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<Value> {
+    entry_points_for_module(index, file_paths, limit)
+        .into_iter()
+        .map(|item| {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            let language = index
+                .files
+                .get(path)
+                .map(|file| language_label(&file.language))
+                .unwrap_or("");
+            json!({
+                "path": item.get("path").cloned().unwrap_or(Value::Null),
+                "line": item.get("line").cloned().unwrap_or(Value::Null),
+                "language": language,
+                "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                "name": item.get("name").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn symbol_importance(kind: &str, name: &str) -> usize {
+    let kind_score = match kind {
+        "class" | "interface" | "struct" | "enum" | "record" => 8,
+        "method" | "constructor" | "function" => 4,
+        "property" | "field" => 2,
+        _ => 1,
+    };
+    kind_score + business_name_bonus(name)
+}
+
+fn entry_point_score(kind: &str, name: &str, path: &str) -> usize {
+    let lower = name.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let mut score = 0usize;
+    if matches!(
+        kind,
+        "class" | "interface" | "struct" | "record" | "method" | "function" | "constructor"
+    ) {
+        score += business_name_bonus(name);
+    }
+    if matches!(
+        lower.as_str(),
+        "awake" | "start" | "init" | "initialize" | "run" | "execute" | "process" | "update"
+    ) {
+        score += 4;
+    }
+    if lower.starts_with("on") || lower.starts_with("handle") {
+        score += 3;
+    }
+    if path_lower.contains("/controller/")
+        || path_lower.contains("/controllers/")
+        || path_lower.contains("/manager/")
+        || path_lower.contains("/managers/")
+        || path_lower.contains("/service/")
+        || path_lower.contains("/services/")
+        || path_lower.contains("/view/")
+        || path_lower.contains("/views/")
+    {
+        score += 2;
+    }
+    score
+}
+
+fn business_name_bonus(name: &str) -> usize {
+    let lower = name.to_ascii_lowercase();
+    let mut score = 0usize;
+    for suffix in [
+        "manager",
+        "controller",
+        "service",
+        "listener",
+        "handler",
+        "router",
+        "view",
+        "panel",
+        "system",
+        "facade",
+        "module",
+        "model",
+        "repository",
+        "processor",
+        "factory",
+    ] {
+        if lower.contains(suffix) {
+            score += 3;
+        }
+    }
+    score
+}
+
+fn module_path_roots(files: &[String], limit: usize) -> Vec<Value> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for path in files {
+        *counts.entry(module_path_root(path)).or_default() += 1;
+    }
+    let mut items = counts.into_iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(path, files)| json!({"path": path, "files": files}))
+        .collect()
+}
+
+fn module_path_roots_camel(files: &[String], limit: usize) -> Vec<Value> {
+    module_path_roots(files, limit)
+}
+
+fn module_path_root(path: &str) -> String {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let dir_count = parts.len().saturating_sub(1);
+    let depth = dir_count.min(5);
+    if depth == 0 {
+        String::new()
+    } else {
+        parts[..depth].join("/")
+    }
+}
+
+fn semantic_query_for_module(
+    label: &str,
+    terms: &[(String, f32, usize)],
+    key_symbols: &[Value],
+) -> String {
+    let mut pieces = Vec::new();
+    pieces.push(label.to_string());
+    pieces.extend(terms.iter().take(6).map(|(term, _, _)| term.clone()));
+    pieces.extend(
+        key_symbols
+            .iter()
+            .take(4)
+            .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string)),
+    );
+    pieces.join(" ")
+}
+
+fn semantic_neighbors_for_module(
+    index: &Codebase,
+    query: &str,
+    file_paths: &BTreeSet<String>,
+    limit: usize,
+) -> Result<(Vec<Value>, f32)> {
+    if limit == 0 || query.trim().is_empty() {
+        return Ok((Vec::new(), 0.0));
+    }
+    let query_vec = index.model.encode_one(query);
+    let hits = index.vectors.query(&query_vec, limit, None)?;
+    let mut in_module = 0usize;
+    let mut values = Vec::new();
+    for (unit_idx, score) in hits {
+        let Some(unit) = index.semantic_units.get(unit_idx) else {
+            continue;
+        };
+        let is_in_module = file_paths.contains(&unit.file_path);
+        if is_in_module {
+            in_module += 1;
+        }
+        values.push(json!({
+            "path": unit.file_path,
+            "score": round2_local(score),
+            "in_module": is_in_module,
+        }));
+    }
+    let density = if values.is_empty() {
+        0.0
+    } else {
+        round2_local(in_module as f32 / values.len() as f32)
+    };
+    Ok((values, density))
+}
+
+fn module_semantic_density(terms: &[(String, f32, usize)], symbol_count: usize) -> f32 {
+    let top_count = terms
+        .iter()
+        .take(5)
+        .map(|(_, _, count)| *count)
+        .sum::<usize>();
+    if symbol_count == 0 {
+        0.0
+    } else {
+        round2_local((top_count as f32 / symbol_count as f32).min(1.0))
+    }
+}
+
+fn module_language_counts(index: &Codebase, files: &[String]) -> Vec<Value> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for path in files {
+        if let Some(file) = index.files.get(path) {
+            *counts
+                .entry(language_label(&file.language).to_string())
+                .or_default() += 1;
+        }
+    }
+    let mut items = counts.into_iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items
+        .into_iter()
+        .map(|(language, files)| json!({"language": language, "files": files}))
+        .collect()
+}
+
+fn language_counts(index: &Codebase) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for file in index.files.values() {
+        *counts
+            .entry(language_label(&file.language).to_string())
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn language_label(language: &str) -> &str {
+    match language {
+        "csharp" => "C#",
+        "java" => "Java",
+        "rust" => "Rust",
+        "python" => "Python",
+        "javascript" | "jsx" => "JavaScript",
+        "typescript" | "tsx" => "TypeScript",
+        "c" => "C",
+        "cpp" => "C++",
+        other => other,
+    }
+}
+
+fn file_module_token_counts(file: &FileEntry) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for part in file.path.split(['/', '.', '-', ' ', '+', '_']) {
+        add_module_token(part, 1, &mut counts);
+    }
+    if let Some(namespace) = &file.namespace {
+        for part in namespace.split('.') {
+            add_module_token(part, 2, &mut counts);
+        }
+    }
+    for import in &file.imports {
+        for part in import.split(['/', '.', ':', '-', ' ', '+', '_']) {
+            add_module_token(part, 1, &mut counts);
+        }
+    }
+    for symbol in &file.symbols {
+        let weight = if matches!(
+            symbol.kind.as_str(),
+            "class" | "interface" | "struct" | "enum" | "record"
+        ) {
+            4
+        } else {
+            2
+        };
+        for part in split_identifier(&symbol.name) {
+            add_module_token(&part, weight, &mut counts);
+        }
+    }
+    counts
+}
+
+fn top_terms_from_counts(counts: &BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
+    let mut items = counts
+        .iter()
+        .map(|(term, count)| (term.clone(), *count))
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items
+}
+
+fn atlas_dependency_ids(
+    paths: Option<&Vec<String>>,
+    path_to_point_id: &HashMap<String, usize>,
+    limit: usize,
+) -> Vec<usize> {
+    let Some(paths) = paths else {
+        return Vec::new();
+    };
+    let mut items = paths
+        .iter()
+        .filter_map(|path| path_to_point_id.get(path).copied())
+        .collect::<Vec<_>>();
+    items.sort();
+    items.dedup();
+    items.truncate(limit);
+    items
+}
+
+fn module_confidence_score(
+    file_count: usize,
+    cohesion: f32,
+    semantic_density: f32,
+    entry_points: usize,
+    cross_folder: bool,
+) -> f32 {
+    let size_component = ((file_count as f32).ln_1p() / 5.0).min(0.35);
+    let entry_component = (entry_points as f32 * 0.03).min(0.15);
+    let cross_component = if cross_folder { 0.05 } else { 0.0 };
+    round2_local(
+        (cohesion * 0.35
+            + semantic_density * 0.25
+            + size_component
+            + entry_component
+            + cross_component)
+            .clamp(0.0, 1.0),
+    )
+}
+
+fn module_evidence(
+    file_count: usize,
+    symbol_count: usize,
+    internal_deps: usize,
+    boundary_deps: usize,
+    cohesion: f32,
+    cross_folder: bool,
+    semantic_density: f32,
+) -> Vec<String> {
+    let mut evidence = vec![
+        format!("{file_count} files and {symbol_count} indexed symbols"),
+        format!(
+            "dependency cohesion {cohesion:.2} from {internal_deps} internal and {boundary_deps} boundary dependency edges"
+        ),
+        format!("semantic neighbor density {semantic_density:.2}"),
+    ];
+    if cross_folder {
+        evidence.push(
+            "files span multiple path roots; treat folder labels as weak evidence".to_string(),
+        );
+    }
+    evidence
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModuleLayout {
+    x: f32,
+    y: f32,
+    radius: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ModuleLayoutItem {
+    id: usize,
+    radius: f32,
+    desired_x: f32,
+    desired_y: f32,
+    x: f32,
+    y: f32,
+}
+
+fn module_layouts(index: &Codebase, modules: &[ModuleAtlasModule]) -> HashMap<usize, ModuleLayout> {
+    if modules.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut items = modules
+        .iter()
+        .map(|module| {
+            let counts = module_term_counts(module);
+            let anchor = module_anchor(&module.label, &counts, modules.len());
+            ModuleLayoutItem {
+                id: module.community_id,
+                radius: module_layout_radius(module.file_count),
+                desired_x: anchor.0,
+                desired_y: anchor.1,
+                x: anchor.0,
+                y: anchor.1,
+            }
+        })
+        .collect::<Vec<_>>();
+    let module_edges = module_layout_edges(index, modules);
+    relax_module_layout(&mut items, &module_edges);
+
+    let mut layouts = HashMap::new();
+    for item in items {
+        layouts.insert(
+            item.id,
+            ModuleLayout {
+                x: round2_local(item.x),
+                y: round2_local(item.y),
+                radius: item.radius,
+            },
+        );
+    }
+
+    layouts
+}
+
+fn module_layout_radius(file_count: usize) -> f32 {
+    let radius = 2.1 + (file_count as f32).sqrt() * 0.34;
+    radius.clamp(2.8, 11.5)
+}
+
+fn module_anchor(label: &str, counts: &BTreeMap<String, usize>, module_count: usize) -> (f32, f32) {
+    let semantic = project_terms(counts, 1.0);
+    let hash = fnv1a(label);
+    let angle = random01(hash) * std::f32::consts::TAU;
+    let ring = 0.65 + random01(hash ^ 0x4f1b_cdc1) * 0.55;
+    let spread = (module_count as f32).sqrt().max(8.0) * 32.0;
+    (
+        (semantic.0 * 0.62 + angle.cos() * ring * 0.38) * spread,
+        (semantic.1 * 0.62 + angle.sin() * ring * 0.38) * spread,
+    )
+}
+
+fn module_layout_edges(
+    index: &Codebase,
+    modules: &[ModuleAtlasModule],
+) -> Vec<(usize, usize, f32)> {
+    let mut path_to_module = HashMap::<&str, usize>::new();
+    for module in modules {
+        for path in &module.files {
+            path_to_module.insert(path.as_str(), module.community_id);
+        }
+    }
+
+    let mut weights = BTreeMap::<(usize, usize), f32>::new();
+    for module in modules {
+        for path in &module.files {
+            let Some(from) = path_to_module.get(path.as_str()).copied() else {
+                continue;
+            };
+            for dep in index.deps_forward.get(path).into_iter().flatten() {
+                let Some(to) = path_to_module.get(dep.as_str()).copied() else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                let key = if from < to { (from, to) } else { (to, from) };
+                *weights.entry(key).or_default() += 1.0;
+            }
+        }
+    }
+
+    weights
+        .into_iter()
+        .filter_map(|((a, b), weight)| (weight >= 2.0).then_some((a, b, weight)))
+        .collect()
+}
+
+fn relax_module_layout(items: &mut [ModuleLayoutItem], edges: &[(usize, usize, f32)]) {
+    let mut id_to_index = HashMap::<usize, usize>::new();
+    for (idx, item) in items.iter().enumerate() {
+        id_to_index.insert(item.id, idx);
+    }
+
+    for _ in 0..180 {
+        let mut delta = vec![(0.0f32, 0.0f32); items.len()];
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                let dx = items[j].x - items[i].x;
+                let dy = items[j].y - items[i].y;
+                let distance_sq = (dx * dx + dy * dy).max(0.04);
+                let distance = distance_sq.sqrt();
+                let min_distance = items[i].radius + items[j].radius + 8.0;
+                let force = if distance < min_distance {
+                    (min_distance - distance) * 0.18
+                } else {
+                    ((items[i].radius * items[j].radius) / distance_sq).min(0.04)
+                };
+                let nx = dx / distance;
+                let ny = dy / distance;
+                delta[i].0 -= nx * force;
+                delta[i].1 -= ny * force;
+                delta[j].0 += nx * force;
+                delta[j].1 += ny * force;
+            }
+        }
+
+        for (a, b, weight) in edges {
+            let (Some(&ai), Some(&bi)) = (id_to_index.get(a), id_to_index.get(b)) else {
+                continue;
+            };
+            let dx = items[bi].x - items[ai].x;
+            let dy = items[bi].y - items[ai].y;
+            let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+            let target = items[ai].radius + items[bi].radius + 30.0 + 50.0 / weight.sqrt();
+            let weight_effect = weight.sqrt().min(3.0);
+            let force = ((distance - target) * 0.0015 * weight_effect).clamp(-0.05, 0.05);
+            let nx = dx / distance;
+            let ny = dy / distance;
+            delta[ai].0 += nx * force;
+            delta[ai].1 += ny * force;
+            delta[bi].0 -= nx * force;
+            delta[bi].1 -= ny * force;
+        }
+
+        for (idx, item) in items.iter().enumerate() {
+            delta[idx].0 += (item.desired_x - item.x) * 0.018;
+            delta[idx].1 += (item.desired_y - item.y) * 0.018;
+        }
+
+        for (item, (dx, dy)) in items.iter_mut().zip(delta) {
+            item.x += dx.clamp(-2.4, 2.4);
+            item.y += dy.clamp(-2.4, 2.4);
+        }
+    }
+
+    resolve_module_collisions(items);
+    center_layout(items);
+}
+
+fn resolve_module_collisions(items: &mut [ModuleLayoutItem]) {
+    for _ in 0..80 {
+        let mut moved = false;
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                let dx = items[j].x - items[i].x;
+                let dy = items[j].y - items[i].y;
+                let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+                let min_distance = items[i].radius + items[j].radius + 7.0;
+                if distance >= min_distance {
+                    continue;
+                }
+                let push = (min_distance - distance) * 0.52;
+                let nx = dx / distance;
+                let ny = dy / distance;
+                items[i].x -= nx * push;
+                items[i].y -= ny * push;
+                items[j].x += nx * push;
+                items[j].y += ny * push;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+fn center_layout(items: &mut [ModuleLayoutItem]) {
+    if items.is_empty() {
+        return;
+    }
+    let cx = items.iter().map(|item| item.x).sum::<f32>() / items.len() as f32;
+    let cy = items.iter().map(|item| item.y).sum::<f32>() / items.len() as f32;
+    for item in items {
+        item.x -= cx;
+        item.y -= cy;
+    }
+}
+
+fn module_file_offsets(
+    index: &Codebase,
+    module: &ModuleAtlasModule,
+    radius: f32,
+) -> HashMap<String, (f32, f32)> {
+    let internal_degrees = module_internal_degrees(index, module);
+    let max_degree = internal_degrees.values().copied().max().unwrap_or(1).max(1) as f32;
+    let mut items = module
+        .files
+        .iter()
+        .filter_map(|path| {
+            let file = index.files.get(path)?;
+            let terms = file_module_token_counts(file);
+            let degree = *internal_degrees.get(path).unwrap_or(&0) as f32;
+            let target = file_layout_target(path, &terms, degree, max_degree, radius);
+            Some(FileLayoutItem {
+                path: path.clone(),
+                radius: file_node_radius(file),
+                x: target.0,
+                y: target.1,
+                target_x: target.0,
+                target_y: target.1,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if items.is_empty() {
+        return HashMap::new();
+    }
+    if items.len() == 1 {
+        return HashMap::from([(items[0].path.clone(), (0.0, 0.0))]);
+    }
+
+    let edges = file_layout_edges(index, module);
+    relax_file_layout(&mut items, &edges, radius);
+    items
+        .into_iter()
+        .map(|item| (item.path, (round2_local(item.x), round2_local(item.y))))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct FileLayoutItem {
+    path: String,
+    radius: f32,
+    x: f32,
+    y: f32,
+    target_x: f32,
+    target_y: f32,
+}
+
+fn file_node_radius(file: &FileEntry) -> f32 {
+    (0.09 + (file.symbols.len() as f32).sqrt() * 0.012).clamp(0.08, 0.22)
+}
+
+fn module_internal_degrees(index: &Codebase, module: &ModuleAtlasModule) -> HashMap<String, usize> {
+    let file_set = module.files.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut degrees = HashMap::<String, usize>::new();
+    for path in &module.files {
+        let outgoing = index
+            .deps_forward
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter(|dep| file_set.contains(dep.as_str()))
+            .count();
+        let incoming = index
+            .deps_reverse
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter(|source| file_set.contains(source.as_str()))
+            .count();
+        degrees.insert(path.clone(), incoming + outgoing);
+    }
+    degrees
+}
+
+fn file_layout_target(
+    path: &str,
+    terms: &BTreeMap<String, usize>,
+    degree: f32,
+    max_degree: f32,
+    radius: f32,
+) -> (f32, f32) {
+    let semantic = project_terms(terms, radius * 0.46);
+    let folder = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(path);
+    let folder_hash = fnv1a(folder);
+    let folder_angle = random01(folder_hash) * std::f32::consts::TAU;
+    let folder_radius = random01(folder_hash ^ 0x72ab_91d3).sqrt() * radius * 0.34;
+    let path_hash = fnv1a(path);
+    let jitter_angle = random01(path_hash ^ 0x7f4a_7c15) * std::f32::consts::TAU;
+    let jitter_radius = random01(path_hash ^ 0xb529_7a4d).sqrt() * radius * 0.22;
+    let centrality = (degree / max_degree).sqrt().clamp(0.0, 1.0);
+    let inward = 1.0 - centrality * 0.55;
+    clamp_vector(
+        (
+            (semantic.0 + folder_angle.cos() * folder_radius) * inward
+                + jitter_angle.cos() * jitter_radius,
+            (semantic.1 + folder_angle.sin() * folder_radius) * inward
+                + jitter_angle.sin() * jitter_radius,
+        ),
+        radius * 0.78,
+    )
+}
+
+fn file_layout_edges(index: &Codebase, module: &ModuleAtlasModule) -> Vec<(usize, usize, f32)> {
+    let mut path_to_index = HashMap::<&str, usize>::new();
+    for (idx, path) in module.files.iter().enumerate() {
+        path_to_index.insert(path.as_str(), idx);
+    }
+    let mut weights = BTreeMap::<(usize, usize), f32>::new();
+    for path in &module.files {
+        let Some(from) = path_to_index.get(path.as_str()).copied() else {
+            continue;
+        };
+        for dep in index.deps_forward.get(path).into_iter().flatten() {
+            let Some(to) = path_to_index.get(dep.as_str()).copied() else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            let key = if from < to { (from, to) } else { (to, from) };
+            *weights.entry(key).or_default() += 1.0;
+        }
+    }
+    weights.into_iter().map(|((a, b), w)| (a, b, w)).collect()
+}
+
+fn relax_file_layout(items: &mut [FileLayoutItem], edges: &[(usize, usize, f32)], radius: f32) {
+    for _ in 0..70 {
+        let mut delta = vec![(0.0f32, 0.0f32); items.len()];
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                let dx = items[j].x - items[i].x;
+                let dy = items[j].y - items[i].y;
+                let distance_sq = (dx * dx + dy * dy).max(0.0004);
+                let distance = distance_sq.sqrt();
+                let min_distance = items[i].radius + items[j].radius + radius * 0.018;
+                if distance >= min_distance {
+                    continue;
+                }
+                let force = (min_distance - distance) * 0.24;
+                let nx = dx / distance;
+                let ny = dy / distance;
+                delta[i].0 -= nx * force;
+                delta[i].1 -= ny * force;
+                delta[j].0 += nx * force;
+                delta[j].1 += ny * force;
+            }
+        }
+
+        for (a, b, weight) in edges {
+            let dx = items[*b].x - items[*a].x;
+            let dy = items[*b].y - items[*a].y;
+            let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+            let target = radius * (0.18 + 0.08 / weight.sqrt());
+            let force = ((distance - target) * 0.006 * weight.sqrt()).clamp(-0.035, 0.035);
+            let nx = dx / distance;
+            let ny = dy / distance;
+            delta[*a].0 += nx * force;
+            delta[*a].1 += ny * force;
+            delta[*b].0 -= nx * force;
+            delta[*b].1 -= ny * force;
+        }
+
+        for (idx, item) in items.iter().enumerate() {
+            delta[idx].0 += (item.target_x - item.x) * 0.05;
+            delta[idx].1 += (item.target_y - item.y) * 0.05;
+            delta[idx].0 -= item.x * 0.002;
+            delta[idx].1 -= item.y * 0.002;
+            let distance = (item.x * item.x + item.y * item.y).sqrt();
+            if distance > radius * 0.82 {
+                let pull = (distance - radius * 0.82) * 0.18;
+                delta[idx].0 -= item.x / distance * pull;
+                delta[idx].1 -= item.y / distance * pull;
+            }
+        }
+
+        for (item, (dx, dy)) in items.iter_mut().zip(delta) {
+            item.x += dx.clamp(-radius * 0.035, radius * 0.035);
+            item.y += dy.clamp(-radius * 0.035, radius * 0.035);
+            let clamped = clamp_vector((item.x, item.y), radius * 0.84);
+            item.x = clamped.0;
+            item.y = clamped.1;
+        }
+    }
+}
+
+fn module_term_counts(module: &ModuleAtlasModule) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for term in &module.terms {
+        let Some(name) = term.get("term").and_then(Value::as_str) else {
+            continue;
+        };
+        let count = term
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                (term
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0)
+                    .max(0.1)
+                    * 10.0)
+                    .round() as u64
+            })
+            .max(1) as usize;
+        counts.insert(name.to_string(), count);
+    }
+    counts
+}
+
+fn clamp_vector(point: (f32, f32), max_radius: f32) -> (f32, f32) {
+    let distance = (point.0 * point.0 + point.1 * point.1).sqrt();
+    if distance <= max_radius || distance <= f32::EPSILON {
+        point
+    } else {
+        let scale = max_radius / distance;
+        (point.0 * scale, point.1 * scale)
+    }
+}
+
+fn project_terms(counts: &BTreeMap<String, usize>, scale: f32) -> (f32, f32) {
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for (term, weight) in counts {
+        let hash = fnv1a(term);
+        let angle = (hash as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+        let radius = 0.7 + random01(hash ^ 0x9e3779b9) * 0.6;
+        let weight = *weight as f32;
+        x += angle.cos() * radius * weight;
+        y += angle.sin() * radius * weight;
+        weight_sum += weight;
+    }
+    if weight_sum <= f32::EPSILON {
+        (0.0, 0.0)
+    } else {
+        ((x / weight_sum) * scale, (y / weight_sum) * scale)
+    }
+}
+
+fn fnv1a(value: &str) -> u32 {
+    let mut hash = 2166136261u32;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
+fn random01(seed: u32) -> f32 {
+    let mut value = seed;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    (value % 100000) as f32 / 100000.0
+}
+
+fn chrono_like_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn round2_local(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+const MODULE_TERM_STOPWORDS: &[&str] = &[
+    "asset",
+    "assets",
+    "base",
+    "build",
+    "cache",
+    "client",
+    "code",
+    "common",
+    "component",
+    "components",
+    "config",
+    "core",
+    "data",
+    "default",
+    "editor",
+    "factory",
+    "file",
+    "framework",
+    "game",
+    "generated",
+    "global",
+    "helper",
+    "helpers",
+    "hot",
+    "hotfix",
+    "impl",
+    "index",
+    "item",
+    "items",
+    "lib",
+    "library",
+    "list",
+    "logic",
+    "main",
+    "manager",
+    "model",
+    "module",
+    "modules",
+    "object",
+    "package",
+    "packages",
+    "plugin",
+    "runtime",
+    "script",
+    "scripts",
+    "service",
+    "simple",
+    "system",
+    "test",
+    "tests",
+    "type",
+    "types",
+    "util",
+    "utils",
+    "view",
+    "views",
+];
 
 const LOUVAIN_CACHE_VERSION: u32 = 2;
 const LOUVAIN_SUBCOMMUNITIES_CACHE_VERSION: u32 = 12;

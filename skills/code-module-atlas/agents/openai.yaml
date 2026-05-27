@@ -1,0 +1,4 @@
+interface:
+  display_name: "code-module-atlas"
+  short_description: "Build a local 3D code atlas"
+  default_prompt: "Generate a code module atlas webpage for this repository using codedb-mcp."

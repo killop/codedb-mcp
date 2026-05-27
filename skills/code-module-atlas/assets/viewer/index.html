@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- ── 百度统计 ── -->
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?079eef2061fa7b574e10a133846f270d";
+      var s = document.getElementsByTagName("script")[0];
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+    <!-- ── 基础 SEO ── -->
+    <title>codedb File Atlas</title>
+    <meta name="description" content="代码文件索引与 3D 可视化平台。从依赖出发递归索引文件依赖网络，以宇宙星系形式呈现文件间的引用关系，帮你发现优质代码文件。" />
+    <meta name="keywords" content="中文模块,独立模块,模块星系,模块导航,依赖,代码库,3D可视化,模块索引" />
+    <meta name="author" content="MeetBlog" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://meet-blog.buyixiao.xyz/" />
+    <meta name="theme-color" content="#000814" />
+
+    <!-- ── Open Graph（微信/微博/社交分享）── -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MeetBlog" />
+    <meta property="og:title" content="codedb File Atlas" />
+    <meta property="og:description" content="代码文件索引与 3D 可视化平台。以宇宙星系形式呈现文件间的依赖引用关系，帮你发现优质代码文件。" />
+    <meta property="og:url" content="https://meet-blog.buyixiao.xyz/" />
+    <meta property="og:image" content="https://meet-blog.buyixiao.xyz/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:locale" content="zh_CN" />
+
+    <!-- ── Twitter Card ── -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="codedb File Atlas" />
+    <meta name="twitter:description" content="代码文件索引与 3D 可视化平台。以宇宙星系形式呈现文件间的依赖引用关系，帮你发现优质代码文件。" />
+    <meta name="twitter:image" content="https://meet-blog.buyixiao.xyz/og-image.png" />
+
+    <!-- ── Favicon ── -->
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+
+    <!-- ── 结构化数据（JSON-LD）── -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "name": "MeetBlog",
+      "alternateName": "中文模块星系",
+      "url": "https://meet-blog.buyixiao.xyz/",
+      "description": "代码文件索引与 3D 可视化平台。从依赖出发递归索引文件依赖网络，以宇宙星系形式呈现文件间的引用关系。",
+      "inLanguage": "zh-CN",
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": {
+          "@type": "EntryPoint",
+          "urlTemplate": "https://meet-blog.buyixiao.xyz/?q={search_term_string}"
+        },
+        "query-input": "required name=search_term_string"
+      }
+    }
+    </script>
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "codedb File Atlas",
+      "url": "https://meet-blog.buyixiao.xyz/",
+      "applicationCategory": "UtilitiesApplication",
+      "operatingSystem": "Web Browser",
+      "description": "以交互式 3D 星系图可视化代码文件依赖网络。每个文件是一颗星球，依赖是星球间的引力连接，帮助用户发现和探索中文代码库。",
+      "inLanguage": "zh-CN",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "CNY"
+      }
+    }
+    </script>
+
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+
+      body {
+        background: #000008;
+        color: #e0f0ff;
+        font-family: 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+        overflow: hidden;
+        user-select: none;
+      }
+
+      #canvas {
+        position: fixed;
+        inset: 0;
+        display: block;
+      }
+
+      /* ── 加载屏幕 ── */
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #000008;
+        z-index: 100;
+        transition: opacity 0.8s ease;
+      }
+      #loading.fade-out { opacity: 0; pointer-events: none; }
+
+      /* 让文字与进度条浮在星系动画之上 */
+      .loading-title, .loading-subtitle,
+      #loading-progress, #depth-selector {
+        position: relative;
+        z-index: 2;
+      }
+
+      .loading-title {
+        font-size: 2.4rem;
+        font-weight: 300;
+        letter-spacing: 0.25em;
+        color: #7df8ff;
+        text-shadow: 0 0 30px #00c8ff88;
+        margin-bottom: 0.4em;
+      }
+      .loading-subtitle {
+        font-size: 0.9rem;
+        color: #4488aa;
+        letter-spacing: 0.1em;
+        margin-bottom: 2.5em;
+      }
+      .loading-bar-wrap {
+        width: 280px;
+        height: 2px;
+        background: rgba(100,200,255,0.15);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      #loading-bar {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #00c8ff, #7df8ff);
+        box-shadow: 0 0 12px #00c8ff;
+        transition: width 0.3s ease;
+        border-radius: 2px;
+      }
+      #loading-text {
+        margin-top: 1em;
+        font-size: 0.78rem;
+        color: #336688;
+        letter-spacing: 0.05em;
+      }
+      #loading-sub {
+        margin-top: 0.35em;
+        font-size: 0.7rem;
+        color: #2a5f7a;
+        letter-spacing: 0.04em;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+        font-variant-numeric: tabular-nums;
+        min-height: 1em;
+      }
+      #loading-sub.visible { opacity: 0.85; }
+
+      /* ── 模块星系动画（长时间加载时显示）── */
+      #loading-galaxy {
+        position: absolute;
+        top: 50%; left: 50%;
+        width: 260px; height: 260px;
+        margin: -130px 0 0 -130px;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.8s ease;
+        z-index: 0;
+      }
+      #loading-galaxy.visible { opacity: 0.55; }
+
+      /* 中心的"光核"——一个发光文件节点 */
+      .lg-core {
+        position: absolute;
+        top: 50%; left: 50%;
+        width: 18px; height: 18px;
+        margin: -9px 0 0 -9px;
+        border-radius: 50%;
+        background: radial-gradient(circle, #ffffff 0%, #7df8ff 45%, rgba(0,200,255,0) 75%);
+        box-shadow:
+          0 0 20px rgba(125, 248, 255, 0.9),
+          0 0 40px rgba(0, 200, 255, 0.5),
+          0 0 80px rgba(0, 160, 255, 0.25);
+        animation: lg-core-pulse 2.4s ease-in-out infinite;
+      }
+      @keyframes lg-core-pulse {
+        0%, 100% { transform: scale(1); filter: brightness(1); }
+        50%      { transform: scale(1.35); filter: brightness(1.5); }
+      }
+
+      /* 4 条轨道——每条是一个偏心椭圆，让整体看起来是 3D 星系 */
+      .lg-ring {
+        position: absolute;
+        top: 50%; left: 50%;
+        border: 1px dashed rgba(100, 200, 255, 0.15);
+        border-radius: 50%;
+        transform-origin: center center;
+      }
+      /* 卫星节点：贴在轨道边缘，随着轨道旋转 */
+      .lg-sat {
+        position: absolute;
+        top: -4px; left: 50%;
+        width: 8px; height: 8px;
+        margin-left: -4px;
+        border-radius: 50%;
+        background: #7df8ff;
+        box-shadow: 0 0 10px #00c8ff, 0 0 24px rgba(0, 200, 255, 0.6);
+      }
+      /* 每条轨道不同尺寸/角度/速度，互相错开，制造轨道层次感 */
+      .lg-ring-1 {
+        width: 100px; height: 100px; margin: -50px 0 0 -50px;
+        transform: rotate(12deg) rotateX(62deg);
+        animation: lg-spin 4.6s linear infinite;
+      }
+      .lg-ring-2 {
+        width: 150px; height: 150px; margin: -75px 0 0 -75px;
+        transform: rotate(-34deg) rotateX(70deg);
+        animation: lg-spin 7.2s linear infinite reverse;
+        border-color: rgba(0, 180, 255, 0.13);
+      }
+      .lg-ring-3 {
+        width: 200px; height: 200px; margin: -100px 0 0 -100px;
+        transform: rotate(26deg) rotateX(58deg);
+        animation: lg-spin 10.4s linear infinite;
+        border-color: rgba(120, 160, 255, 0.11);
+      }
+      .lg-ring-4 {
+        width: 250px; height: 250px; margin: -125px 0 0 -125px;
+        transform: rotate(-14deg) rotateX(65deg);
+        animation: lg-spin 14.8s linear infinite reverse;
+        border-color: rgba(100, 200, 255, 0.08);
+      }
+      .lg-ring-2 .lg-sat { background: #a8e4ff; box-shadow: 0 0 8px #5ec6ff; width: 6px; height: 6px; top: -3px; margin-left: -3px; }
+      .lg-ring-3 .lg-sat { background: #c8fbff; box-shadow: 0 0 7px #9ad8ff; width: 5px; height: 5px; top: -2.5px; margin-left: -2.5px; }
+      .lg-ring-4 .lg-sat { background: #e0f7ff; box-shadow: 0 0 6px #7fb8d8; width: 4px; height: 4px; top: -2px; margin-left: -2px; }
+
+      @keyframes lg-spin {
+        from { transform: var(--lg-tilt, rotate(0deg) rotateX(62deg)) rotateZ(0deg); }
+        to   { transform: var(--lg-tilt, rotate(0deg) rotateX(62deg)) rotateZ(360deg); }
+      }
+      /* 由于 CSS 变量 + transform 组合较复杂，此处直接在各 ring 上覆盖 keyframes */
+      .lg-ring-1 { animation-name: lg-spin-1; }
+      .lg-ring-2 { animation-name: lg-spin-2; }
+      .lg-ring-3 { animation-name: lg-spin-3; }
+      .lg-ring-4 { animation-name: lg-spin-4; }
+      @keyframes lg-spin-1 {
+        from { transform: rotate(12deg)  rotateX(62deg) rotateZ(0deg); }
+        to   { transform: rotate(12deg)  rotateX(62deg) rotateZ(360deg); }
+      }
+      @keyframes lg-spin-2 {
+        from { transform: rotate(-34deg) rotateX(70deg) rotateZ(360deg); }
+        to   { transform: rotate(-34deg) rotateX(70deg) rotateZ(0deg); }
+      }
+      @keyframes lg-spin-3 {
+        from { transform: rotate(26deg)  rotateX(58deg) rotateZ(0deg); }
+        to   { transform: rotate(26deg)  rotateX(58deg) rotateZ(360deg); }
+      }
+      @keyframes lg-spin-4 {
+        from { transform: rotate(-14deg) rotateX(65deg) rotateZ(360deg); }
+        to   { transform: rotate(-14deg) rotateX(65deg) rotateZ(0deg); }
+      }
+      /* 尊重用户系统设置：如果开启了"减少动态效果"，停止旋转 */
+      @media (prefers-reduced-motion: reduce) {
+        .lg-ring, .lg-core { animation: none !important; }
+      }
+
+      /* ── 深度选择器 ── */
+      #depth-selector {
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 0;
+        animation: fadeIn 0.4s ease;
+      }
+      #depth-selector.visible { display: flex; }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+      .depth-title {
+        font-size: 0.82rem;
+        color: #4a8aaa;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 1.4em;
+      }
+      .depth-value {
+        font-size: 3rem;
+        font-weight: 200;
+        color: #7df8ff;
+        text-shadow: 0 0 20px #00c8ff66;
+        line-height: 1;
+        margin-bottom: 0.15em;
+        min-width: 2ch;
+        text-align: center;
+      }
+      .depth-sub {
+        font-size: 0.72rem;
+        color: #2a5570;
+        margin-bottom: 1.8em;
+        letter-spacing: 0.06em;
+      }
+      #depth-slider {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 240px;
+        height: 2px;
+        background: rgba(100,200,255,0.15);
+        border-radius: 2px;
+        outline: none;
+        margin-bottom: 2.2em;
+      }
+      #depth-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 16px; height: 16px;
+        border-radius: 50%;
+        background: #00c8ff;
+        box-shadow: 0 0 10px #00c8ff88;
+        cursor: pointer;
+      }
+      #depth-slider::-moz-range-thumb {
+        width: 16px; height: 16px;
+        border-radius: 50%;
+        background: #00c8ff;
+        box-shadow: 0 0 10px #00c8ff88;
+        cursor: pointer;
+        border: none;
+      }
+      #depth-confirm {
+        padding: 10px 32px;
+        background: rgba(0,200,255,0.1);
+        border: 1px solid rgba(0,200,255,0.35);
+        border-radius: 24px;
+        color: #7df8ff;
+        font-size: 0.85rem;
+        letter-spacing: 0.12em;
+        cursor: pointer;
+        transition: background 0.2s, box-shadow 0.2s;
+      }
+      #depth-confirm:hover {
+        background: rgba(0,200,255,0.2);
+        box-shadow: 0 0 16px rgba(0,200,255,0.2);
+      }
+
+      /* ── 搜索栏 ── */
+      #search-wrap {
+        position: fixed;
+        top: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        width: min(380px, calc(100vw - 32px));
+        opacity: 0;
+        transition: opacity 0.5s ease;
+      }
+      #search-wrap.visible { opacity: 1; }
+
+      #search-row {
+        display: flex;
+        align-items: center;
+      }
+
+      #search-input {
+        flex: 1;
+        padding: 9px 16px;
+        background: rgba(5, 15, 40, 0.85);
+        border: 1px solid rgba(100,200,255,0.25);
+        border-right: none;
+        border-radius: 8px 0 0 8px;
+        color: #c0e8ff;
+        font-size: 0.88rem;
+        outline: none;
+        backdrop-filter: blur(12px);
+        transition: border-color 0.2s;
+      }
+      #search-input:focus { border-color: rgba(100,200,255,0.6); }
+      #search-input::placeholder { color: #2a5570; }
+
+      #search-btn {
+        padding: 9px 14px;
+        background: rgba(0,200,255,0.12);
+        border: 1px solid rgba(100,200,255,0.25);
+        border-radius: 0 8px 8px 0;
+        color: #6af0ff;
+        font-size: 0.85rem;
+        cursor: pointer;
+        backdrop-filter: blur(12px);
+        transition: background 0.2s;
+        white-space: nowrap;
+      }
+      #search-btn:hover { background: rgba(0,200,255,0.25); }
+
+      #search-results {
+        display: none;
+        flex-direction: column;
+        margin-top: 6px;
+        background: rgba(4, 12, 35, 0.92);
+        border: 1px solid rgba(100,200,255,0.2);
+        border-radius: 10px;
+        backdrop-filter: blur(16px);
+        overflow: hidden;
+        max-height: 360px;
+        overflow-y: auto;
+      }
+      #search-results.open { display: flex; }
+      #search-results::-webkit-scrollbar { width: 4px; }
+      #search-results::-webkit-scrollbar-track { background: transparent; }
+      #search-results::-webkit-scrollbar-thumb { background: rgba(100,200,255,0.2); border-radius: 2px; }
+
+      .search-result-item {
+        padding: 10px 16px;
+        cursor: pointer;
+        border-bottom: 1px solid rgba(100,200,255,0.07);
+        transition: background 0.15s;
+      }
+      .search-result-item:last-child { border-bottom: none; }
+      .search-result-item:hover { background: rgba(0,160,255,0.12); }
+      .search-result-item.focused { background: rgba(0,160,255,0.18); }
+      .sri-title {
+        font-size: 0.85rem;
+        color: #c0e8ff;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .sri-url {
+        font-size: 0.7rem;
+        color: #2a6080;
+        margin-top: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .sri-cat {
+        display: inline-flex;
+        margin-top: 5px;
+        padding: 1px 7px;
+        border: 1px solid rgba(0,200,255,0.18);
+        border-radius: 999px;
+        color: #4aa4c4;
+        background: rgba(0,200,255,0.06);
+        font-size: 0.64rem;
+      }
+      .search-result-count {
+        padding: 6px 16px;
+        font-size: 0.7rem;
+        color: #1e4060;
+        border-bottom: 1px solid rgba(100,200,255,0.07);
+        letter-spacing: 0.04em;
+      }
+
+      @media (max-width: 560px) {
+        /* 窄屏：搜索框不再居中，右侧预留 64px 给用户按钮（头像圆约 40px + 14px 右边距 + 10px 间隙） */
+        #search-wrap {
+          top: 14px;
+          left: 14px;
+          right: 64px;
+          transform: none;
+          width: auto;
+        }
+        #search-input { font-size: 0.95rem; padding: 11px 14px; }
+        #search-btn { padding: 11px 12px; font-size: 0.9rem; }
+        #search-results { max-height: 50vh; }
+      }
+
+      /* ── 分类子星图控制 ── */
+      #category-dock {
+        position: fixed;
+        top: 24px;
+        left: 24px;
+        width: 218px;
+        z-index: 9;
+        opacity: 0;
+        transition: opacity 0.5s ease;
+        pointer-events: none;
+      }
+      #category-dock.visible {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      #category-dock.busy {
+        opacity: 0.55;
+      }
+      #category-summary {
+        margin-bottom: 8px;
+        color: #2f6d8c;
+        font-size: 0.72rem;
+        letter-spacing: 0.06em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #category-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        max-height: calc(100vh - 160px);
+        overflow: auto;
+        padding-right: 4px;
+      }
+      #category-chips::-webkit-scrollbar { width: 3px; }
+      #category-chips::-webkit-scrollbar-thumb { background: rgba(100,200,255,0.2); border-radius: 2px; }
+      .category-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 9px;
+        border-radius: 999px;
+        border: 1px solid rgba(100,200,255,0.15);
+        background: rgba(4,12,35,0.72);
+        color: #4d8ba8;
+        font-size: 0.72rem;
+        line-height: 1;
+        backdrop-filter: blur(12px);
+        cursor: pointer;
+        transition: background 0.18s, border-color 0.18s, color 0.18s;
+      }
+      .category-chip:hover {
+        color: #8ee8ff;
+        border-color: rgba(100,200,255,0.36);
+        background: rgba(0,100,180,0.16);
+      }
+      .category-chip.active {
+        color: #7df8ff;
+        border-color: rgba(0,200,255,0.42);
+        background: rgba(0,200,255,0.13);
+        box-shadow: 0 0 16px rgba(0,200,255,0.08);
+      }
+      .category-chip span {
+        color: #2f6d8c;
+        font-variant-numeric: tabular-nums;
+      }
+
+      @media (max-width: 760px) {
+        #category-dock {
+          top: 64px;
+          left: 14px;
+          right: 14px;
+          width: auto;
+        }
+        #category-summary { display: none; }
+        #category-chips {
+          flex-wrap: nowrap;
+          max-height: none;
+          overflow-x: auto;
+          padding: 0 0 4px;
+        }
+        .category-chip {
+          flex: 0 0 auto;
+          padding: 7px 10px;
+          font-size: 0.74rem;
+        }
+      }
+
+      /* ── 信息面板 ── */
+      #info-panel {
+        position: fixed;
+        width: 300px;
+        background: rgba(4, 12, 35, 0.88);
+        border: 1px solid rgba(100,200,255,0.25);
+        border-radius: 14px;
+        padding: 22px 22px 18px;
+        backdrop-filter: blur(16px);
+        z-index: 10;
+        opacity: 0;
+        transform: scale(0.94);
+        transition: opacity 0.3s ease, transform 0.3s ease;
+        pointer-events: none;
+      }
+      #info-panel.open {
+        opacity: 1;
+        transform: scale(1);
+        pointer-events: all;
+      }
+
+      .panel-icon-wrap {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      #panel-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        object-fit: cover;
+        border: 1.5px solid rgba(100,200,255,0.3);
+        background: rgba(0,100,200,0.2);
+        flex-shrink: 0;
+      }
+      #panel-title {
+        font-size: 1rem;
+        font-weight: 500;
+        color: #d0eeff;
+        line-height: 1.4;
+        word-break: break-all;
+      }
+      #panel-url {
+        font-size: 0.72rem;
+        color: #3399bb;
+        text-decoration: none;
+        word-break: break-all;
+        display: block;
+        margin-top: 2px;
+        transition: color 0.2s;
+      }
+      #panel-url:hover { color: #5de0ff; }
+      #panel-category {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin-top: 10px;
+      }
+      #panel-category span {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(0,200,255,0.07);
+        border: 1px solid rgba(0,200,255,0.16);
+        color: #4aa4c4;
+        font-size: 0.66rem;
+      }
+      #panel-category .panel-cat-primary {
+        color: #7df8ff;
+        border-color: rgba(0,200,255,0.28);
+        background: rgba(0,200,255,0.12);
+      }
+      #panel-desc {
+        font-size: 0.8rem;
+        color: #5a8a9f;
+        line-height: 1.6;
+        margin-top: 10px;
+        margin-bottom: 14px;
+        word-break: break-all;
+      }
+      .panel-stats {
+        display: flex;
+        gap: 10px;
+      }
+      .stat-box {
+        flex: 1;
+        background: rgba(0,100,180,0.12);
+        border: 1px solid rgba(100,200,255,0.1);
+        border-radius: 8px;
+        padding: 8px 10px;
+        text-align: center;
+      }
+      .stat-label {
+        font-size: 0.68rem;
+        color: #336688;
+        margin-bottom: 3px;
+        letter-spacing: 0.04em;
+      }
+      .stat-value {
+        font-size: 1.1rem;
+        color: #7df8ff;
+        font-weight: 600;
+      }
+      #panel-close {
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        background: none;
+        border: none;
+        color: #336688;
+        font-size: 1.1rem;
+        cursor: pointer;
+        line-height: 1;
+        transition: color 0.2s;
+        padding: 4px;
+      }
+      #panel-close:hover { color: #5de0ff; }
+
+      /* ── 底部统计 ── */
+      #stats {
+        position: fixed;
+        bottom: 22px;
+        left: 24px;
+        font-size: 0.72rem;
+        color: #1e4060;
+        letter-spacing: 0.06em;
+        z-index: 10;
+        opacity: 0;
+        transition: opacity 0.5s;
+      }
+      #stats.visible { opacity: 1; }
+
+      /* ── 操作提示 ── */
+      #hint {
+        position: fixed;
+        bottom: 22px;
+        right: 24px;
+        font-size: 0.68rem;
+        color: #1a3a55;
+        text-align: right;
+        line-height: 1.8;
+        z-index: 10;
+        opacity: 0;
+        transition: opacity 0.5s;
+      }
+      #hint.visible { opacity: 1; }
+
+      /* ── Tooltip ── */
+      #tooltip {
+        position: fixed;
+        padding: 6px 12px;
+        background: rgba(4, 12, 35, 0.9);
+        border: 1px solid rgba(100,200,255,0.2);
+        border-radius: 6px;
+        font-size: 0.78rem;
+        color: #b0d8f0;
+        pointer-events: none;
+        z-index: 20;
+        opacity: 0;
+        transition: opacity 0.15s;
+        backdrop-filter: blur(8px);
+        max-width: 220px;
+        word-break: break-all;
+      }
+      #tooltip.visible { opacity: 1; }
+
+      /* ── 推荐卡片 ── */
+      #rec-overlay {
+        position: fixed; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(0, 4, 20, 0.72);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        z-index: 60;
+        opacity: 0; pointer-events: none;
+        transition: opacity 0.5s ease;
+      }
+      #rec-overlay.open { opacity: 1; pointer-events: all; }
+
+      #rec-card {
+        width: 360px; max-width: calc(100vw - 40px);
+        background: linear-gradient(145deg, rgba(4,12,40,0.97), rgba(2,8,28,0.99));
+        border: 1px solid rgba(0,200,255,0.28);
+        border-radius: 22px;
+        padding: 30px 28px 26px;
+        position: relative;
+        box-shadow:
+          0 0 0 1px rgba(0,200,255,0.06),
+          0 8px 40px rgba(0,0,0,0.6),
+          0 0 80px rgba(0,200,255,0.1),
+          inset 0 1px 0 rgba(255,255,255,0.04);
+        transform: translateY(28px) scale(0.97);
+        transition: transform 0.45s cubic-bezier(0.34,1.56,0.64,1), opacity 0.4s ease;
+        opacity: 0;
+      }
+      #rec-overlay.open #rec-card { transform: translateY(0) scale(1); opacity: 1; }
+
+      /* 顶部装饰线 */
+      #rec-card::before {
+        content: '';
+        position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+        width: 60%; height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(0,200,255,0.5), transparent);
+      }
+
+      /* 关闭按钮 */
+      #rec-close {
+        position: absolute; top: 14px; right: 16px;
+        background: none; border: none;
+        color: rgba(100,200,255,0.3); font-size: 1rem;
+        cursor: pointer; padding: 4px 6px; line-height: 1;
+        transition: color 0.2s;
+      }
+      #rec-close:hover { color: #7df8ff; }
+
+      /* 徽章 */
+      .rec-badge {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 12px;
+        background: rgba(0,200,255,0.08);
+        border: 1px solid rgba(0,200,255,0.2);
+        border-radius: 20px;
+        font-size: 0.68rem; letter-spacing: 0.14em;
+        color: #4ab8d8; text-transform: uppercase;
+        margin-bottom: 20px;
+      }
+      .rec-badge-dot {
+        width: 5px; height: 5px; border-radius: 50%;
+        background: #00c8ff;
+        box-shadow: 0 0 6px #00c8ff;
+        animation: rec-pulse 2s infinite;
+      }
+      @keyframes rec-pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(0.8)} }
+
+      /* 模块图标 + 信息 */
+      .rec-header {
+        display: flex; gap: 16px; align-items: flex-start;
+        margin-bottom: 16px;
+      }
+      #rec-icon {
+        width: 56px; height: 56px; border-radius: 14px;
+        object-fit: cover; flex-shrink: 0;
+        border: 1.5px solid rgba(0,200,255,0.2);
+        background: rgba(0,40,80,0.5);
+        box-shadow: 0 0 20px rgba(0,200,255,0.12);
+      }
+      .rec-info { flex: 1; min-width: 0; }
+      #rec-title {
+        font-size: 1.05rem; font-weight: 500;
+        color: #d8f0ff; line-height: 1.35;
+        margin-bottom: 5px;
+        word-break: break-all;
+      }
+      #rec-url {
+        font-size: 0.7rem; color: #2a7090;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+
+      /* 描述 */
+      #rec-desc {
+        font-size: 0.8rem; line-height: 1.65;
+        color: #4a7a90;
+        margin-bottom: 20px;
+        display: -webkit-box; -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical; overflow: hidden;
+      }
+
+      /* 统计行 */
+      .rec-stats {
+        display: flex; gap: 10px; margin-bottom: 22px;
+      }
+      .rec-stat {
+        flex: 1;
+        padding: 10px 8px;
+        background: rgba(0,100,180,0.1);
+        border: 1px solid rgba(0,200,255,0.1);
+        border-radius: 10px; text-align: center;
+      }
+      .rec-stat-val {
+        font-size: 1.2rem; font-weight: 300;
+        color: #7df8ff; line-height: 1;
+        margin-bottom: 4px;
+      }
+      .rec-stat-label { font-size: 0.62rem; color: #2a5570; letter-spacing: 0.06em; }
+
+      /* 访问按钮 */
+      #rec-visit {
+        width: 100%; padding: 13px;
+        background: linear-gradient(135deg, rgba(0,180,255,0.18), rgba(0,100,200,0.12));
+        border: 1px solid rgba(0,200,255,0.35);
+        border-radius: 12px;
+        color: #7df8ff; font-size: 0.9rem; letter-spacing: 0.08em;
+        cursor: pointer; font-family: inherit;
+        transition: all 0.25s;
+        box-shadow: 0 0 20px rgba(0,200,255,0.08);
+        position: relative; overflow: hidden;
+        margin-bottom: 12px;
+      }
+      #rec-visit::after {
+        content: '';
+        position: absolute; inset: 0;
+        background: linear-gradient(135deg, rgba(125,248,255,0.08), transparent);
+        opacity: 0; transition: opacity 0.25s;
+      }
+      #rec-visit:hover { border-color: rgba(0,200,255,0.6); box-shadow: 0 0 30px rgba(0,200,255,0.18); }
+      #rec-visit:hover::after { opacity: 1; }
+
+      /* 关闭链接 */
+      #rec-later {
+        display: block; text-align: center;
+        font-size: 0.72rem; color: #1e4060;
+        cursor: pointer; transition: color 0.2s;
+        letter-spacing: 0.04em;
+      }
+      #rec-later:hover { color: #4a8090; }
+    
+
+      /* atlas-module-sidebar */
+      #category-dock {
+        width: 318px;
+        bottom: 24px;
+      }
+      #category-chips {
+        display: block;
+        max-height: calc(100vh - 110px);
+        overflow: hidden;
+        padding-right: 0;
+      }
+      .atlas-nav {
+        display: grid;
+        gap: 10px;
+      }
+      .atlas-panel-section {
+        background: rgba(4, 12, 35, 0.72);
+        border: 1px solid rgba(100,200,255,0.16);
+        border-radius: 12px;
+        backdrop-filter: blur(12px);
+        overflow: hidden;
+      }
+      .atlas-section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 10px;
+        color: #4d8ba8;
+        font-size: 0.72rem;
+        letter-spacing: 0.06em;
+        border-bottom: 1px solid rgba(100,200,255,0.08);
+      }
+      .atlas-list {
+        overflow: auto;
+      }
+      .atlas-module-list {
+        max-height: 38vh;
+      }
+      .atlas-file-list {
+        max-height: 34vh;
+      }
+      .atlas-list::-webkit-scrollbar {
+        width: 4px;
+      }
+      .atlas-list::-webkit-scrollbar-thumb {
+        background: rgba(100,200,255,0.22);
+        border-radius: 2px;
+      }
+      .atlas-list-item {
+        width: 100%;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        padding: 7px 10px;
+        border: 0;
+        border-bottom: 1px solid rgba(100,200,255,0.06);
+        background: transparent;
+        color: #4d8ba8;
+        text-align: left;
+        cursor: pointer;
+      }
+      .atlas-list-item:hover,
+      .atlas-list-item.active {
+        color: #8ee8ff;
+        background: rgba(0,160,255,0.14);
+      }
+      .atlas-main {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.75rem;
+      }
+      .atlas-sub {
+        grid-column: 1 / -1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #2f6d8c;
+        font-size: 0.66rem;
+      }
+      .atlas-count {
+        color: #2f6d8c;
+        font-size: 0.68rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .atlas-empty {
+        padding: 14px 10px;
+        color: #2f6d8c;
+        font-size: 0.72rem;
+      }
+      @media (max-width: 760px) {
+        #category-dock {
+          top: 64px;
+          width: auto;
+        }
+        #category-chips {
+          max-height: 45vh;
+        }
+        .atlas-module-list,
+        .atlas-file-list {
+          max-height: 20vh;
+        }
+      }
+
+    </style>
+    <script type="module" crossorigin src="/assets/index-DB71QehS.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/three-Df2n1lyU.js">
+    <link rel="modulepreload" crossorigin href="/assets/postprocessing-D4VCwszR.js">
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+
+    <!-- 加载屏幕 -->
+    <div id="loading">
+      <div class="loading-title">CODEDB ATLAS</div>
+      <div class="loading-subtitle">代码文件星系</div>
+
+      <!-- 进度条（默认显示） -->
+      <div id="loading-progress">
+        <div class="loading-bar-wrap">
+          <div id="loading-bar"></div>
+        </div>
+        <div id="loading-text">正在加载数据集...</div>
+        <div id="loading-sub"></div>
+      </div>
+
+      <!-- 模块星系动画（长时间加载时渐显，4 个卫星节点绕中心旋转） -->
+      <div id="loading-galaxy" aria-hidden="true">
+        <div class="lg-core"></div>
+        <div class="lg-ring lg-ring-1"><span class="lg-sat"></span></div>
+        <div class="lg-ring lg-ring-2"><span class="lg-sat"></span></div>
+        <div class="lg-ring lg-ring-3"><span class="lg-sat"></span></div>
+        <div class="lg-ring lg-ring-4"><span class="lg-sat"></span></div>
+      </div>
+
+      <!-- 深度选择器（取得 meta 后显示，用户选择后隐藏） -->
+      <div id="depth-selector">
+        <div class="depth-title">选择探索深度</div>
+        <div class="depth-value" id="depth-value">3</div>
+        <div class="depth-sub" id="depth-sub">越小越快，越大越完整</div>
+        <input type="range" id="depth-slider" min="2" max="20" step="1" value="3" />
+        <button id="depth-confirm">进入星系</button>
+      </div>
+    </div>
+
+    <!-- 搜索 -->
+    <div id="search-wrap">
+      <div id="search-row">
+        <input id="search-input" type="text" placeholder="搜索文件名 / URL..." autocomplete="off" />
+        <button id="search-btn">搜索</button>
+      </div>
+      <div id="search-results"></div>
+    </div>
+
+    <!-- 分类子星图 -->
+    <div id="category-dock">
+      <div id="category-summary">全部文件</div>
+      <div id="category-chips"></div>
+    </div>
+
+    <!-- 信息面板 -->
+    <div id="info-panel">
+      <button id="panel-close">✕</button>
+      <div class="panel-icon-wrap">
+        <img id="panel-icon" src="" alt="icon" />
+        <div>
+          <div id="panel-title"></div>
+          <a id="panel-url" href="#" target="_blank" rel="noopener noreferrer"></a>
+        </div>
+      </div>
+      <div id="panel-category"></div>
+      <div id="panel-desc"></div>
+      <div class="panel-stats">
+        <div class="stat-box">
+          <div class="stat-label">入度</div>
+          <div class="stat-value" id="stat-in">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">出度</div>
+          <div class="stat-value" id="stat-out">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">连接数</div>
+          <div class="stat-value" id="stat-total">0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tooltip -->
+    <div id="tooltip"></div>
+
+    <!-- 推荐卡片弹窗 -->
+    <div id="rec-overlay">
+      <div id="rec-card">
+        <button id="rec-close" title="关闭">✕</button>
+        <div class="rec-badge">
+          <span class="rec-badge-dot"></span>
+          热门推荐
+        </div>
+        <div class="rec-header">
+          <img id="rec-icon" src="" alt="favicon" />
+          <div class="rec-info">
+            <div id="rec-title">文件名</div>
+            <div id="rec-url">https://example.com</div>
+          </div>
+        </div>
+        <div id="rec-desc">文件描述</div>
+        <div class="rec-stats">
+          <div class="rec-stat">
+            <div class="rec-stat-val" id="rec-stat-clicks">0</div>
+            <div class="rec-stat-label">全站点击</div>
+          </div>
+          <div class="rec-stat">
+            <div class="rec-stat-val" id="rec-stat-indegree">0</div>
+            <div class="rec-stat-label">依赖入度</div>
+          </div>
+          <div class="rec-stat">
+            <div class="rec-stat-val" id="rec-stat-depth">0</div>
+            <div class="rec-stat-label">索引深度</div>
+          </div>
+        </div>
+        <button id="rec-visit">查看文件 →</button>
+        <span id="rec-later">下次再说</span>
+      </div>
+    </div>
+
+    <!-- 底部信息 -->
+    <div id="stats"></div>
+    <div id="hint">
+      拖拽旋转 · 滚轮缩放<br>
+      悬浮查看 · 点击详情<br>
+      双击查看文件
+    </div>
+
+  </body>
+</html>

@@ -3,7 +3,9 @@
 
 [scan]
 # Source extensions to index through the unified tree-sitter parser layer.
-extensions = ["cs", "java", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
+# Current languages: C#, Java, Rust, Python, JavaScript/TypeScript, C, C++.
+# Humans can edit this list before indexing; only these extensions are scanned.
+extensions = ["cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 
 # Skip extremely large generated files before parsing or embedding.
 max_file_bytes = 50000000
@@ -25,6 +27,12 @@ skip_dirs = [
   ".idea",
   ".gradle",
   "node_modules",
+  "target",
+  "dist",
+  ".next",
+  ".svelte-kit",
+  "coverage",
+  "out",
   ".codedb-mcp",
   "Library",
   "Temp",
@@ -37,8 +45,10 @@ skip_dirs = [
 ]
 
 [embedding]
-# Model2Vec model loaded through model2vec-rs. Use a local path if needed.
-model = "minishlab/potion-code-16M"
+# Absolute Model2Vec model directory selected by setup-for-agent.
+# If the default HuggingFace hub cache exists, setup should use it; otherwise
+# it should fall back to the second available Windows drive.
+model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
 
 [diagnostics]
 # Set timing=true only while benchmarking; it writes stage timings to stderr.

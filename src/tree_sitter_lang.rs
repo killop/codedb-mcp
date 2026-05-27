@@ -45,6 +45,7 @@ fn grammar(language: &str) -> Option<Language> {
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "javascript" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -126,6 +127,13 @@ fn collect_namespace_or_import(node: Node<'_>, context: &mut ParseContext<'_>) {
                 }
             }
         }
+        "rust" => {
+            if kind == "use_declaration" {
+                for import in extract_rust_uses(node_text(node, context.content)) {
+                    context.imports.insert(import);
+                }
+            }
+        }
         "javascript" | "jsx" | "typescript" | "tsx" => {
             if matches!(kind, "import_statement" | "export_statement")
                 && let Some(module) = extract_quoted_module(node_text(node, context.content))
@@ -198,6 +206,20 @@ fn symbol_kind(language: &str, node_kind: &str) -> Option<&'static str> {
             "class_definition" => Some("class"),
             "function_definition" => Some("function"),
             "type_alias_statement" => Some("type_alias"),
+            _ => None,
+        },
+        "rust" => match node_kind {
+            "struct_item" => Some("struct"),
+            "union_item" => Some("union"),
+            "enum_item" => Some("enum"),
+            "trait_item" => Some("trait"),
+            "impl_item" => Some("impl"),
+            "function_item" => Some("function"),
+            "mod_item" => Some("module"),
+            "type_item" => Some("type_alias"),
+            "const_item" => Some("const"),
+            "static_item" => Some("static"),
+            "macro_definition" => Some("macro"),
             _ => None,
         },
         "javascript" | "jsx" => match node_kind {
@@ -392,6 +414,108 @@ fn extract_python_imports(text: Option<String>) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+fn extract_rust_uses(text: Option<String>) -> Vec<String> {
+    let Some(text) = text else {
+        return Vec::new();
+    };
+    let Some(rest) = strip_rust_use_prefix(text.trim()) else {
+        return Vec::new();
+    };
+    expand_rust_use(rest.trim_end_matches(';').trim())
+        .into_iter()
+        .filter_map(clean_rust_use_path)
+        .collect()
+}
+
+fn strip_rust_use_prefix(value: &str) -> Option<&str> {
+    if let Some(rest) = strip_prefix_word(value, "use") {
+        return Some(rest);
+    }
+    let rest = strip_prefix_word(value, "pub")?;
+    let rest = rest
+        .strip_prefix('(')
+        .and_then(|value| value.split_once(')'))
+        .map(|(_, suffix)| suffix.trim_start())
+        .unwrap_or(rest);
+    strip_prefix_word(rest, "use")
+}
+
+fn expand_rust_use(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let Some(open) = value.find('{') else {
+        return vec![value.to_string()];
+    };
+    let Some(close) = matching_brace(value, open) else {
+        return vec![value.to_string()];
+    };
+    let prefix = value[..open].trim().trim_end_matches("::");
+    split_top_level_commas(&value[open + 1..close])
+        .into_iter()
+        .flat_map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return Vec::new();
+            }
+            let combined = if item == "self" {
+                prefix.to_string()
+            } else if prefix.is_empty() {
+                item.to_string()
+            } else {
+                format!("{prefix}::{item}")
+            };
+            expand_rust_use(&combined)
+        })
+        .collect()
+}
+
+fn matching_brace(value: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in value.char_indices().skip_while(|(idx, _)| *idx < open) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(value[start..idx].to_string());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].to_string());
+    parts
+}
+
+fn clean_rust_use_path(value: impl AsRef<str>) -> Option<String> {
+    let value = value
+        .as_ref()
+        .split_once(" as ")
+        .map(|(path, _)| path)
+        .unwrap_or(value.as_ref());
+    clean_qualified_name(value)
 }
 
 fn split_import_items(value: &str) -> Vec<String> {

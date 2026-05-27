@@ -4,3 +4,11 @@
 .codedb-mcp/manifest.json
 .codedb-mcp/*.tmp
 .codedb-mcp/*.bin
+skills/code-module-atlas/assets/viewer/node_modules/
+skills/code-module-atlas/assets/viewer/dist/
+skills/code-module-atlas/assets/viewer/.chrome*/
+skills/code-module-atlas/assets/viewer/debug-*
+skills/code-module-atlas/assets/viewer/vite.*.log
+skills/code-module-atlas/assets/viewer/public/module-atlas-data.json
+skills/code-module-atlas/assets/viewer/public/module-atlas-points.json
+skills/code-module-atlas/assets/viewer/public/data/dataset.json

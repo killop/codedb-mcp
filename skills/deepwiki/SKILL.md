@@ -17,10 +17,11 @@ Write generated wiki files under the target repo's `.codedb-mcp/deepwiki` direct
 
 1. Ensure `codedb-mcp` is configured and healthy for the repo. If not, use the `codedb-mcp` skill first.
 2. Call `codedb_status`, `codedb_tree` or `codedb_ls`, and `codedb_analyze` to understand size, languages, and graph shape.
-3. Build an initial page plan from business/domain signals, not folder names alone. Use `codedb_search`, `codedb_find`, `codedb_deps`, `codedb_callers`, and `codedb_graph` to find cross-folder modules with real call/dependency cohesion.
-4. Treat `codedb_communities` as a hint, not the source of truth. Split or merge modules based on code evidence and the agent's domain reasoning.
-5. Use `codedb_bundle` for repeated outlines, reads, dependency checks, and searches.
-6. Write concise pages with code citations: module responsibility, key entry points, main flows, dependencies, extension points, and risks.
+3. Call `codedb_module_map` before page planning. Treat its output as a module atlas: dependency cohesion, cross-folder roots, c-TF-IDF-like terms, entry points, key symbols, and semantic neighbors.
+4. Build an initial page plan from business/domain signals, not folder names alone. Use `codedb_search`, `codedb_find`, `codedb_deps`, `codedb_callers`, and `codedb_graph` to verify or challenge module-map candidates.
+5. Treat `codedb_communities` as a low-level hint, not the source of truth. Split or merge modules based on module-map evidence, code relationships, and the agent's domain reasoning.
+6. Use `codedb_bundle` for repeated outlines, reads, dependency checks, and searches.
+7. Write concise pages with code citations: module responsibility, key entry points, main flows, dependencies, extension points, and risks.
 
 ## Page Shape
 
@@ -34,8 +35,9 @@ Write generated wiki files under the target repo's `.codedb-mcp/deepwiki` direct
 
 - Prefer `codedb_callers` for "who uses this symbol" questions.
 - Prefer `codedb_deps` and `codedb_graph` for module relationships.
+- Prefer `codedb_module_map` for DeepWiki page planning. It is designed for business-module discovery, while `codedb_communities` is raw graph clustering.
 - Prefer `codedb_outline` before reading full files.
 - Prefer `codedb_search regex=true` plus `rg` only when validating exact raw text counts.
 - Record uncertainty explicitly when code evidence is weak or a module boundary is inferred.
 
-See `references/deepwiki-workflow.md` for a fuller generation checklist.
+See `references/deepwiki-workflow.md` for the fuller generation checklist. When a human needs the visual module/file graph, switch to the sibling `code-module-atlas` skill; do not duplicate atlas viewer or conversion code in this skill.

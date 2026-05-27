@@ -49,8 +49,8 @@ pub struct StorageOptions {
 
 fn default_source_extensions() -> Vec<String> {
     [
-        "cs", "java", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp",
-        "cxx", "hpp", "hh", "hxx",
+        "cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc",
+        "cpp", "cxx", "hpp", "hh", "hxx",
     ]
     .into_iter()
     .map(str::to_string)
@@ -62,7 +62,7 @@ impl Default for IndexOptions {
         Self {
             extensions: default_source_extensions(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            embedding_model: "minishlab/potion-code-16M".to_string(),
+            embedding_model: default_embedding_model_path(),
             respect_gitignore: true,
             include_paths: vec!["Library/PackageCache".to_string()],
             skip_dirs: vec![
@@ -73,6 +73,12 @@ impl Default for IndexOptions {
                 ".idea".to_string(),
                 ".gradle".to_string(),
                 "node_modules".to_string(),
+                "target".to_string(),
+                "dist".to_string(),
+                ".next".to_string(),
+                ".svelte-kit".to_string(),
+                "coverage".to_string(),
+                "out".to_string(),
                 ".codedb-mcp".to_string(),
                 "library".to_string(),
                 "temp".to_string(),
@@ -93,6 +99,88 @@ impl Default for IndexOptions {
             },
         }
     }
+}
+
+#[cfg(windows)]
+fn default_embedding_model_path() -> String {
+    if let Some(path) = default_hf_embedding_model_path() {
+        return path_to_config_string(&path);
+    }
+    let drives = (b'C'..=b'Z')
+        .filter_map(|letter| {
+            let root = format!("{}:/", letter as char);
+            Path::new(&root).exists().then_some(letter as char)
+        })
+        .collect::<Vec<_>>();
+    let drive = drives
+        .get(1)
+        .or_else(|| drives.first())
+        .copied()
+        .unwrap_or('C');
+    format!("{drive}:/codedb-mcp-cache/models/potion-code-16M")
+}
+
+#[cfg(windows)]
+fn default_hf_embedding_model_path() -> Option<PathBuf> {
+    let hub = default_hf_hub_dir()?;
+    if let Some(snapshot) = existing_hf_model_snapshot(&hub) {
+        return Some(snapshot);
+    }
+    hub.exists().then(|| {
+        hub.join("codedb-mcp")
+            .join("models")
+            .join("potion-code-16M")
+    })
+}
+
+#[cfg(windows)]
+fn default_hf_hub_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub"),
+    )
+}
+
+#[cfg(windows)]
+fn existing_hf_model_snapshot(hub: &Path) -> Option<PathBuf> {
+    let repo = hub.join("models--minishlab--potion-code-16M");
+    let refs_main = repo.join("refs").join("main");
+    if let Ok(commit) = fs::read_to_string(&refs_main) {
+        let snapshot = repo.join("snapshots").join(commit.trim());
+        if is_model_dir(&snapshot) {
+            return Some(snapshot);
+        }
+    }
+    let snapshots = repo.join("snapshots");
+    let mut entries = fs::read_dir(snapshots)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && is_model_dir(path))
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.into_iter().next()
+}
+
+#[cfg(windows)]
+fn is_model_dir(path: &Path) -> bool {
+    path.join("tokenizer.json").exists()
+        && path.join("model.safetensors").exists()
+        && (path.join("config.json").exists()
+            || path.join("config_sentence_transformers.json").exists())
+}
+
+#[cfg(windows)]
+fn path_to_config_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn default_embedding_model_path() -> String {
+    ".codedb-mcp/models/potion-code-16M".to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,7 +361,7 @@ impl Codebase {
         log_timing(timing, "semantic_units", stage);
 
         let stage = Instant::now();
-        let model = load_embedding_model(&options.embedding_model)?;
+        let model = load_embedding_model(&root, &options.embedding_model)?;
         log_timing(timing, "load_embedding_model", stage);
 
         let stage = Instant::now();
@@ -338,7 +426,7 @@ impl Codebase {
     ) -> Result<Self> {
         let timing = options.diagnostics.timing;
         let stage = Instant::now();
-        let model = load_embedding_model(&options.embedding_model)?;
+        let model = load_embedding_model(&root, &options.embedding_model)?;
         log_timing(timing, "load_embedding_model", stage);
 
         let stage = Instant::now();
@@ -738,10 +826,23 @@ fn is_skipped_entry(
     false
 }
 
-fn load_embedding_model(model_id: &str) -> Result<MinishEmbeddingModel> {
-    let path = Path::new(model_id);
+fn load_embedding_model(root: &Path, model_id: &str) -> Result<MinishEmbeddingModel> {
+    let configured_path = Path::new(model_id);
+    let path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        root.join(configured_path)
+    };
     if path.exists() {
-        MinishEmbeddingModel::load_local(path)
+        MinishEmbeddingModel::load_local(&path)
+    } else if configured_path.components().count() > 1
+        || model_id.starts_with('.')
+        || model_id.contains('\\')
+    {
+        Err(anyhow!(
+            "configured local embedding model path does not exist: {}",
+            path.display()
+        ))
     } else {
         MinishEmbeddingModel::load(model_id)
     }
@@ -893,6 +994,7 @@ struct SymbolDefinition {
     name: String,
     path: String,
     namespace: Option<String>,
+    module_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -909,6 +1011,12 @@ fn build_dependency_symbols(files: &[FileEntry]) -> HashMap<String, Vec<SymbolDe
             .iter()
             .filter(|symbol| is_dependency_symbol_kind(&symbol.kind))
             .collect::<Vec<_>>();
+        if file.language == "rust" {
+            for symbol in type_symbols {
+                push_dependency_symbol(&mut symbols_by_name, file, symbol);
+            }
+            continue;
+        }
         let has_primary_type = type_symbols.iter().any(|symbol| {
             is_dependency_symbol_kind(&symbol.kind)
                 && is_primary_symbol_for_file(&file.path, &symbol.name)
@@ -922,17 +1030,26 @@ fn build_dependency_symbols(files: &[FileEntry]) -> HashMap<String, Vec<SymbolDe
             } else if !include_single_non_primary_type {
                 continue;
             }
-            symbols_by_name
-                .entry(symbol.name.clone())
-                .or_default()
-                .push(SymbolDefinition {
-                    name: symbol.name.clone(),
-                    path: file.path.clone(),
-                    namespace: file.namespace.clone(),
-                });
+            push_dependency_symbol(&mut symbols_by_name, file, symbol);
         }
     }
     symbols_by_name
+}
+
+fn push_dependency_symbol(
+    symbols_by_name: &mut HashMap<String, Vec<SymbolDefinition>>,
+    file: &FileEntry,
+    symbol: &Symbol,
+) {
+    symbols_by_name
+        .entry(symbol.name.clone())
+        .or_default()
+        .push(SymbolDefinition {
+            name: symbol.name.clone(),
+            path: file.path.clone(),
+            namespace: file.namespace.clone(),
+            module_path: (file.language == "rust").then(|| rust_module_path_from_file(&file.path)),
+        });
 }
 
 fn build_dependencies(
@@ -941,8 +1058,15 @@ fn build_dependencies(
     references_by_file: &HashMap<String, DependencyReferences>,
 ) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
     let mut forward: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let indexed_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
     for file in files {
         let deps = forward.entry(file.path.clone()).or_default();
+        if file.language == "rust" {
+            collect_rust_module_file_dependencies(file, &indexed_paths, deps);
+        }
         let Some(references) = references_by_file.get(&file.path) else {
             continue;
         };
@@ -980,7 +1104,10 @@ fn build_dependencies(
 }
 
 fn is_dependency_symbol_kind(kind: &str) -> bool {
-    matches!(kind, "class" | "interface" | "struct" | "enum" | "record")
+    matches!(
+        kind,
+        "class" | "interface" | "struct" | "enum" | "record" | "union" | "trait" | "type_alias"
+    )
 }
 
 fn is_primary_symbol_for_file(path: &str, symbol_name: &str) -> bool {
@@ -1006,7 +1133,86 @@ fn is_dependency_reference_line(language: &str, line: &str) -> bool {
 fn is_import_or_namespace_line(language: &str, trimmed: &str) -> bool {
     match language {
         "java" => trimmed.starts_with("import ") || trimmed.starts_with("package "),
+        "rust" => {
+            trimmed.starts_with("use ")
+                || trimmed.starts_with("pub use ")
+                || rust_module_name(trimmed).is_some()
+        }
         _ => trimmed.starts_with("using ") || trimmed.starts_with("namespace "),
+    }
+}
+
+fn collect_rust_module_file_dependencies(
+    file: &FileEntry,
+    indexed_paths: &HashSet<&str>,
+    deps: &mut BTreeSet<String>,
+) {
+    for line in file.content.lines() {
+        let code = strip_strings_and_line_comment(line);
+        let Some(name) = rust_module_name(code.trim_start()) else {
+            continue;
+        };
+        for candidate in rust_module_dependency_candidates(&file.path, &name) {
+            if candidate != file.path && indexed_paths.contains(candidate.as_str()) {
+                deps.insert(candidate);
+                break;
+            }
+        }
+    }
+}
+
+fn rust_module_name(trimmed: &str) -> Option<String> {
+    let captures = rust_module_re().captures(trimmed)?;
+    Some(captures[1].to_string())
+}
+
+fn rust_module_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+            .expect("valid rust module regex")
+    })
+}
+
+fn rust_module_dependency_candidates(path: &str, name: &str) -> Vec<String> {
+    let normalized = path.replace('\\', "/");
+    let (dir, file_name) = normalized
+        .rsplit_once('/')
+        .map(|(dir, file)| (dir.to_string(), file))
+        .unwrap_or_else(|| (String::new(), normalized.as_str()));
+    let stem = file_name.strip_suffix(".rs").unwrap_or(file_name);
+    let base = if matches!(stem, "main" | "lib" | "mod") {
+        dir
+    } else if dir.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{dir}/{stem}")
+    };
+    let prefix = if base.is_empty() {
+        name.to_string()
+    } else {
+        format!("{base}/{name}")
+    };
+    vec![format!("{prefix}.rs"), format!("{prefix}/mod.rs")]
+}
+
+fn rust_module_path_from_file(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let src_path = normalized.strip_prefix("src/").unwrap_or(&normalized);
+    path_to_rust_module_path(src_path)
+}
+
+fn path_to_rust_module_path(path: &str) -> String {
+    let without_ext = path.strip_suffix(".rs").unwrap_or(path);
+    let parts = without_ext
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .filter(|part| *part != "main" && *part != "lib" && *part != "mod")
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "crate".to_string()
+    } else {
+        format!("crate.{}", parts.join("."))
     }
 }
 
@@ -1294,11 +1500,25 @@ fn strip_strings_and_line_comment(line: &str) -> String {
 }
 
 fn can_reference_symbol_definition(file: &FileEntry, candidate: &SymbolDefinition) -> bool {
+    if file.language == "rust" && candidate.module_path.is_some() {
+        return rust_imports_symbol_module(&file.imports, candidate);
+    }
     let Some(candidate_namespace) = candidate.namespace.as_deref() else {
         return file.namespace.is_none();
     };
     file.namespace.as_deref() == Some(candidate_namespace)
         || imports_symbol_namespace(&file.imports, candidate_namespace, &candidate.name)
+}
+
+fn rust_imports_symbol_module(imports: &[String], candidate: &SymbolDefinition) -> bool {
+    let Some(module_path) = candidate.module_path.as_deref() else {
+        return false;
+    };
+    let fully_qualified = format!("{module_path}.{}", candidate.name);
+    let wildcard = format!("{module_path}.*");
+    imports
+        .iter()
+        .any(|import| import == &fully_qualified || import == &wildcard)
 }
 
 fn imports_symbol_namespace(imports: &[String], namespace: &str, name: &str) -> bool {
@@ -1314,6 +1534,11 @@ fn references_qualified_symbol(
     candidate: &SymbolDefinition,
     identifier: &str,
 ) -> bool {
+    if let Some(module_path) = candidate.module_path.as_deref() {
+        return references
+            .qualified_names
+            .contains(&format!("{module_path}.{identifier}"));
+    }
     let Some(namespace) = candidate.namespace.as_deref() else {
         return false;
     };
@@ -1417,6 +1642,10 @@ mod tests {
 
     fn java_file(path: &str, content: &str) -> FileEntry {
         file_with_language(path, "java", content)
+    }
+
+    fn rust_file(path: &str, content: &str) -> FileEntry {
+        file_with_language(path, "rust", content)
     }
 
     fn file_with_language(path: &str, language: &str, content: &str) -> FileEntry {
@@ -1692,5 +1921,58 @@ public class App {
 
         let deps = dependency_paths(files, "src/main/java/com/acme/app/App.java");
         assert!(deps.contains(&"src/main/java/com/acme/core/Widget.java".to_string()));
+    }
+
+    #[test]
+    fn rust_dependencies_include_use_declarations() {
+        let files = vec![
+            rust_file(
+                "src/core.rs",
+                r#"
+pub struct Engine;
+pub trait Runner {
+    fn run(&self);
+}
+"#,
+            ),
+            rust_file(
+                "src/app.rs",
+                r#"
+use crate::core::{Engine, Runner};
+
+pub struct App {
+    engine: Engine,
+}
+
+impl Runner for App {
+    fn run(&self) {}
+}
+"#,
+            ),
+        ];
+
+        let deps = dependency_paths(files, "src/app.rs");
+        assert!(deps.contains(&"src/core.rs".to_string()));
+    }
+
+    #[test]
+    fn rust_dependencies_include_mod_file_declarations() {
+        let files = vec![
+            rust_file(
+                "src/lib.rs",
+                r#"
+pub mod guide;
+"#,
+            ),
+            rust_file(
+                "src/guide.rs",
+                r#"
+pub struct GuideType;
+"#,
+            ),
+        ];
+
+        let deps = dependency_paths(files, "src/lib.rs");
+        assert!(deps.contains(&"src/guide.rs".to_string()));
     }
 }

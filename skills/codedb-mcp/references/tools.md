@@ -25,11 +25,13 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_deps` | File dependencies or reverse dependencies | Supports `direction=depends_on/imported_by`, `transitive=true`, and `max_depth`. C#/Java namespace/package imports are currently the most precise path. |
+| `codedb_deps` | File dependencies or reverse dependencies | Supports `direction=depends_on/imported_by`, `transitive=true`, and `max_depth`. C#/Java namespace/package imports are currently the most precise typed path; Rust `use`, C/C++ includes, and JS/Python imports are also indexed. |
 | `codedb_graph` | Graph summary or limited graph export | Formats: `summary`, `json`, `graphml`, `cypher`. |
 | `codedb_explain` | Explain a graph node and neighbors | Use with fuzzy node names or labels. |
 | `codedb_path` | Shortest graph path between two nodes | Useful for cross-module coupling questions. |
 | `codedb_communities` | Lazy Louvain communities and subcommunities | Use as a hint for module discovery, not as final architecture truth. |
+| `codedb_module_map` | DeepWiki module-planning atlas | Rust dependency-connected module candidates with dependency cohesion, cross-folder evidence, key symbols, entry points, semantic neighbors, and c-TF-IDF-like labels. Use before writing DeepWiki pages. |
+| `codedb_module_atlas` | Module/file atlas export | Writes or returns Rust-generated atlas JSON: modules, file points, terms, roots, central files, and entry points. Use `output_path` for large repos. Use the sibling `code-module-atlas` skill for webpage generation; this skill only exposes the MCP tool. |
 | `codedb_analyze` | Graph stats, top nodes, relation counts, suggested questions | Costs more than simple lookup tools; use for planning. |
 | `codedb_export` | Write or return graph export | Use `output_path` for large exports. |
 
@@ -49,4 +51,4 @@
 
 ## rg Comparison
 
-Use `rg` for raw filesystem search across arbitrary file types. Use `codedb_search regex=true` when exact text search should stay inside the indexed tree-sitter corpus and reuse the warm index. Use `codedb_outline` across all configured languages. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior that `rg` does not model, with the highest confidence on C#/Java symbols.
+Use `rg` for raw filesystem search across arbitrary file types. Use `codedb_search regex=true` when exact text search should stay inside the indexed tree-sitter corpus and reuse the warm index. Use `codedb_outline` across all configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior that `rg` does not model, with the highest confidence on C#/Java symbols.

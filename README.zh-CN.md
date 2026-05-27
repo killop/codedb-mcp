@@ -2,13 +2,34 @@
 
 [English README](README.md)
 
-`codebase-mcp` 是一个 Rust 实现的本地 MCP Server，提供兼容 `codedb_*` 的工具接口，用于大型代码库的代码搜索、符号大纲、引用查找、依赖分析、图分析和本地 DeepWiki 生成。
+`codebase-mcp` 是一组面向大型代码库的本地 Rust MCP 工具：快速索引搜索、符号大纲、引用查找、依赖分析、模块发现、可视化代码 atlas 网页，以及 DeepWiki-style 仓库文档生成。
 
-## 演示
+常驻 MCP 进程内的 warm tool 调用目标是毫秒级响应。实测数据见 [Benchmark 速览](#benchmark-速览)、[MCP vs rg](#mcp-vs-rg) 和 [Warm MCP 工具验证](#warm-mcp-工具验证)。
+
+## MCP 工具
+
+服务会把 tree-sitter 索引和项目本地数据放在 `.codedb-mcp` 下，并提供这些 MCP 能力：
+
+- 快速 exact/regex 搜索，以及词法和向量混合搜索；
+- 符号大纲和定义查找；
+- 基于 definition path/line 锚定的 LSP-like callers；
+- 文件正向依赖、反向依赖和 transitive 依赖查询；
+- 模糊文件查找、路径 glob、小型 query pipeline 和一次最多 100 个内部调用的 bundle；
+- 图摘要、懒计算 Louvain community、模块规划、atlas 导出和 DeepWiki 证据收集。
+
+## Code Module Atlas
 
 ![Code Module Atlas 演示](docs/assets/code-module-atlas.gif)
 
 [观看 MP4 演示](docs/assets/code-module-atlas.mp4)
+
+Atlas 网页由 `skills/code-module-atlas` skill 生成。它调用本地 MCP 的模块 atlas 导出，把结果转换成内置 meet-blog 风格 3D viewer 的数据集，并用一个星点表示一个源码文件。
+
+模块边界先从依赖连通文件图开始划分。在每个连通块内部，Rust 模块规划器使用 dependency-weighted label propagation；路径和 distinctive terms 只用于命名、证据展示和过大连通块拆分，不作为主要分组规则。网页提供模块列表、选中模块内的文件列表、文件之间的依赖边，以及文件聚焦和详情展示。
+
+## DeepWiki
+
+`skills/deepwiki` skill 会基于 MCP 证据和当前 agent 的推理能力生成本地 DeepWiki-style 文档。它从依赖感知的模块候选开始规划页面，然后生成业务模块优先的文档，包含代码引用、入口点、流程、依赖关系和风险说明，不需要单独配置大模型 API。
 
 推荐的部署方式是 setup-guide first：先把 `setup-for-agent.md` 交给 agent，让它创建 `.codedb-mcp`、优先复用已有的默认 HuggingFace cache；如果默认 cache 不存在，再走第二盘符逻辑。之后询问人类是否要给某个特定 agent 注册 MCP。`codedb-mcp` skill 只负责安装后的工具使用，不负责安装。
 

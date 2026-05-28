@@ -1,11 +1,10 @@
 use anyhow::{Result, bail};
 use std::collections::HashSet;
-use vicinity::hnsw::HNSWIndex;
 
 pub struct MinishVectorStore {
-    index: HNSWIndex,
+    vectors: Vec<f32>,
     len: usize,
-    ef_search: usize,
+    dim: usize,
 }
 
 impl MinishVectorStore {
@@ -15,13 +14,7 @@ impl MinishVectorStore {
             .find(|vector| !vector.is_empty())
             .map_or(fallback_dim, Vec::len)
             .max(1);
-        let mut index = HNSWIndex::builder(dim)
-            .m(8)
-            .ef_construction(80)
-            .ef_search(64)
-            .auto_normalize(true)
-            .build()?;
-
+        let mut flat = Vec::with_capacity(vectors.len() * dim);
         for (id, vector) in vectors.iter().enumerate() {
             if vector.len() != dim {
                 bail!(
@@ -29,18 +22,19 @@ impl MinishVectorStore {
                     vector.len()
                 );
             }
-            index.add_slice(id as u32, vector)?;
+            let norm = vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-6);
+            flat.extend(vector.iter().map(|value| value / norm));
         }
-        index.build()?;
         Ok(Self {
-            index,
+            vectors: flat,
             len: vectors.len(),
-            ef_search: 64,
+            dim,
         })
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
     }
 
     pub fn query(
@@ -52,25 +46,43 @@ impl MinishVectorStore {
         if self.len == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
-
-        let requested = match selector {
-            Some(selector) => (top_k * 20)
-                .max(top_k)
-                .min(self.len)
-                .max(selector.len().min(top_k)),
-            None => top_k.min(self.len),
-        };
-        let mut results = self
-            .index
-            .search(query, requested, self.ef_search.max(requested))?;
-        if let Some(selector) = selector {
-            let allowed = selector.iter().copied().collect::<HashSet<_>>();
-            results.retain(|(id, _)| allowed.contains(&(*id as usize)));
+        if query.len() != self.dim {
+            bail!(
+                "embedding dimension mismatch: expected {}, got {}",
+                self.dim,
+                query.len()
+            );
         }
-        results.truncate(top_k);
-        Ok(results
-            .into_iter()
-            .map(|(id, distance)| (id as usize, 1.0 - distance))
-            .collect())
+        let query_norm = query
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-6);
+        let normalized_query = query
+            .iter()
+            .map(|value| value / query_norm)
+            .collect::<Vec<_>>();
+        let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+        let mut scores = Vec::new();
+        for id in 0..self.len {
+            if allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&id))
+            {
+                continue;
+            }
+            let start = id * self.dim;
+            let end = start + self.dim;
+            let dot = self.vectors[start..end]
+                .iter()
+                .zip(normalized_query.iter())
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            scores.push((id, dot));
+        }
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scores.truncate(top_k.min(scores.len()));
+        Ok(scores)
     }
 }

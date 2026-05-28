@@ -1,6 +1,6 @@
 use crate::indexer::Codebase;
 use crate::tokens::{split_identifier, tokenize};
-use crate::types::{Chunk, ChunkSearchHit};
+use crate::types::ChunkSearchHit;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,19 +17,32 @@ pub fn hybrid_search(
         return Ok(Vec::new());
     }
 
-    let candidate_count = (top_k.max(1) * 5).min(index.chunks.len()).max(top_k);
+    let symbol_query = is_symbol_query(query);
+    let candidate_count = (top_k.max(1) * if symbol_query { 12 } else { 5 })
+        .min(index.chunks.len())
+        .max(top_k);
     let bm25 = index
         .bm25
-        .query(query, candidate_count, selector)
+        .query(query, candidate_count, selector)?
         .into_iter()
         .collect::<HashMap<usize, f32>>();
-    let query_vec = index.model.encode_one(query);
+
+    if symbol_query {
+        let mut scores = rrf_scores(&bm25);
+        boost_multi_chunk_files(index, &mut scores);
+        let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+        apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
+        return ranked_hits(index, scores, top_k, "symbol");
+    }
+
+    let model = index.embedding_model()?;
+    let query_vec = model.encode_one(query);
     let semantic_files = index
-        .vectors
+        .vector_store()?
         .query(&query_vec, candidate_count, None)?
         .into_iter()
         .collect::<HashMap<usize, f32>>();
-    let semantic = semantic_chunk_scores(index, query, &semantic_files, top_k, selector);
+    let semantic = semantic_chunk_scores(index, query, &semantic_files, top_k, selector)?;
 
     let semantic_rrf = rrf_scores(&semantic);
     let bm25_rrf = rrf_scores(&bm25);
@@ -37,28 +50,34 @@ pub fn hybrid_search(
     candidates.extend(semantic_rrf.keys().copied());
     candidates.extend(bm25_rrf.keys().copied());
 
-    let alpha = if is_symbol_query(query) { 0.3 } else { 0.5 };
     let mut scores = HashMap::new();
     for idx in candidates {
-        let score = alpha * semantic_rrf.get(&idx).copied().unwrap_or(0.0)
-            + (1.0 - alpha) * bm25_rrf.get(&idx).copied().unwrap_or(0.0);
+        let score = 0.5 * semantic_rrf.get(&idx).copied().unwrap_or(0.0)
+            + 0.5 * bm25_rrf.get(&idx).copied().unwrap_or(0.0);
         scores.insert(idx, score);
     }
 
     boost_multi_chunk_files(index, &mut scores);
     let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-    apply_query_boost(index, query, &mut scores, allowed.as_ref());
+    apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
+    ranked_hits(index, scores, top_k, "hybrid")
+}
+
+fn ranked_hits(
+    index: &Codebase,
+    scores: HashMap<usize, f32>,
+    top_k: usize,
+    source: &'static str,
+) -> Result<Vec<ChunkSearchHit>> {
     let mut ranked = scores.into_iter().collect::<Vec<_>>();
     ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-        let a_score = *a_score * path_penalty(&index.chunks[*a_idx].file_path);
-        let b_score = *b_score * path_penalty(&index.chunks[*b_idx].file_path);
+        let a_path = index.chunk_file_path(&index.chunks[*a_idx]);
+        let b_path = index.chunk_file_path(&index.chunks[*b_idx]);
+        let a_score = *a_score * path_penalty(a_path);
+        let b_score = *b_score * path_penalty(b_path);
         b_score
             .total_cmp(&a_score)
-            .then_with(|| {
-                index.chunks[*a_idx]
-                    .file_path
-                    .cmp(&index.chunks[*b_idx].file_path)
-            })
+            .then_with(|| a_path.cmp(b_path))
             .then_with(|| {
                 index.chunks[*a_idx]
                     .start_line
@@ -71,7 +90,7 @@ pub fn hybrid_search(
         .map(|(idx, score)| ChunkSearchHit {
             chunk: index.chunks[idx].clone(),
             score,
-            source: "hybrid",
+            source,
         })
         .collect())
 }
@@ -106,12 +125,13 @@ fn semantic_chunk_scores(
     file_scores: &HashMap<usize, f32>,
     top_k: usize,
     selector: Option<&[usize]>,
-) -> HashMap<usize, f32> {
+) -> Result<HashMap<usize, f32>> {
     if file_scores.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
     let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+    let mut content_by_file = HashMap::<String, String>::new();
     let mut ranked_files = file_scores.iter().collect::<Vec<_>>();
     ranked_files.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
         b_score.total_cmp(a_score).then_with(|| a_idx.cmp(b_idx))
@@ -137,10 +157,16 @@ fn semantic_chunk_scores(
             .copied()
             .filter(|idx| allowed.as_ref().is_none_or(|allowed| allowed.contains(idx)))
             .map(|idx| {
-                let local = semantic_local_chunk_score(&index.chunks[idx], &query_tokens, query);
-                (idx, local)
+                let local = semantic_local_chunk_score(
+                    index,
+                    idx,
+                    &query_tokens,
+                    query,
+                    &mut content_by_file,
+                )?;
+                Ok((idx, local))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         chunks.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (rank, (idx, local_score)) in chunks.into_iter().take(per_file).enumerate() {
             let rank_penalty = 1.0 / (rank as f32 + 1.0);
@@ -155,13 +181,21 @@ fn semantic_chunk_scores(
                 .or_insert(score);
         }
     }
-    scores
+    Ok(scores)
 }
 
-fn semantic_local_chunk_score(chunk: &Chunk, query_tokens: &HashSet<String>, query: &str) -> f32 {
+fn semantic_local_chunk_score(
+    index: &Codebase,
+    chunk_idx: usize,
+    query_tokens: &HashSet<String>,
+    query: &str,
+    content_by_file: &mut HashMap<String, String>,
+) -> Result<f32> {
+    let chunk = &index.chunks[chunk_idx];
+    let content = index.chunk_content_cached(chunk, content_by_file)?;
     let mut score = 0.0f32;
     if !query_tokens.is_empty() {
-        let chunk_tokens = tokenize(&chunk.content).into_iter().collect::<HashSet<_>>();
+        let chunk_tokens = tokenize(&content).into_iter().collect::<HashSet<_>>();
         let overlap = query_tokens
             .iter()
             .filter(|token| chunk_tokens.contains(*token))
@@ -174,13 +208,13 @@ fn semantic_local_chunk_score(chunk: &Chunk, query_tokens: &HashSet<String>, que
             .next()
             .unwrap_or(query)
             .trim();
-        if chunk_defines_symbol(chunk, symbol) {
+        if chunk_defines_symbol(&content, symbol) {
             score += 2.0;
-        } else if chunk.content.contains(symbol) {
+        } else if content.contains(symbol) {
             score += 0.5;
         }
     }
-    score
+    Ok(score)
 }
 
 fn boost_multi_chunk_files(index: &Codebase, scores: &mut HashMap<usize, f32>) {
@@ -194,7 +228,7 @@ fn boost_multi_chunk_files(index: &Codebase, scores: &mut HashMap<usize, f32>) {
     let mut file_sum: HashMap<&str, f32> = HashMap::new();
     let mut best_chunk: HashMap<&str, usize> = HashMap::new();
     for (&idx, &score) in scores.iter() {
-        let path = index.chunks[idx].file_path.as_str();
+        let path = index.chunk_file_path(&index.chunks[idx]);
         *file_sum.entry(path).or_default() += score;
         match best_chunk.get(path) {
             Some(&current) if scores[&current] >= score => {}
@@ -217,9 +251,9 @@ fn apply_query_boost(
     query: &str,
     scores: &mut HashMap<usize, f32>,
     allowed: Option<&HashSet<usize>>,
-) {
+) -> Result<()> {
     if scores.is_empty() {
-        return;
+        return Ok(());
     }
     let max_score = scores.values().copied().fold(0.0f32, f32::max);
     if is_symbol_query(query) {
@@ -228,13 +262,14 @@ fn apply_query_boost(
             .next()
             .unwrap_or(query)
             .trim();
-        boost_symbol_definitions(index, scores, symbol, max_score * 3.0, allowed);
+        boost_symbol_definitions(index, scores, symbol, max_score * 3.0, allowed)?;
     } else {
         boost_path_keyword_matches(index, scores, query, max_score);
         for symbol in embedded_symbols(query) {
-            boost_symbol_definitions(index, scores, &symbol, max_score * 1.5, allowed);
+            boost_symbol_definitions(index, scores, &symbol, max_score * 1.5, allowed)?;
         }
     }
+    Ok(())
 }
 
 fn boost_symbol_definitions(
@@ -243,9 +278,10 @@ fn boost_symbol_definitions(
     symbol: &str,
     boost_unit: f32,
     allowed: Option<&HashSet<usize>>,
-) {
+) -> Result<()> {
     let symbol_lower = symbol.to_ascii_lowercase();
     let mut boosted_non_candidates = Vec::new();
+    let mut content_by_file = HashMap::<String, String>::new();
 
     if let Some(indices) = index.symbol_definition_chunks.get(&symbol_lower) {
         for &idx in indices {
@@ -264,7 +300,8 @@ fn boost_symbol_definitions(
             if allowed.is_some_and(|allowed| !allowed.contains(&idx)) {
                 continue;
             }
-            if chunk_defines_symbol(&index.chunks[idx], symbol) {
+            let content = index.chunk_content_cached(&index.chunks[idx], &mut content_by_file)?;
+            if chunk_defines_symbol(&content, symbol) {
                 *score += boost_unit * symbol_definition_multiplier(index, idx, &symbol_lower);
             }
         }
@@ -273,10 +310,11 @@ fn boost_symbol_definitions(
     for (idx, score) in boosted_non_candidates {
         scores.insert(idx, score);
     }
+    Ok(())
 }
 
 fn symbol_definition_multiplier(index: &Codebase, idx: usize, symbol_lower: &str) -> f32 {
-    let stem = Path::new(&index.chunks[idx].file_path)
+    let stem = Path::new(index.chunk_file_path(&index.chunks[idx]))
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
@@ -302,7 +340,7 @@ fn boost_path_keyword_matches(
         return;
     }
     for (&idx, score) in scores.iter_mut() {
-        let path = Path::new(&index.chunks[idx].file_path);
+        let path = Path::new(index.chunk_file_path(&index.chunks[idx]));
         let mut parts = HashSet::new();
         if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
             parts.extend(split_identifier(stem));
@@ -336,7 +374,7 @@ fn embedded_symbols(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn chunk_defines_symbol(chunk: &Chunk, symbol: &str) -> bool {
+fn chunk_defines_symbol(content: &str, symbol: &str) -> bool {
     let needles = [
         format!("class {symbol}"),
         format!("interface {symbol}"),
@@ -345,7 +383,7 @@ fn chunk_defines_symbol(chunk: &Chunk, symbol: &str) -> bool {
         format!("record {symbol}"),
         format!(" {symbol}("),
     ];
-    needles.iter().any(|needle| chunk.content.contains(needle))
+    needles.iter().any(|needle| content.contains(needle))
 }
 
 fn stem_matches(stem: &str, name: &str) -> bool {

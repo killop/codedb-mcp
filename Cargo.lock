@@ -302,7 +302,6 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
- "vicinity",
 ]
 
 [[package]]
@@ -729,11 +728,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -972,12 +969,6 @@ dependencies = [
  "unicode-width",
  "web-time",
 ]
-
-[[package]]
-name = "innr"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8602407ceb96abb84ff33c01d34dc97cdef517842ac1b1f2d935752c7c9172a0"
 
 [[package]]
 name = "inotify"
@@ -2266,19 +2257,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vicinity"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecd69b0156e94b41a0e9db5204e62dadeb5420296e24dc01cbd508ce9d9aec06"
-dependencies = [
- "getrandom 0.3.4",
- "innr",
- "rand",
- "smallvec",
- "thiserror",
-]
 
 [[package]]
 name = "walkdir"

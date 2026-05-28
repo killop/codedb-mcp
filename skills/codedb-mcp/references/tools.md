@@ -4,7 +4,7 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_search` | Semantic/BM25 search or regex line search | Use `query` for one lookup or `queries` for batch. `regex=true` is closest to `rg`; default search uses indexed lexical and vector ranking. |
+| `codedb_search` | Regex, BM25/symbol, or natural-language vector search | Use `query` for one lookup or `queries` for batch. `regex=true` is closest to `rg`; symbol-shaped default queries stay on the indexed lexical/symbol path, while natural-language queries add lazy Model2Vec flat-cosine ranking. |
 | `codedb_callers` | LSP-like symbol references | Pass `definition_path` and `definition_line` for same-name symbols. Use `targets` for batch. Strongest on C#/Java. |
 | `codedb_symbol` | Find definitions by symbol name | Add `body=true` only when the body is needed. |
 | `codedb_word` | Exact identifier inverted-index lookup | Fast primitive for debugging reference results. |
@@ -42,7 +42,7 @@
 | `codedb_status` | Health and index stats | Check after setup, watch rebuild, or benchmark. |
 | `codedb_changes` | Files changed since sequence | Useful for incremental agent context. |
 | `codedb_index` | Reindex a local folder | Usually not needed when the server watches files. |
-| `codedb_bundle` | Up to 100 mixed tool calls | Use to reduce MCP round trips. Nested `codedb_bundle` is rejected. |
+| `codedb_bundle` | Up to 100 mixed tool calls | Use to reduce MCP round trips. Nested `codedb_bundle` is rejected. `timing=true` and `discard_output=true` are useful for benchmark runs. |
 | `codedb_query` | Small find/filter/search/limit/outline pipeline | Good for compact exploration without writing a custom loop. |
 | `codedb_projects` | Projects loaded in this server process | Mostly diagnostic because storage is project-local under `.codedb-mcp`. |
 | `codedb_snapshot` | JSON snapshot of files, symbols, dependencies | Use carefully on large repos. |

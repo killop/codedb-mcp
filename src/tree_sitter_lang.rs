@@ -68,7 +68,7 @@ struct ParseContext<'a> {
 fn visit(node: Node<'_>, context: &mut ParseContext<'_>) {
     collect_namespace_or_import(node, context);
     let skip_children = if let Some(symbol) = symbol_from_node(node, context) {
-        let skip_children = skip_symbol_children(&symbol.kind);
+        let skip_children = skip_symbol_children(symbol.kind.as_str());
         context.symbols.push(symbol);
         skip_children
     } else {
@@ -179,7 +179,7 @@ fn symbol_from_node(node: Node<'_>, context: &ParseContext<'_>) -> Option<Symbol
     let name = node_text(name_node, context.content).and_then(clean_symbol_name)?;
     Some(Symbol {
         name,
-        kind: kind.to_string(),
+        kind: kind.into(),
         line_start: node.start_position().row + 1,
         line_end: node.end_position().row + 1,
         detail: detail_for_node(node, context.lines),
@@ -300,7 +300,7 @@ fn lua_symbol_from_node(node: Node<'_>, context: &ParseContext<'_>) -> Option<Sy
     let name = node_text(name_node, context.content).and_then(clean_lua_symbol_name)?;
     Some(Symbol {
         name,
-        kind: kind.to_string(),
+        kind: kind.into(),
         line_start: node.start_position().row + 1,
         line_end: node.end_position().row + 1,
         detail: detail_for_node(node, context.lines),

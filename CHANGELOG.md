@@ -11,10 +11,24 @@
 ### Changed
 
 - Changed source scanning so nested Git worktrees/submodules under the target root are indexed as normal source directories. `respect_gitignore=true` still honors project `.gitignore` files, but `.git/info/exclude`, global gitignore, and nested Git repository boundaries no longer define the codebase boundary.
+- Reduced warm-index memory on large projects by storing identifier hits as compact file ids, keeping large-project graph nodes at file/namespace/dependency level while preserving symbol data in outline/search/callers indexes, building BM25 postings without a full temporary token corpus, and moving cached full-file source bodies to on-demand reads.
+- Reduced warm cache-hit memory further by making the graph, reverse dependencies, BM25 postings, embedding vectors, and Model2Vec/vector store lazy. Symbol-shaped `codedb_search` queries now stay on the BM25/symbol path and avoid loading embeddings.
+- Replaced the resident Vicinity HNSW vector index with a lazy flat-cosine file-vector scan for natural-language search, removing the HNSW dependency and its graph memory.
+- Compacted repeated in-memory metadata by storing symbol kinds and source languages as small enums and storing chunk file paths as file ids instead of duplicating path strings per chunk.
+- Moved forward dependencies into a lazy `deps.bin` sidecar so search/status/callers do not keep the dependency graph resident; dependency and graph/module tools load it on demand.
 
 ### Fixed
 
 - Fixed missing indexes for source files that live inside submodule directories under the main project root.
+- Fixed very small indexed projects failing vector-store construction when embedding output was empty by using the configured model dimension as the vector-store fallback.
+
+### Benchmark And Validation
+
+- Re-measured `u3dclient` after cache v14: 19,035 indexed files, 129,858 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
+- Re-ran README benchmarks on `u3dclient`: cache-hit non-semantic one-shot tools now sit around 258-269 MB working set and 318-351 MB private memory; dependency lookup peaks at 325.4 MB working set after loading `deps.bin`; one-shot natural-language search peaks at 403.8 MB working set and 453.6 MB private memory.
+- Re-ran the `gameserver` Java benchmark after fixing its explicit model path: 6,940 files, 55,057 chunks, and 245,238 symbols rebuild in 10.477s, then reopen from cache in 1.027s.
+- Updated the README `rg` comparison to reflect the cache v14 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
+- Verified source-on-demand tools after removing resident full-file bodies: `codedb_search PoolManager`, definition-anchored `codedb_callers PoolManager`, and `codedb_read PoolManager.cs`.
 
 ## Unreleased - 2026-05-27
 

@@ -163,7 +163,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_search",
-                "description": "Search indexed source code. Pass query for one search, or queries for a batch of strings/objects. Default is BM25 plus local Model2Vec/Vicinity vector search; set regex=true for regex line matching.",
+                "description": "Search indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use BM25 plus exact symbol boosts; natural-language queries add lazy Model2Vec flat-cosine vector search. Set regex=true for regex line matching.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             },
             {
@@ -213,8 +213,8 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_bundle",
-                "description": "Run up to 100 codedb_* calls in one round trip. Extra ops are reported as truncated.",
-                "inputSchema": {"type": "object", "properties": {"ops": {"type": "array", "items": {"type": "object"}}, "project": {"type": "string"}}, "required": ["ops"]}
+                "description": "Run up to 100 codedb_* calls in one round trip. Extra ops are reported as truncated. Optional timing=true reports per-inner-call milliseconds; discard_output=true keeps benchmark output compact.",
+                "inputSchema": {"type": "object", "properties": {"ops": {"type": "array", "items": {"type": "object"}}, "timing": {"type": "boolean"}, "discard_output": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["ops"]}
             },
             {
                 "name": "codedb_remote",

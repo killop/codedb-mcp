@@ -1,5 +1,6 @@
-use crate::indexer::{IndexOptions, StorageOptions};
-use crate::types::{Chunk, FileEntry, SemanticUnit, Symbol};
+use crate::bm25::Bm25Index;
+use crate::indexer::{IndexOptions, LightweightGraphStats, StorageOptions};
+use crate::types::{Chunk, FileEntry, LanguageId, SemanticUnit, Symbol, WordIndex};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -7,9 +8,12 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 14;
 const MANIFEST_FILE: &str = "manifest.json";
 const PAYLOAD_FILE: &str = "index.bin";
+const BM25_POSTINGS_FILE: &str = "bm25.postings";
+const EMBEDDINGS_FILE: &str = "embeddings.bin";
+const DEPS_FILE: &str = "deps.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceFingerprint {
@@ -30,6 +34,7 @@ struct CacheManifest {
     created_unix_ms: i128,
     config_hash: String,
     embedding_model: String,
+    embedding_dims: usize,
     file_count: usize,
     chunk_count: usize,
     semantic_unit_count: usize,
@@ -42,13 +47,17 @@ pub struct CachedIndexPayload {
     pub files: Vec<CachedFileEntry>,
     pub chunks: Vec<Chunk>,
     pub semantic_units: Vec<SemanticUnit>,
-    pub embeddings: Vec<Vec<f32>>,
+    pub embedding_dims: usize,
+    pub vector_count: usize,
+    pub graph_stats: LightweightGraphStats,
+    pub bm25: Bm25Index,
+    pub word_index: WordIndex,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CachedFileEntry {
     pub path: String,
-    pub language: String,
+    pub language: LanguageId,
     pub line_count: usize,
     pub byte_size: usize,
     pub modified_unix_ms: i128,
@@ -56,7 +65,6 @@ pub struct CachedFileEntry {
     pub namespace: Option<String>,
     pub imports: Vec<String>,
     pub symbols: Vec<Symbol>,
-    pub content: String,
 }
 
 #[derive(Serialize)]
@@ -64,13 +72,17 @@ struct CachedIndexPayloadRef<'a> {
     files: Vec<CachedFileEntryRef<'a>>,
     chunks: &'a [Chunk],
     semantic_units: &'a [SemanticUnit],
-    embeddings: &'a [Vec<f32>],
+    embedding_dims: usize,
+    vector_count: usize,
+    graph_stats: LightweightGraphStats,
+    bm25: &'a Bm25Index,
+    word_index: &'a WordIndex,
 }
 
 #[derive(Serialize)]
 struct CachedFileEntryRef<'a> {
     path: &'a str,
-    language: &'a str,
+    language: LanguageId,
     line_count: usize,
     byte_size: usize,
     modified_unix_ms: i128,
@@ -78,7 +90,6 @@ struct CachedFileEntryRef<'a> {
     namespace: &'a Option<String>,
     imports: &'a [String],
     symbols: &'a [Symbol],
-    content: &'a str,
 }
 
 #[derive(Serialize)]
@@ -111,6 +122,18 @@ impl ProjectCache {
         &self.dir
     }
 
+    pub fn bm25_postings_path(&self) -> PathBuf {
+        self.dir.join(BM25_POSTINGS_FILE)
+    }
+
+    pub fn embeddings_path(&self) -> PathBuf {
+        self.dir.join(EMBEDDINGS_FILE)
+    }
+
+    pub fn deps_path(&self) -> PathBuf {
+        self.dir.join(DEPS_FILE)
+    }
+
     pub fn load(
         &self,
         options: &IndexOptions,
@@ -121,7 +144,13 @@ impl ProjectCache {
         }
         let manifest_path = self.dir.join(MANIFEST_FILE);
         let payload_path = self.dir.join(PAYLOAD_FILE);
-        if !manifest_path.is_file() || !payload_path.is_file() {
+        let embeddings_path = self.dir.join(EMBEDDINGS_FILE);
+        let deps_path = self.dir.join(DEPS_FILE);
+        if !manifest_path.is_file()
+            || !payload_path.is_file()
+            || !embeddings_path.is_file()
+            || !deps_path.is_file()
+        {
             return Ok(None);
         }
 
@@ -134,15 +163,21 @@ impl ProjectCache {
             return Ok(None);
         }
 
-        let payload: CachedIndexPayload = read_bin(&payload_path)?;
+        let mut payload: CachedIndexPayload = read_bin(&payload_path)?;
         if payload.files.len() != manifest.file_count
             || payload.chunks.len() != manifest.chunk_count
             || payload.semantic_units.len() != manifest.semantic_unit_count
-            || payload.embeddings.len() != manifest.vector_count
-            || payload.semantic_units.len() != payload.embeddings.len()
+            || payload.embedding_dims != manifest.embedding_dims
+            || payload.vector_count != manifest.vector_count
+            || payload.semantic_units.len() != payload.vector_count
         {
             return Ok(None);
         }
+        let postings_path = self.dir.join(BM25_POSTINGS_FILE);
+        if !postings_path.is_file() {
+            return Ok(None);
+        }
+        payload.bm25.use_postings_file(postings_path);
         Ok(Some(payload))
     }
 
@@ -154,6 +189,10 @@ impl ProjectCache {
         chunks: &[Chunk],
         semantic_units: &[SemanticUnit],
         embeddings: &[Vec<f32>],
+        bm25: &Bm25Index,
+        word_index: &WordIndex,
+        deps_forward: &std::collections::HashMap<String, Vec<String>>,
+        graph_stats: LightweightGraphStats,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -169,12 +208,16 @@ impl ProjectCache {
             created_unix_ms: now_ms(),
             config_hash: config_hash(options)?,
             embedding_model: options.embedding_model.clone(),
+            embedding_dims: embedding_dims(embeddings),
             file_count: files.len(),
             chunk_count: chunks.len(),
             semantic_unit_count: semantic_units.len(),
             vector_count: embeddings.len(),
             files: fingerprints,
         };
+        bm25.write_postings(&self.dir.join(BM25_POSTINGS_FILE))?;
+        write_bin_atomic(&self.dir.join(EMBEDDINGS_FILE), embeddings)?;
+        write_bin_atomic(&self.dir.join(DEPS_FILE), deps_forward)?;
         let payload = CachedIndexPayloadRef {
             files: files
                 .iter()
@@ -182,12 +225,31 @@ impl ProjectCache {
                 .collect(),
             chunks,
             semantic_units,
-            embeddings,
+            embedding_dims: embedding_dims(embeddings),
+            vector_count: embeddings.len(),
+            graph_stats,
+            bm25,
+            word_index,
         };
         write_bin_atomic(&self.dir.join(PAYLOAD_FILE), &payload)?;
         write_json_atomic(&self.dir.join(MANIFEST_FILE), &manifest)?;
         Ok(())
     }
+}
+
+pub fn read_embeddings(path: &Path) -> Result<Vec<Vec<f32>>> {
+    read_bin(path)
+}
+
+pub fn read_deps_forward(path: &Path) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    read_bin(path)
+}
+
+fn embedding_dims(embeddings: &[Vec<f32>]) -> usize {
+    embeddings
+        .iter()
+        .find(|vector| !vector.is_empty())
+        .map_or(0, Vec::len)
 }
 
 impl SourceFingerprint {
@@ -213,7 +275,7 @@ impl CachedFileEntry {
             namespace: self.namespace,
             imports: self.imports,
             symbols: self.symbols,
-            content: self.content,
+            content: String::new(),
         }
     }
 }
@@ -222,7 +284,7 @@ impl<'a> CachedFileEntryRef<'a> {
     fn from_file_entry(file: &'a FileEntry) -> Self {
         Self {
             path: &file.path,
-            language: &file.language,
+            language: file.language,
             line_count: file.line_count,
             byte_size: file.byte_size,
             modified_unix_ms: file.modified_unix_ms,
@@ -230,7 +292,6 @@ impl<'a> CachedFileEntryRef<'a> {
             namespace: &file.namespace,
             imports: &file.imports,
             symbols: &file.symbols,
-            content: &file.content,
         }
     }
 }
@@ -286,7 +347,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     replace_file(&tmp, path)
 }
 
-fn write_bin_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+fn write_bin_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("bin.tmp");
     let file = File::create(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
     bincode::serialize_into(BufWriter::new(file), value)

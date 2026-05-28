@@ -53,10 +53,11 @@ pub fn chunk_source(
             } else {
                 Some(Chunk {
                     id: 0,
+                    file_id: 0,
                     file_path: file_path.to_string(),
                     start_line: start,
                     end_line: end,
-                    language: language.to_string(),
+                    language: language.into(),
                     content,
                 })
             }
@@ -71,7 +72,7 @@ pub fn scope_for_line(symbols: &[Symbol], line: usize) -> Option<Scope> {
         .max_by_key(|sym| sym.line_start)
         .map(|sym| Scope {
             name: sym.name.clone(),
-            kind: sym.kind.clone(),
+            kind: sym.kind.as_str().to_string(),
             start: sym.line_start,
             end: sym.line_end,
         })
@@ -87,6 +88,14 @@ pub fn regex_case_insensitive(pattern: &str) -> Result<Regex, regex::Error> {
 }
 
 fn line_chunks(lines: &[&str], start: usize, end: usize) -> Vec<(usize, usize)> {
+    if lines.is_empty() || start == 0 || end < start {
+        return Vec::new();
+    }
+    let start = start.min(lines.len());
+    let end = end.min(lines.len());
+    if end < start {
+        return Vec::new();
+    }
     let mut ranges = Vec::new();
     let mut chunk_start = start;
     let mut chars = 0usize;

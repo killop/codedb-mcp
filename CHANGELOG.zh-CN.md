@@ -11,10 +11,24 @@
 ### 变更
 
 - 调整源码扫描逻辑：目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录索引。`respect_gitignore=true` 仍然读取项目内 `.gitignore`，但 `.git/info/exclude`、全局 gitignore 和嵌套 Git 仓库边界不再决定 codebase 边界。
+- 降低大工程 warm index 内存：identifier hits 改为紧凑 file id；大工程图层保留 file/namespace/dependency 级别，symbol 仍保留在 outline/search/callers 专用索引；BM25 构建改为不保留完整临时 token 语料；缓存内不再保存完整文件源码正文，工具按需读取文件内容。
+- 进一步降低 cache hit 内存：graph、反向依赖、BM25 postings、embedding vectors、Model2Vec/vector store 都改成懒加载。符号形态的 `codedb_search` 现在走 BM25 + symbol 增强，不加载 embeddings。
+- 将常驻 Vicinity HNSW 向量索引替换为自然语言搜索时懒加载的 flat cosine 文件向量扫描，移除 HNSW 依赖和对应图内存。
+- 压缩重复内存元数据：symbol kind 和源码 language 改为小枚举；chunk 文件路径改为 file id，避免每个 chunk 重复保存路径字符串。
+- 将正向依赖图移动到懒加载的 `deps.bin` sidecar，search/status/callers 不再常驻依赖图；dependency 和 graph/module 工具按需加载。
 
 ### 修复
 
 - 修复主工程目录下的子模块源码不会被索引的问题。
+- 修复极小工程在 embedding 输出为空时 vector store 构建维度为 0 的问题，改为使用配置模型维度作为 fallback。
+
+### Benchmark 与验证
+
+- cache v14 后重新测量 `u3dclient`：19,035 个 indexed files、129,858 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
+- 重新测量 README benchmark：`u3dclient` cache-hit 非语义单次工具约 258-269 MB working set、318-351 MB private memory；依赖查询加载 `deps.bin` 后峰值为 325.4 MB working set；单次自然语言语义搜索峰值为 403.8 MB working set 和 453.6 MB private memory。
+- 修正 `gameserver` 显式模型路径后重新测量 Java benchmark：6,940 个 files、55,057 个 chunks、245,238 个 symbols，重建 10.477s，cache hit 重新打开 1.027s。
+- 更新 README 里的 `rg` 对比：cache v14 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
+- 验证移除常驻完整文件源码正文后的按需读文件工具：`codedb_search PoolManager`、基于定义锚点的 `codedb_callers PoolManager`、`codedb_read PoolManager.cs`。
 
 ## Unreleased - 2026-05-27
 

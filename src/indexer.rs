@@ -1,10 +1,12 @@
 use crate::bm25::Bm25Index;
-use crate::cache::{CachedIndexPayload, ProjectCache, SourceFingerprint};
+use crate::cache::{
+    CachedIndexPayload, ProjectCache, SourceFingerprint, read_deps_forward, read_embeddings,
+};
 use crate::embedding::MinishEmbeddingModel;
 use crate::graph::CodeGraph;
 use crate::language::{analyze_source, chunk_source, language_for_extension};
 use crate::tokens::{raw_identifiers, tokenize};
-use crate::types::{Chunk, FileEntry, SearchHit, SemanticUnit, Symbol, WordHit};
+use crate::types::{Chunk, FileEntry, SearchHit, SemanticUnit, Symbol, WordHit, WordIndex};
 use crate::vector_store::MinishVectorStore;
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -15,7 +17,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -203,22 +205,37 @@ pub struct IndexStats {
     pub cache: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+pub struct LightweightGraphStats {
+    pub nodes: usize,
+    pub edges: usize,
+    pub communities: usize,
+}
+
 pub struct Codebase {
     pub root: PathBuf,
     pub options: IndexOptions,
     pub seq: u64,
+    pub file_paths: Vec<String>,
     pub files: BTreeMap<String, FileEntry>,
     pub chunks: Vec<Chunk>,
     pub semantic_units: Vec<SemanticUnit>,
     pub chunk_indices_by_file: HashMap<String, Vec<usize>>,
     pub symbol_definition_chunks: HashMap<String, Vec<usize>>,
-    pub word_index: HashMap<String, Vec<WordHit>>,
-    pub deps_forward: HashMap<String, Vec<String>>,
-    pub deps_reverse: HashMap<String, Vec<String>>,
-    pub graph: CodeGraph,
+    pub word_index: WordIndex,
+    pub deps_forward: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
+    pub deps_path: Option<PathBuf>,
+    pub deps_reverse: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
+    pub graph_stats: LightweightGraphStats,
+    pub graph: parking_lot::RwLock<Option<Arc<CodeGraph>>>,
     pub bm25: Bm25Index,
-    pub vectors: MinishVectorStore,
-    pub model: MinishEmbeddingModel,
+    pub embeddings: parking_lot::RwLock<Option<Vec<Vec<f32>>>>,
+    pub embeddings_path: Option<PathBuf>,
+    pub vectors: parking_lot::RwLock<Option<Arc<MinishVectorStore>>>,
+    pub model: parking_lot::RwLock<Option<Arc<MinishEmbeddingModel>>>,
+    pub embedding_model_id: String,
+    pub embedding_dims: usize,
+    pub vector_count: usize,
     pub changed_files: Vec<ChangedFile>,
     pub storage_dir: Option<String>,
     pub cache_status: &'static str,
@@ -268,7 +285,15 @@ impl Codebase {
             match project_cache.load(&options, &cache_fingerprints) {
                 Ok(Some(payload)) => {
                     log_timing(timing, "load_project_cache", stage);
-                    return Self::from_cached(root, options, payload, storage_dir, total_start);
+                    return Self::from_cached(
+                        root,
+                        options,
+                        payload,
+                        storage_dir,
+                        Some(project_cache.embeddings_path()),
+                        Some(project_cache.deps_path()),
+                        total_start,
+                    );
                 }
                 Ok(None) => {
                     log_timing(timing, "load_project_cache_miss", stage);
@@ -297,13 +322,17 @@ impl Codebase {
             })
             .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
+        let file_paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
         log_timing(timing, "read_parse_files", stage);
 
         let stage = Instant::now();
         let mut chunks = Vec::new();
         for file in &files {
             chunks.extend(chunk_source(
-                &file.language,
+                file.language.as_str(),
                 &file.content,
                 &file.path,
                 &file.symbols,
@@ -312,37 +341,37 @@ impl Codebase {
         for (id, chunk) in chunks.iter_mut().enumerate() {
             chunk.id = id;
         }
-        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks);
+        assign_chunk_file_ids(&mut chunks, &file_paths);
+        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
         let symbol_definition_chunks =
             build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "chunk_files", stage);
 
         let stage = Instant::now();
         let dependency_symbols = build_dependency_symbols(&files);
-        let (word_index, dependency_identifiers) = build_word_index(&files, &dependency_symbols);
+        let (word_index, dependency_identifiers) =
+            build_word_index(&files, &chunks, &chunk_indices_by_file, &dependency_symbols);
         log_timing(timing, "word_index", stage);
 
         let stage = Instant::now();
-        let (deps_forward, deps_reverse) =
-            build_dependencies(&files, &dependency_symbols, &dependency_identifiers);
+        let (deps_forward, _deps_reverse) = build_dependencies(
+            &files,
+            &chunks,
+            &chunk_indices_by_file,
+            &dependency_symbols,
+            &dependency_identifiers,
+        );
         log_timing(timing, "dependencies", stage);
 
-        let stage = Instant::now();
-        let file_map = files
+        let mut file_map = files
             .iter()
             .cloned()
             .map(|file| (file.path.clone(), file))
             .collect::<BTreeMap<_, _>>();
-        let graph = CodeGraph::build(&file_map, &deps_forward);
-        log_timing(timing, "graph", stage);
+        let graph_stats = estimate_graph_stats(&file_map, &deps_forward);
 
         let stage = Instant::now();
-        let bm25 = Bm25Index::new(
-            chunks
-                .par_iter()
-                .map(|chunk| tokenize(&enrich_for_bm25(chunk)))
-                .collect(),
-        );
+        let mut bm25 = Bm25Index::new(chunks.iter().map(|chunk| tokenize(&enrich_for_bm25(chunk))));
         log_timing(timing, "bm25", stage);
 
         let stage = Instant::now();
@@ -362,6 +391,8 @@ impl Codebase {
 
         let stage = Instant::now();
         let model = load_embedding_model(&root, &options.embedding_model)?;
+        let embedding_model_id = model.model_id().to_string();
+        let embedding_dims = model.dim();
         log_timing(timing, "load_embedding_model", stage);
 
         let stage = Instant::now();
@@ -370,41 +401,74 @@ impl Codebase {
             .map(|unit| unit.text.clone())
             .collect::<Vec<_>>();
         let embeddings = model.encode(&texts);
+        drop(texts);
         log_timing(timing, "encode_embeddings", stage);
-
-        let stage = Instant::now();
-        let vectors = MinishVectorStore::build(&embeddings, model.dim())?;
-        log_timing(timing, "hnsw", stage);
+        let vector_count = embeddings.len();
+        let mut embeddings_path = None;
+        let mut deps_path = None;
+        strip_semantic_unit_text(&mut semantic_units);
+        strip_chunk_contents(&mut chunks);
+        strip_chunk_paths(&mut chunks);
         if project_cache.enabled() {
             let stage = Instant::now();
-            if let Err(err) =
-                project_cache.save(&options, &files, &chunks, &semantic_units, &embeddings)
-            {
+            let save_result = project_cache.save(
+                &options,
+                &files,
+                &chunks,
+                &semantic_units,
+                &embeddings,
+                &bm25,
+                &word_index,
+                &deps_forward,
+                graph_stats,
+            );
+            if let Err(err) = save_result {
                 eprintln!(
                     "codebase-mcp cache save failed at {}: {err:#}",
                     project_cache.dir().display()
                 );
+            } else {
+                bm25.use_postings_file(project_cache.bm25_postings_path());
+                embeddings_path = Some(project_cache.embeddings_path());
+                deps_path = Some(project_cache.deps_path());
             }
             log_timing(timing, "save_project_cache", stage);
         }
         log_timing(timing, "total", total_start);
+        strip_file_contents(&mut file_map);
 
         Ok(Self {
             root,
             options,
             seq: now_ms() as u64,
+            file_paths,
             files: file_map,
             chunks,
             semantic_units,
             chunk_indices_by_file,
             symbol_definition_chunks,
             word_index,
-            deps_forward,
-            deps_reverse,
-            graph,
+            deps_forward: parking_lot::RwLock::new(if deps_path.is_some() {
+                None
+            } else {
+                Some(deps_forward)
+            }),
+            deps_path,
+            deps_reverse: parking_lot::RwLock::new(None),
+            graph_stats,
+            graph: parking_lot::RwLock::new(None),
             bm25,
-            vectors,
-            model,
+            embeddings: parking_lot::RwLock::new(if embeddings_path.is_some() {
+                None
+            } else {
+                Some(embeddings)
+            }),
+            embeddings_path,
+            vectors: parking_lot::RwLock::new(None),
+            model: parking_lot::RwLock::new(None),
+            embedding_model_id,
+            embedding_dims,
+            vector_count,
             changed_files: Vec::new(),
             storage_dir,
             cache_status: if project_cache.enabled() {
@@ -422,73 +486,66 @@ impl Codebase {
         options: IndexOptions,
         payload: CachedIndexPayload,
         storage_dir: Option<String>,
+        embeddings_path: Option<PathBuf>,
+        deps_path: Option<PathBuf>,
         total_start: Instant,
     ) -> Result<Self> {
         let timing = options.diagnostics.timing;
         let stage = Instant::now();
-        let model = load_embedding_model(&root, &options.embedding_model)?;
-        log_timing(timing, "load_embedding_model", stage);
-
-        let stage = Instant::now();
-        let vectors = MinishVectorStore::build(&payload.embeddings, model.dim())?;
-        log_timing(timing, "hnsw", stage);
-
-        let stage = Instant::now();
+        let embedding_dims = payload.embedding_dims;
+        let vector_count = payload.vector_count;
         let files = payload
             .files
             .into_iter()
             .map(|file| file.into_file_entry())
             .collect::<Vec<_>>();
-        let chunks = payload.chunks;
-        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks);
+        let file_paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let mut chunks = payload.chunks;
+        assign_chunk_file_ids(&mut chunks, &file_paths);
+        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
+        strip_chunk_paths(&mut chunks);
         let symbol_definition_chunks =
             build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "restore_cached_files", stage);
 
-        let stage = Instant::now();
-        let dependency_symbols = build_dependency_symbols(&files);
-        let (word_index, dependency_identifiers) = build_word_index(&files, &dependency_symbols);
-        log_timing(timing, "word_index", stage);
-
-        let stage = Instant::now();
-        let (deps_forward, deps_reverse) =
-            build_dependencies(&files, &dependency_symbols, &dependency_identifiers);
-        log_timing(timing, "dependencies", stage);
-
-        let stage = Instant::now();
-        let file_map = files
+        let word_index = payload.word_index;
+        let bm25 = payload.bm25;
+        let embedding_model_id = options.embedding_model.clone();
+        let mut file_map = files
             .into_iter()
             .map(|file| (file.path.clone(), file))
             .collect::<BTreeMap<_, _>>();
-        let graph = CodeGraph::build(&file_map, &deps_forward);
-        log_timing(timing, "graph", stage);
-
-        let stage = Instant::now();
-        let bm25 = Bm25Index::new(
-            chunks
-                .par_iter()
-                .map(|chunk| tokenize(&enrich_for_bm25(chunk)))
-                .collect(),
-        );
-        log_timing(timing, "bm25", stage);
+        let graph_stats = payload.graph_stats;
         log_timing(timing, "total", total_start);
+        strip_file_contents(&mut file_map);
 
         Ok(Self {
             root,
             options,
             seq: now_ms() as u64,
+            file_paths,
             files: file_map,
             chunks,
             semantic_units: payload.semantic_units,
             chunk_indices_by_file,
             symbol_definition_chunks,
             word_index,
-            deps_forward,
-            deps_reverse,
-            graph,
+            deps_forward: parking_lot::RwLock::new(None),
+            deps_path,
+            deps_reverse: parking_lot::RwLock::new(None),
+            graph_stats,
+            graph: parking_lot::RwLock::new(None),
             bm25,
-            vectors,
-            model,
+            embeddings: parking_lot::RwLock::new(None),
+            embeddings_path,
+            vectors: parking_lot::RwLock::new(None),
+            model: parking_lot::RwLock::new(None),
+            embedding_model_id,
+            embedding_dims,
+            vector_count,
             changed_files: Vec::new(),
             storage_dir,
             cache_status: "hit",
@@ -506,12 +563,12 @@ impl Codebase {
             seq: self.seq,
             scan: "ready",
             extensions: self.options.extensions.clone(),
-            graph_nodes: self.graph.nodes.len(),
-            graph_edges: self.graph.edges.len(),
-            graph_communities: self.graph.communities.len(),
-            embedding_model: self.model.model_id().to_string(),
-            embedding_dims: self.model.dim(),
-            vector_count: self.vectors.len(),
+            graph_nodes: self.graph_summary().nodes,
+            graph_edges: self.graph_summary().edges,
+            graph_communities: self.graph_summary().communities,
+            embedding_model: self.embedding_model_id.clone(),
+            embedding_dims: self.embedding_dims,
+            vector_count: self.vector_count,
             vector_units: "files",
             storage_dir: self.storage_dir.clone(),
             cache: self.cache_status,
@@ -521,6 +578,201 @@ impl Codebase {
     pub fn file(&self, path: &str) -> Option<&FileEntry> {
         let normalized = normalize_rel_path(path);
         self.files.get(&normalized)
+    }
+
+    pub fn file_by_id(&self, file_id: u32) -> Option<&FileEntry> {
+        self.file_paths
+            .get(file_id as usize)
+            .and_then(|path| self.files.get(path))
+    }
+
+    pub fn file_content(&self, file: &FileEntry) -> Result<String> {
+        if !file.content.is_empty() {
+            return Ok(file.content.clone());
+        }
+        let path = self.root.join(&file.path);
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    pub fn chunk_content(&self, chunk: &Chunk) -> Result<String> {
+        let mut cache = HashMap::new();
+        self.chunk_content_cached(chunk, &mut cache)
+    }
+
+    pub fn chunk_file_path<'a>(&'a self, chunk: &'a Chunk) -> &'a str {
+        chunk_file_path(chunk, &self.file_paths)
+    }
+
+    pub fn chunk_content_cached(
+        &self,
+        chunk: &Chunk,
+        content_by_file: &mut HashMap<String, String>,
+    ) -> Result<String> {
+        if !chunk.content.is_empty() {
+            return Ok(chunk.content.clone());
+        }
+        let file_path = self.chunk_file_path(chunk);
+        if !content_by_file.contains_key(file_path) {
+            let file = self
+                .file(file_path)
+                .ok_or_else(|| anyhow!("chunk file not indexed: {}", file_path))?;
+            content_by_file.insert(file_path.to_string(), self.file_content(file)?);
+        }
+        let content = content_by_file
+            .get(file_path)
+            .ok_or_else(|| anyhow!("chunk file not cached: {}", file_path))?;
+        Ok(extract_content_lines(
+            content,
+            chunk.start_line,
+            chunk.end_line,
+        ))
+    }
+
+    pub fn graph(&self) -> Arc<CodeGraph> {
+        if let Some(graph) = self.graph.read().as_ref().cloned() {
+            return graph;
+        }
+        let mut guard = self.graph.write();
+        if let Some(graph) = guard.as_ref().cloned() {
+            return graph;
+        }
+        let deps_forward = self.deps_forward_snapshot();
+        let graph = Arc::new(CodeGraph::build(&self.files, &deps_forward));
+        *guard = Some(graph.clone());
+        graph
+    }
+
+    pub fn graph_summary(&self) -> LightweightGraphStats {
+        if let Some(graph) = self.graph.read().as_ref() {
+            return LightweightGraphStats {
+                nodes: graph.nodes.len(),
+                edges: graph.edges.len(),
+                communities: graph.communities.len(),
+            };
+        }
+        self.graph_stats
+    }
+
+    pub fn embedding_model(&self) -> Result<Arc<MinishEmbeddingModel>> {
+        if let Some(model) = self.model.read().as_ref().cloned() {
+            return Ok(model);
+        }
+        let mut guard = self.model.write();
+        if let Some(model) = guard.as_ref().cloned() {
+            return Ok(model);
+        }
+        let model = Arc::new(load_embedding_model(
+            &self.root,
+            &self.options.embedding_model,
+        )?);
+        *guard = Some(model.clone());
+        Ok(model)
+    }
+
+    pub fn vector_store(&self) -> Result<Arc<MinishVectorStore>> {
+        if let Some(vectors) = self.vectors.read().as_ref().cloned() {
+            return Ok(vectors);
+        }
+        let mut guard = self.vectors.write();
+        if let Some(vectors) = guard.as_ref().cloned() {
+            return Ok(vectors);
+        }
+        let embeddings = if let Some(embeddings) = self.embeddings.write().take() {
+            embeddings
+        } else if let Some(path) = &self.embeddings_path {
+            read_embeddings(path)?
+        } else {
+            return Err(anyhow!("embedding vectors are unavailable"));
+        };
+        let vectors = Arc::new(MinishVectorStore::build(&embeddings, self.embedding_dims)?);
+        *guard = Some(vectors.clone());
+        Ok(vectors)
+    }
+
+    pub fn reverse_deps_for(&self, path: &str) -> Vec<String> {
+        self.ensure_deps_reverse();
+        self.deps_reverse
+            .read()
+            .as_ref()
+            .and_then(|reverse| reverse.get(path).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn deps_for(&self, path: &str) -> Vec<String> {
+        self.ensure_deps_forward();
+        self.deps_forward
+            .read()
+            .as_ref()
+            .and_then(|deps| deps.get(path).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn deps_forward_snapshot(&self) -> HashMap<String, Vec<String>> {
+        self.ensure_deps_forward();
+        self.deps_forward
+            .read()
+            .as_ref()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn deps_reverse_snapshot(&self) -> HashMap<String, Vec<String>> {
+        self.ensure_deps_reverse();
+        self.deps_reverse
+            .read()
+            .as_ref()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn ensure_deps_forward(&self) {
+        if self.deps_forward.read().is_some() {
+            return;
+        }
+        let mut guard = self.deps_forward.write();
+        if guard.is_some() {
+            return;
+        }
+        let deps = if let Some(path) = &self.deps_path {
+            read_deps_forward(path).unwrap_or_else(|err| {
+                eprintln!(
+                    "codebase-mcp deps cache load failed at {}: {err:#}",
+                    path.display()
+                );
+                HashMap::new()
+            })
+        } else {
+            HashMap::new()
+        };
+        *guard = Some(deps);
+    }
+
+    fn ensure_deps_reverse(&self) {
+        if self.deps_reverse.read().is_some() {
+            return;
+        }
+        let mut guard = self.deps_reverse.write();
+        if guard.is_some() {
+            return;
+        }
+        let deps_forward = self.deps_forward_snapshot();
+        let mut reverse: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (source, targets) in &deps_forward {
+            for target in targets {
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(source.clone());
+            }
+        }
+        *guard = Some(
+            reverse
+                .into_iter()
+                .map(|(path, sources)| (path, sources.into_iter().collect()))
+                .collect(),
+        );
     }
 
     pub fn symbols_named(&self, name: &str) -> Vec<(&FileEntry, &Symbol)> {
@@ -545,7 +797,7 @@ impl Codebase {
         self.chunks
             .iter()
             .enumerate()
-            .filter_map(|(idx, chunk)| globset.is_match(&chunk.file_path).then_some(idx))
+            .filter_map(|(idx, chunk)| globset.is_match(self.chunk_file_path(chunk)).then_some(idx))
             .collect()
     }
 
@@ -576,7 +828,8 @@ impl Codebase {
             {
                 continue;
             }
-            for (idx, line) in file.content.lines().enumerate() {
+            let content = self.file_content(file)?;
+            for (idx, line) in content.lines().enumerate() {
                 if compact && crate::language::is_comment_or_blank(line) {
                     continue;
                 }
@@ -615,11 +868,144 @@ fn log_timing(enabled: bool, stage: &str, start: Instant) {
     }
 }
 
-fn build_chunk_indices_by_file(chunks: &[Chunk]) -> HashMap<String, Vec<usize>> {
+fn strip_file_contents(files: &mut BTreeMap<String, FileEntry>) {
+    for file in files.values_mut() {
+        file.content.clear();
+        file.content.shrink_to_fit();
+    }
+}
+
+fn strip_chunk_contents(chunks: &mut [Chunk]) {
+    for chunk in chunks {
+        chunk.content.clear();
+        chunk.content.shrink_to_fit();
+    }
+}
+
+fn strip_chunk_paths(chunks: &mut [Chunk]) {
+    for chunk in chunks {
+        chunk.file_path.clear();
+        chunk.file_path.shrink_to_fit();
+    }
+}
+
+fn strip_semantic_unit_text(units: &mut [SemanticUnit]) {
+    for unit in units {
+        unit.text.clear();
+        unit.text.shrink_to_fit();
+    }
+}
+
+fn assign_chunk_file_ids(chunks: &mut [Chunk], file_paths: &[String]) {
+    let path_to_id = file_paths
+        .iter()
+        .enumerate()
+        .map(|(id, path)| (path.as_str(), id as u32))
+        .collect::<HashMap<_, _>>();
+    for chunk in chunks {
+        if let Some(file_id) = path_to_id.get(chunk.file_path.as_str()) {
+            chunk.file_id = *file_id;
+        }
+    }
+}
+
+fn chunk_file_path<'a>(chunk: &'a Chunk, file_paths: &'a [String]) -> &'a str {
+    if !chunk.file_path.is_empty() {
+        return &chunk.file_path;
+    }
+    file_paths
+        .get(chunk.file_id as usize)
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+fn extract_content_lines(content: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        if line_no < start {
+            continue;
+        }
+        if line_no > end {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn estimate_graph_stats(
+    files: &BTreeMap<String, FileEntry>,
+    deps_forward: &HashMap<String, Vec<String>>,
+) -> LightweightGraphStats {
+    let namespaces = files
+        .values()
+        .filter_map(|file| file.namespace.as_ref())
+        .collect::<BTreeSet<_>>();
+    let namespace_edges = files
+        .values()
+        .filter(|file| file.namespace.is_some())
+        .count();
+    let mut dep_edges = 0usize;
+    let mut adjacency = HashMap::<String, Vec<String>>::new();
+    for path in files.keys() {
+        adjacency.entry(path.clone()).or_default();
+    }
+    for (source, targets) in deps_forward {
+        if !files.contains_key(source) {
+            continue;
+        }
+        for target in targets {
+            if !files.contains_key(target) {
+                continue;
+            }
+            dep_edges += 1;
+            adjacency
+                .entry(source.clone())
+                .or_default()
+                .push(target.clone());
+            adjacency
+                .entry(target.clone())
+                .or_default()
+                .push(source.clone());
+        }
+    }
+
+    let mut communities = 0usize;
+    let mut visited = HashSet::<String>::new();
+    for path in files.keys() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        communities += 1;
+        let mut stack = vec![path.clone()];
+        while let Some(current) = stack.pop() {
+            for next in adjacency.get(&current).into_iter().flatten() {
+                if visited.insert(next.clone()) {
+                    stack.push(next.clone());
+                }
+            }
+        }
+    }
+
+    LightweightGraphStats {
+        nodes: files.len() + namespaces.len(),
+        edges: namespace_edges + dep_edges,
+        communities,
+    }
+}
+
+fn build_chunk_indices_by_file(
+    chunks: &[Chunk],
+    file_paths: &[String],
+) -> HashMap<String, Vec<usize>> {
     let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, chunk) in chunks.iter().enumerate() {
         by_file
-            .entry(chunk.file_path.clone())
+            .entry(chunk_file_path(chunk, file_paths).to_string())
             .or_default()
             .push(idx);
     }
@@ -886,7 +1272,7 @@ fn read_file_entry(
 
     let entry = FileEntry {
         path: rel,
-        language: language.to_string(),
+        language: language.into(),
         line_count: content.lines().count(),
         byte_size: bytes.len(),
         modified_unix_ms,
@@ -911,29 +1297,31 @@ fn read_file_entry(
 
 fn build_word_index(
     files: &[FileEntry],
+    chunks: &[Chunk],
+    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
     dependency_symbols: &HashMap<String, Vec<SymbolDefinition>>,
-) -> (
-    HashMap<String, Vec<WordHit>>,
-    HashMap<String, DependencyReferences>,
-) {
+) -> (WordIndex, HashMap<String, DependencyReferences>) {
     let partials = files
         .par_iter()
-        .map(|file| {
+        .enumerate()
+        .map(|(file_id, file)| {
             let mut local: HashMap<String, Vec<WordHit>> = HashMap::new();
             let mut dependency_references = DependencyReferences::default();
-            let aliases = (file.language == "csharp").then(|| parse_using_aliases(&file.content));
+            let lines = file_chunk_lines(file, chunks, chunk_indices_by_file);
+            let aliases =
+                (file.language == "csharp").then(|| parse_using_aliases_from_lines(&lines));
             if file.language == "csharp" {
-                collect_static_using_dependency_references(
-                    &file.content,
+                collect_static_using_dependency_references_from_lines(
+                    &lines,
                     dependency_symbols,
                     &mut dependency_references,
                 );
             }
-            for (line_idx, line) in file.content.lines().enumerate() {
+            for (line_no, line) in lines {
                 let mut seen = HashSet::new();
                 let identifiers = raw_identifiers(line);
                 let code = strip_strings_and_line_comment(line);
-                let dependency_line = is_dependency_reference_line(&file.language, &code);
+                let dependency_line = is_dependency_reference_line(file.language.as_str(), &code);
                 if dependency_line {
                     collect_qualified_dependency_references(
                         &code,
@@ -966,8 +1354,8 @@ fn build_word_index(
                     }
                     if seen.insert(raw.clone()) {
                         local.entry(raw).or_default().push(WordHit {
-                            path: file.path.clone(),
-                            line: line_idx + 1,
+                            file_id: file_id as u32,
+                            line: line_no as u32,
                         });
                     }
                 }
@@ -984,10 +1372,27 @@ fn build_word_index(
         }
         references_by_file.insert(path, dependency_references);
     }
-    for hits in index.values_mut() {
-        hits.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+    (WordIndex::from_map(index), references_by_file)
+}
+
+fn file_chunk_lines<'a>(
+    file: &FileEntry,
+    chunks: &'a [Chunk],
+    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
+) -> Vec<(usize, &'a str)> {
+    let Some(indices) = chunk_indices_by_file.get(&file.path) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for &chunk_idx in indices {
+        let Some(chunk) = chunks.get(chunk_idx) else {
+            continue;
+        };
+        for (offset, line) in chunk.content.lines().enumerate() {
+            lines.push((chunk.start_line + offset, line));
+        }
     }
-    (index, references_by_file)
+    lines
 }
 
 #[derive(Clone)]
@@ -1010,7 +1415,7 @@ fn build_dependency_symbols(files: &[FileEntry]) -> HashMap<String, Vec<SymbolDe
         let type_symbols = file
             .symbols
             .iter()
-            .filter(|symbol| is_dependency_symbol_kind(&symbol.kind))
+            .filter(|symbol| is_dependency_symbol_kind(symbol.kind.as_str()))
             .collect::<Vec<_>>();
         if file.language == "rust" {
             for symbol in type_symbols {
@@ -1019,7 +1424,7 @@ fn build_dependency_symbols(files: &[FileEntry]) -> HashMap<String, Vec<SymbolDe
             continue;
         }
         let has_primary_type = type_symbols.iter().any(|symbol| {
-            is_dependency_symbol_kind(&symbol.kind)
+            is_dependency_symbol_kind(symbol.kind.as_str())
                 && is_primary_symbol_for_file(&file.path, &symbol.name)
         });
         let include_single_non_primary_type = !has_primary_type && type_symbols.len() == 1;
@@ -1055,6 +1460,8 @@ fn push_dependency_symbol(
 
 fn build_dependencies(
     files: &[FileEntry],
+    chunks: &[Chunk],
+    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
     symbols_by_name: &HashMap<String, Vec<SymbolDefinition>>,
     references_by_file: &HashMap<String, DependencyReferences>,
 ) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
@@ -1066,7 +1473,13 @@ fn build_dependencies(
     for file in files {
         let deps = forward.entry(file.path.clone()).or_default();
         if file.language == "rust" {
-            collect_rust_module_file_dependencies(file, &indexed_paths, deps);
+            collect_rust_module_file_dependencies(
+                file,
+                chunks,
+                chunk_indices_by_file,
+                &indexed_paths,
+                deps,
+            );
         }
         if file.language == "lua" {
             collect_lua_require_file_dependencies(file, &indexed_paths, deps);
@@ -1148,10 +1561,12 @@ fn is_import_or_namespace_line(language: &str, trimmed: &str) -> bool {
 
 fn collect_rust_module_file_dependencies(
     file: &FileEntry,
+    chunks: &[Chunk],
+    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
     indexed_paths: &HashSet<&str>,
     deps: &mut BTreeSet<String>,
 ) {
-    for line in file.content.lines() {
+    for (_, line) in file_chunk_lines(file, chunks, chunk_indices_by_file) {
         let code = strip_strings_and_line_comment(line);
         let Some(name) = rust_module_name(code.trim_start()) else {
             continue;
@@ -1293,9 +1708,15 @@ fn qualified_name_re() -> &'static Regex {
     })
 }
 
-fn parse_using_aliases(content: &str) -> HashMap<String, String> {
+fn parse_using_aliases_from_lines(lines: &[(usize, &str)]) -> HashMap<String, String> {
+    parse_using_aliases_from_iter(lines.iter().map(|(_, line)| *line))
+}
+
+fn parse_using_aliases_from_iter<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
-    for line in content.lines() {
+    for line in lines {
         if let Some(caps) = using_alias_re().captures(line) {
             aliases.insert(caps[1].to_string(), normalize_qualified_name(&caps[2]));
         }
@@ -1319,12 +1740,24 @@ fn static_using_re() -> &'static Regex {
     })
 }
 
-fn collect_static_using_dependency_references(
-    content: &str,
+fn collect_static_using_dependency_references_from_lines(
+    lines: &[(usize, &str)],
     symbols_by_name: &HashMap<String, Vec<SymbolDefinition>>,
     references: &mut DependencyReferences,
 ) {
-    for line in content.lines() {
+    collect_static_using_dependency_references_from_iter(
+        lines.iter().map(|(_, line)| *line),
+        symbols_by_name,
+        references,
+    );
+}
+
+fn collect_static_using_dependency_references_from_iter<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    symbols_by_name: &HashMap<String, Vec<SymbolDefinition>>,
+    references: &mut DependencyReferences,
+) {
+    for line in lines {
         if let Some(caps) = static_using_re().captures(line) {
             collect_qualified_dependency_reference(
                 &normalize_qualified_name(&caps[1]),
@@ -1668,7 +2101,7 @@ fn semantic_text_for_file(file: &FileEntry) -> String {
     }
     text.push_str("symbols ");
     for symbol in file.symbols.iter().take(256) {
-        text.push_str(&symbol.kind);
+        text.push_str(symbol.kind.as_str());
         text.push(' ');
         text.push_str(&symbol.name);
         text.push(' ');
@@ -1699,7 +2132,7 @@ mod tests {
     fn file_with_language(path: &str, language: &str, content: &str) -> FileEntry {
         FileEntry {
             path: path.to_string(),
-            language: language.to_string(),
+            language: language.into(),
             line_count: content.lines().count(),
             byte_size: content.len(),
             modified_unix_ms: 0,
@@ -1712,9 +2145,33 @@ mod tests {
     }
 
     fn dependency_paths(files: Vec<FileEntry>, path: &str) -> Vec<String> {
+        let mut chunks = Vec::new();
+        for file in &files {
+            chunks.extend(chunk_source(
+                file.language.as_str(),
+                &file.content,
+                &file.path,
+                &file.symbols,
+            ));
+        }
+        for (id, chunk) in chunks.iter_mut().enumerate() {
+            chunk.id = id;
+        }
+        let file_paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assign_chunk_file_ids(&mut chunks, &file_paths);
+        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
         let symbols = build_dependency_symbols(&files);
-        let (_, references) = build_word_index(&files, &symbols);
-        let (forward, _) = build_dependencies(&files, &symbols, &references);
+        let (_, references) = build_word_index(&files, &chunks, &chunk_indices_by_file, &symbols);
+        let (forward, _) = build_dependencies(
+            &files,
+            &chunks,
+            &chunk_indices_by_file,
+            &symbols,
+            &references,
+        );
         forward.get(path).cloned().unwrap_or_default()
     }
 

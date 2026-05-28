@@ -2,6 +2,7 @@
 .mcp_data/
 .codedb-mcp/index.bin
 .codedb-mcp/manifest.json
+.codedb-mcp/bm25.postings
 .codedb-mcp/*.tmp
 .codedb-mcp/*.bin
 skills/code-module-atlas/assets/viewer/node_modules/

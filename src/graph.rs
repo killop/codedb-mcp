@@ -172,7 +172,8 @@ impl CodeGraph {
         deps_forward: &HashMap<String, Vec<String>>,
     ) -> Self {
         let symbol_count = files.values().map(|file| file.symbols.len()).sum::<usize>();
-        let enable_reference_edges = symbol_count <= MAX_SYMBOLS_FOR_REFERENCE_EDGES;
+        let include_symbol_nodes = symbol_count <= MAX_SYMBOLS_FOR_REFERENCE_EDGES;
+        let enable_reference_edges = include_symbol_nodes;
         let mut nodes = BTreeMap::new();
         let mut edges = EdgeAccumulator::default();
         let mut symbol_by_name: HashMap<String, Vec<SymbolRef>> = HashMap::new();
@@ -199,11 +200,11 @@ impl CodeGraph {
                 );
             }
 
-            for symbol in &file.symbols {
-                let symbol_id = symbol_node_id(&file.path, symbol.line_start, &symbol.name);
-                let node = symbol_node(file, symbol, &symbol_id);
-                nodes.insert(symbol_id.clone(), node);
-                if enable_reference_edges {
+            if include_symbol_nodes {
+                for symbol in &file.symbols {
+                    let symbol_id = symbol_node_id(&file.path, symbol.line_start, &symbol.name);
+                    let node = symbol_node(file, symbol, &symbol_id);
+                    nodes.insert(symbol_id.clone(), node);
                     file_symbol_ids
                         .entry(file.path.clone())
                         .or_default()
@@ -216,22 +217,9 @@ impl CodeGraph {
                             file_path: file.path.clone(),
                             namespace: file.namespace.clone(),
                         });
-                }
 
-                edges.add(
-                    &file_id,
-                    &symbol_id,
-                    "contains",
-                    "EXTRACTED",
-                    1.0,
-                    1.0,
-                    Some(file.path.clone()),
-                    Some(symbol.line_start),
-                );
-
-                if let Some(namespace) = &file.namespace {
                     edges.add(
-                        &namespace_node_id(namespace),
+                        &file_id,
                         &symbol_id,
                         "contains",
                         "EXTRACTED",
@@ -240,6 +228,19 @@ impl CodeGraph {
                         Some(file.path.clone()),
                         Some(symbol.line_start),
                     );
+
+                    if let Some(namespace) = &file.namespace {
+                        edges.add(
+                            &namespace_node_id(namespace),
+                            &symbol_id,
+                            "contains",
+                            "EXTRACTED",
+                            1.0,
+                            1.0,
+                            Some(file.path.clone()),
+                            Some(symbol.line_start),
+                        );
+                    }
                 }
             }
         }
@@ -1862,6 +1863,9 @@ fn build_file_reference_edges(
         let Some(file) = files.get(source_path) else {
             continue;
         };
+        if file.content.is_empty() {
+            continue;
+        }
         let identifiers = raw_identifiers(&file.content)
             .into_iter()
             .filter(|ident| should_consider_reference(ident, ""))
@@ -2130,7 +2134,7 @@ fn file_node(file: &FileEntry) -> GraphNode {
         file_path: Some(file.path.clone()),
         line_start: Some(1),
         line_end: Some(file.line_count.max(1)),
-        language: Some(file.language.clone()),
+        language: Some(file.language.to_string()),
         community: None,
         confidence: "EXTRACTED".to_string(),
         metadata,
@@ -2160,12 +2164,12 @@ fn symbol_node(file: &FileEntry, symbol: &crate::types::Symbol, id: &str) -> Gra
     }
     GraphNode {
         id: id.to_string(),
-        label: symbol_label(&symbol.kind, &symbol.name),
-        node_type: symbol.kind.clone(),
+        label: symbol_label(symbol.kind.as_str(), &symbol.name),
+        node_type: symbol.kind.to_string(),
         file_path: Some(file.path.clone()),
         line_start: Some(symbol.line_start),
         line_end: Some(symbol.line_end),
-        language: Some(file.language.clone()),
+        language: Some(file.language.to_string()),
         community: None,
         confidence: "EXTRACTED".to_string(),
         metadata,
@@ -2662,7 +2666,7 @@ mod tests {
             "Services/UserService.cs".to_string(),
             FileEntry {
                 path: "Services/UserService.cs".to_string(),
-                language: "csharp".to_string(),
+                language: "csharp".into(),
                 line_count: 6,
                 byte_size: 120,
                 modified_unix_ms: 0,
@@ -2671,7 +2675,7 @@ mod tests {
                 imports: vec![],
                 symbols: vec![Symbol {
                     name: "UserService".to_string(),
-                    kind: "class".to_string(),
+                    kind: "class".into(),
                     line_start: 1,
                     line_end: 2,
                     detail: "class UserService".to_string(),
@@ -2683,7 +2687,7 @@ mod tests {
             "Data/UserRepository.cs".to_string(),
             FileEntry {
                 path: "Data/UserRepository.cs".to_string(),
-                language: "csharp".to_string(),
+                language: "csharp".into(),
                 line_count: 3,
                 byte_size: 80,
                 modified_unix_ms: 0,
@@ -2692,7 +2696,7 @@ mod tests {
                 imports: vec![],
                 symbols: vec![Symbol {
                     name: "UserRepository".to_string(),
-                    kind: "class".to_string(),
+                    kind: "class".into(),
                     line_start: 1,
                     line_end: 3,
                     detail: "class UserRepository".to_string(),

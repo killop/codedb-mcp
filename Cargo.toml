@@ -31,4 +31,3 @@ tree-sitter-lua = "0.5"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
-vicinity = { version = "0.8", features = ["hnsw"] }

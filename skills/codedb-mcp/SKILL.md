@@ -29,7 +29,7 @@ MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first
 
 Load `references/tools.md` when deciding which `codedb_*` tool to call. The common choices are:
 
-- `codedb_search`: semantic/BM25 search or regex line search; supports `queries` batch.
+- `codedb_search`: regex line search, BM25/symbol search, or natural-language vector search; supports `queries` batch.
 - `codedb_callers`: LSP-like references anchored to a definition; supports `targets` batch. Accuracy is strongest for C#/Java.
 - `codedb_deps`: direct or transitive file dependencies and reverse dependencies. C#/Java namespace/package imports are the most precise path.
 - `codedb_outline`: precomputed file symbols.

@@ -270,8 +270,9 @@ fn handle_symbol(index: &Codebase, args: &Value) -> Result<String> {
             file.path, symbol.line_start, symbol.kind, symbol.detail
         ));
         if include_body {
+            let content = index.file_content(file)?;
             out.push_str(&extract_lines(
-                &file.content,
+                &content,
                 symbol.line_start,
                 symbol.line_end,
                 false,
@@ -358,15 +359,17 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
         )?;
         return Ok(format_line_hits(&query, fallback));
     }
-    Ok(format_chunk_hits(&query, hits))
+    format_chunk_hits(index, &query, hits)
 }
 
 fn handle_word(index: &Codebase, args: &Value) -> Result<String> {
     let word = required_str(args, "word")?;
-    let hits = index.word_index.get(&word).cloned().unwrap_or_default();
+    let hits = index.word_index.get(&word);
     let mut out = format!("{} hits for '{}':\n", hits.len(), word);
     for hit in hits {
-        out.push_str(&format!("  {}:{}\n", hit.path, hit.line));
+        if let Some(file) = index.file_by_id(hit.file_id) {
+            out.push_str(&format!("  {}:{}\n", file.path, hit.line));
+        }
     }
     Ok(out)
 }
@@ -424,7 +427,7 @@ fn handle_callers_one(index: &Codebase, args: &Value) -> Result<String> {
         .into_iter()
         .map(|(file, symbol)| (file.path.clone(), symbol.line_start))
         .collect::<BTreeSet<_>>();
-    let mut hits = reference_candidates(index, &name);
+    let mut hits = reference_candidates(index, &name)?;
     hits.retain(|hit| is_lsp_like_reference(index, &target, hit, &all_definition_sites));
     hits.truncate(max_results);
     let mut out = format!(
@@ -472,24 +475,35 @@ fn batch_item_args(
     Ok(Value::Object(merged))
 }
 
-fn reference_candidates(index: &Codebase, name: &str) -> Vec<SearchHit> {
-    let Some(word_hits) = index.word_index.get(name) else {
-        return Vec::new();
+fn reference_candidates(index: &Codebase, name: &str) -> Result<Vec<SearchHit>> {
+    let word_hits = index.word_index.get(name);
+    if word_hits.is_empty() {
+        return Ok(Vec::new());
     };
-    word_hits
-        .iter()
-        .filter_map(|hit| {
-            let file = index.file(&hit.path)?;
-            let text = file.content.lines().nth(hit.line.saturating_sub(1))?;
-            let scope = scope_for_line(&file.symbols, hit.line);
-            Some(SearchHit {
-                path: hit.path.clone(),
-                line: hit.line,
+    let mut content_by_file = HashMap::<u32, String>::new();
+    let mut results = Vec::new();
+    for hit in word_hits {
+        let Some(file) = index.file_by_id(hit.file_id) else {
+            continue;
+        };
+        if !content_by_file.contains_key(&hit.file_id) {
+            content_by_file.insert(hit.file_id, index.file_content(file)?);
+        }
+        if let Some(content) = content_by_file.get(&hit.file_id) {
+            let line = hit.line as usize;
+            let Some(text) = content.lines().nth(line.saturating_sub(1)) else {
+                continue;
+            };
+            let scope = scope_for_line(&file.symbols, line);
+            results.push(SearchHit {
+                path: file.path.clone(),
+                line,
                 text: text.trim().to_string(),
                 scope,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(results)
 }
 
 #[derive(Debug, Clone)]
@@ -547,7 +561,7 @@ fn resolve_callers_target(index: &Codebase, args: &Value, name: &str) -> Result<
 fn target_from_symbol(file: &FileEntry, symbol: &Symbol) -> SymbolTarget {
     SymbolTarget {
         name: symbol.name.clone(),
-        kind: symbol.kind.clone(),
+        kind: symbol.kind.to_string(),
         path: file.path.clone(),
         line_start: symbol.line_start,
         namespace: file.namespace.clone(),
@@ -833,9 +847,9 @@ fn handle_deps(index: &Codebase, args: &Value) -> Result<String> {
     let results = if transitive {
         transitive_deps(index, &path, forward, max_depth)
     } else if forward {
-        index.deps_forward.get(&path).cloned().unwrap_or_default()
+        index.deps_for(&path)
     } else {
-        index.deps_reverse.get(&path).cloned().unwrap_or_default()
+        index.reverse_deps_for(&path)
     };
 
     let mut out = if forward {
@@ -874,7 +888,8 @@ fn handle_read(index: &Codebase, args: &Value) -> Result<String> {
             fuzzy_suggestions(index, &path)
         ));
     };
-    let hash = hash_content(&file.content);
+    let content = index.file_content(file)?;
+    let hash = hash_content(&content);
     if get_str(args, "if_hash").as_deref() == Some(hash.as_str()) {
         return Ok(format!("unchanged:{hash}"));
     }
@@ -889,9 +904,9 @@ fn handle_read(index: &Codebase, args: &Value) -> Result<String> {
     }
     let mut out = format!("hash:{hash}\n");
     if start != 1 || end != file.line_count || compact {
-        out.push_str(&extract_lines(&file.content, start, end, compact));
+        out.push_str(&extract_lines(&content, start, end, compact));
     } else {
-        out.push_str(&file.content);
+        out.push_str(&content);
     }
     Ok(out)
 }
@@ -922,7 +937,7 @@ fn handle_changes(index: &Codebase, args: &Value) -> String {
 fn handle_status(index: &Codebase) -> String {
     let stats = index.stats();
     format!(
-        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  vector_index: vicinity HNSW ({} {} vectors)\n  embedding_model: model2vec-rs {} ({} dims)\n  scan: {}\n  extensions: {}\n  cache: {}\n  storage: {}\n",
+        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  vector_index: lazy flat cosine ({} {} vectors)\n  embedding_model: model2vec-rs {} ({} dims)\n  scan: {}\n  extensions: {}\n  cache: {}\n  storage: {}\n",
         stats.seq,
         stats.files,
         stats.files,
@@ -942,19 +957,20 @@ fn handle_status(index: &Codebase) -> String {
 }
 
 fn handle_snapshot(index: &Codebase) -> String {
+    let graph = index.graph_summary();
     let snapshot = json!({
         "root": index.root.display().to_string(),
         "seq": index.seq,
         "stats": index.stats(),
         "files": index.files.values().collect::<Vec<_>>(),
         "deps": {
-            "forward": &index.deps_forward,
-            "reverse": &index.deps_reverse,
+            "forward": index.deps_forward_snapshot(),
+            "reverse": index.deps_reverse_snapshot(),
         },
         "graph": {
-            "nodes": index.graph.nodes.len(),
-            "edges": index.graph.edges.len(),
-            "communities": index.graph.communities.len(),
+            "nodes": graph.nodes,
+            "edges": graph.edges,
+            "communities": graph.communities,
         },
     });
     serde_json::to_string_pretty(&snapshot)
@@ -1067,8 +1083,12 @@ fn handle_query(index: &Codebase, args: &Value) -> Result<String> {
                     .as_ref()
                     .map(|paths| chunk_selector_for_paths(index, paths));
                 let hits = hybrid_search(index, &query, max, selector.as_deref())?;
-                paths = Some(hits.iter().map(|hit| hit.chunk.file_path.clone()).collect());
-                out = format_chunk_hits(&query, hits);
+                paths = Some(
+                    hits.iter()
+                        .map(|hit| index.chunk_file_path(&hit.chunk).to_string())
+                        .collect(),
+                );
+                out = format_chunk_hits(index, &query, hits)?;
             }
             "filter" => {
                 let pattern = required_str(step, "path_glob")?;
@@ -1117,10 +1137,11 @@ fn handle_graph(index: &Codebase, args: &Value) -> Result<String> {
     let format = get_str(args, "format").unwrap_or_else(|| "summary".to_string());
     let max_nodes = get_usize(args, "max_nodes").unwrap_or(1000);
     let max_edges = get_usize(args, "max_edges").unwrap_or(3000);
+    let graph = index.graph();
     match format.as_str() {
         "summary" => {
-            let stats = index.graph.stats();
-            let analysis = index.graph.analysis(10);
+            let stats = graph.stats();
+            let analysis = graph.analysis(10);
             let mut out = format!(
                 "code graph:\n  nodes: {}\n  edges: {}\n  communities: {}\n  isolated_nodes: {}\n  average_degree: {:.2}\n",
                 stats.nodes,
@@ -1146,10 +1167,10 @@ fn handle_graph(index: &Codebase, args: &Value) -> Result<String> {
             }
             Ok(out)
         }
-        "json" => serde_json::to_string_pretty(&index.graph.limited_json(max_nodes, max_edges))
+        "json" => serde_json::to_string_pretty(&graph.limited_json(max_nodes, max_edges))
             .map_err(Into::into),
-        "graphml" => Ok(index.graph.to_graphml(max_nodes, max_edges)),
-        "cypher" | "neo4j" => Ok(index.graph.to_cypher(max_nodes, max_edges)),
+        "graphml" => Ok(graph.to_graphml(max_nodes, max_edges)),
+        "cypher" | "neo4j" => Ok(graph.to_cypher(max_nodes, max_edges)),
         other => Ok(format!(
             "error: unsupported graph format: {other}; use summary, json, graphml, or cypher"
         )),
@@ -1161,7 +1182,8 @@ fn handle_explain(index: &Codebase, args: &Value) -> Result<String> {
         .or_else(|| get_str(args, "query"))
         .ok_or_else(|| anyhow!("missing 'node' argument"))?;
     let limit = get_usize(args, "limit").unwrap_or(20).clamp(1, 200);
-    match index.graph.explain(&term, limit) {
+    let graph = index.graph();
+    match graph.explain(&term, limit) {
         Some(result) => serde_json::to_string_pretty(&result).map_err(Into::into),
         None => Ok(format!("error: graph node not found: {term}")),
     }
@@ -1175,7 +1197,8 @@ fn handle_path(index: &Codebase, args: &Value) -> Result<String> {
         .or_else(|| get_str(args, "to"))
         .ok_or_else(|| anyhow!("missing 'target' argument"))?;
     let max_depth = get_usize(args, "max_depth").unwrap_or(8).clamp(1, 32);
-    let result = index.graph.shortest_path(&source, &target, max_depth);
+    let graph = index.graph();
+    let result = graph.shortest_path(&source, &target, max_depth);
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
 
@@ -1189,6 +1212,7 @@ fn handle_communities(index: &Codebase, args: &Value) -> Result<String> {
     let include_children = get_bool(args, "children") || get_bool(args, "subcommunities");
     let child_id = get_usize(args, "child_id").or_else(|| get_usize(args, "subcommunity_id"));
     ensure_louvain_communities(index);
+    let graph = index.graph();
     let communities = index.louvain_communities.read();
     let communities = communities
         .as_ref()
@@ -1202,7 +1226,7 @@ fn handle_communities(index: &Codebase, args: &Value) -> Result<String> {
             return Ok(format!("error: community not found: {id}"));
         };
         let subcommunities = ensure_louvain_subcommunities(index, parent);
-        return serde_json::to_string_pretty(&index.graph.subcommunities_summary_for(
+        return serde_json::to_string_pretty(&graph.subcommunities_summary_for(
             parent,
             &subcommunities,
             child_id,
@@ -1213,7 +1237,7 @@ fn handle_communities(index: &Codebase, args: &Value) -> Result<String> {
         .map_err(Into::into);
     }
 
-    serde_json::to_string_pretty(&index.graph.communities_summary_for(
+    serde_json::to_string_pretty(&graph.communities_summary_for(
         communities,
         "lazy-louvain",
         community_id,
@@ -1473,11 +1497,13 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
             };
             let point_id = path_to_point_id.get(path).copied().unwrap_or(points.len());
             let local = local_offsets.get(path).copied().unwrap_or((0.0, 0.0));
+            let dep_in = index.reverse_deps_for(path);
+            let dep_out = index.deps_for(path);
             points.push(json!({
                 "id": point_id,
                 "path": path,
                 "language": file.language,
-                "languageLabel": language_label(&file.language),
+                "languageLabel": language_label(file.language.as_str()),
                 "moduleId": module.community_id,
                 "moduleLabel": module.label,
                 "x": layout.x + local.0,
@@ -1485,10 +1511,10 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
                 "category": module.community_id % 12,
                 "symbols": file.symbols.iter().take(12).map(|symbol| symbol.name.clone()).collect::<Vec<_>>(),
                 "lineCount": file.line_count,
-                "depIn": index.deps_reverse.get(path).map(Vec::len).unwrap_or(0),
-                "depOut": index.deps_forward.get(path).map(Vec::len).unwrap_or(0),
-                "depInIds": atlas_dependency_ids(index.deps_reverse.get(path), &path_to_point_id, 80),
-                "depOutIds": atlas_dependency_ids(index.deps_forward.get(path), &path_to_point_id, 80),
+                "depIn": dep_in.len(),
+                "depOut": dep_out.len(),
+                "depInIds": atlas_dependency_ids(Some(&dep_in), &path_to_point_id, 80),
+                "depOutIds": atlas_dependency_ids(Some(&dep_out), &path_to_point_id, 80),
             }));
         }
     }
@@ -1533,6 +1559,7 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
             })
         })
         .collect::<Vec<_>>();
+    let graph = index.graph_summary();
     let mut metadata = json!({
         "project": index.root.file_name().and_then(|name| name.to_str()).unwrap_or("project"),
         "root": index.root.display().to_string().replace('\\', "/"),
@@ -1543,8 +1570,8 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
         "totalFiles": index.files.len(),
         "totalModules": modules_json.len(),
         "graph": {
-            "nodes": index.graph.nodes.len(),
-            "edges": index.graph.edges.len(),
+            "nodes": graph.nodes,
+            "edges": graph.edges,
         },
         "algorithm": "rust dependency-connected file graph + label propagation",
         "generationMs": started.elapsed().as_millis() as u64,
@@ -1683,8 +1710,8 @@ fn detect_file_dependency_modules(
         own_labels.insert(path.clone(), id);
     }
 
-    let hub_targets = index
-        .deps_reverse
+    let reverse_deps = index.deps_reverse_snapshot();
+    let hub_targets = reverse_deps
         .iter()
         .filter(|(path, sources)| {
             allowed.contains(*path) && sources.len() > MODULE_HUB_INCOMING_LIMIT
@@ -1694,11 +1721,11 @@ fn detect_file_dependency_modules(
     let mut adjacency = HashMap::<String, Vec<(String, f32)>>::new();
     for path in allowed {
         let mut emitted = 0usize;
-        for dep in index.deps_forward.get(path).into_iter().flatten() {
+        for dep in index.deps_for(path) {
             if emitted >= MODULE_MAX_DEPENDENCY_EDGES_PER_FILE {
                 break;
             }
-            if !allowed.contains(dep) || hub_targets.contains(dep) || dep == path {
+            if !allowed.contains(&dep) || hub_targets.contains(&dep) || dep == *path {
                 continue;
             }
             adjacency
@@ -1944,15 +1971,15 @@ fn module_dependency_counts(
     let mut outgoing = 0usize;
     let mut incoming = 0usize;
     for path in file_paths {
-        for dep in index.deps_forward.get(path).into_iter().flatten() {
-            if file_paths.contains(dep) {
+        for dep in index.deps_for(path) {
+            if file_paths.contains(&dep) {
                 internal += 1;
             } else {
                 outgoing += 1;
             }
         }
-        for source in index.deps_reverse.get(path).into_iter().flatten() {
-            if !file_paths.contains(source) {
+        for source in index.reverse_deps_for(path) {
+            if !file_paths.contains(&source) {
                 incoming += 1;
             }
         }
@@ -1978,32 +2005,22 @@ fn central_files_for_module(
         .iter()
         .filter_map(|path| {
             let file = index.files.get(path)?;
-            let internal_out = index
-                .deps_forward
-                .get(path)
-                .into_iter()
-                .flatten()
+            let outgoing = index.deps_for(path);
+            let internal_out = outgoing
+                .iter()
                 .filter(|dep| file_paths.contains(*dep))
                 .count();
-            let internal_in = index
-                .deps_reverse
-                .get(path)
-                .into_iter()
-                .flatten()
+            let incoming = index.reverse_deps_for(path);
+            let internal_in = incoming
+                .iter()
                 .filter(|source| file_paths.contains(*source))
                 .count();
-            let external_out = index
-                .deps_forward
-                .get(path)
-                .into_iter()
-                .flatten()
+            let external_out = outgoing
+                .iter()
                 .filter(|dep| !file_paths.contains(*dep))
                 .count();
-            let external_in = index
-                .deps_reverse
-                .get(path)
-                .into_iter()
-                .flatten()
+            let external_in = incoming
+                .iter()
                 .filter(|source| !file_paths.contains(*source))
                 .count();
             let score = internal_in * 3
@@ -2063,7 +2080,7 @@ fn key_symbols_for_module(
             continue;
         };
         for symbol in &file.symbols {
-            let score = symbol_importance(&symbol.kind, &symbol.name);
+            let score = symbol_importance(symbol.kind.as_str(), &symbol.name);
             if score == 0 {
                 continue;
             }
@@ -2104,7 +2121,7 @@ fn key_symbols_for_module_camel(
             let language = index
                 .files
                 .get(path)
-                .map(|file| language_label(&file.language))
+                .map(|file| language_label(file.language.as_str()))
                 .unwrap_or("");
             json!({
                 "path": item.get("path").cloned().unwrap_or(Value::Null),
@@ -2128,7 +2145,7 @@ fn entry_points_for_module(
             continue;
         };
         for symbol in &file.symbols {
-            let score = entry_point_score(&symbol.kind, &symbol.name, path);
+            let score = entry_point_score(symbol.kind.as_str(), &symbol.name, path);
             if score == 0 {
                 continue;
             }
@@ -2163,7 +2180,7 @@ fn entry_points_for_module_camel(
             let language = index
                 .files
                 .get(path)
-                .map(|file| language_label(&file.language))
+                .map(|file| language_label(file.language.as_str()))
                 .unwrap_or("");
             json!({
                 "path": item.get("path").cloned().unwrap_or(Value::Null),
@@ -2301,8 +2318,9 @@ fn semantic_neighbors_for_module(
     if limit == 0 || query.trim().is_empty() {
         return Ok((Vec::new(), 0.0));
     }
-    let query_vec = index.model.encode_one(query);
-    let hits = index.vectors.query(&query_vec, limit, None)?;
+    let model = index.embedding_model()?;
+    let query_vec = model.encode_one(query);
+    let hits = index.vector_store()?.query(&query_vec, limit, None)?;
     let mut in_module = 0usize;
     let mut values = Vec::new();
     for (unit_idx, score) in hits {
@@ -2345,7 +2363,7 @@ fn module_language_counts(index: &Codebase, files: &[String]) -> Vec<Value> {
     for path in files {
         if let Some(file) = index.files.get(path) {
             *counts
-                .entry(language_label(&file.language).to_string())
+                .entry(language_label(file.language.as_str()).to_string())
                 .or_default() += 1;
         }
     }
@@ -2361,7 +2379,7 @@ fn language_counts(index: &Codebase) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::<String, usize>::new();
     for file in index.files.values() {
         *counts
-            .entry(language_label(&file.language).to_string())
+            .entry(language_label(file.language.as_str()).to_string())
             .or_default() += 1;
     }
     counts
@@ -2573,7 +2591,7 @@ fn module_layout_edges(
             let Some(from) = path_to_module.get(path.as_str()).copied() else {
                 continue;
             };
-            for dep in index.deps_forward.get(path).into_iter().flatten() {
+            for dep in index.deps_for(path) {
                 let Some(to) = path_to_module.get(dep.as_str()).copied() else {
                     continue;
                 };
@@ -2750,21 +2768,21 @@ fn file_node_radius(file: &FileEntry) -> f32 {
 }
 
 fn module_internal_degrees(index: &Codebase, module: &ModuleAtlasModule) -> HashMap<String, usize> {
-    let file_set = module.files.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let file_set = module
+        .files
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let mut degrees = HashMap::<String, usize>::new();
     for path in &module.files {
         let outgoing = index
-            .deps_forward
-            .get(path)
+            .deps_for(path)
             .into_iter()
-            .flatten()
             .filter(|dep| file_set.contains(dep.as_str()))
             .count();
         let incoming = index
-            .deps_reverse
-            .get(path)
+            .reverse_deps_for(path)
             .into_iter()
-            .flatten()
             .filter(|source| file_set.contains(source.as_str()))
             .count();
         degrees.insert(path.clone(), incoming + outgoing);
@@ -2810,7 +2828,7 @@ fn file_layout_edges(index: &Codebase, module: &ModuleAtlasModule) -> Vec<(usize
         let Some(from) = path_to_index.get(path.as_str()).copied() else {
             continue;
         };
-        for dep in index.deps_forward.get(path).into_iter().flatten() {
+        for dep in index.deps_for(path) {
             let Some(to) = path_to_index.get(dep.as_str()).copied() else {
                 continue;
             };
@@ -3062,7 +3080,8 @@ fn ensure_louvain_communities(index: &Codebase) {
         return;
     }
 
-    let communities = index.graph.louvain_communities();
+    let graph = index.graph();
+    let communities = graph.louvain_communities();
     save_louvain_cache(index, &graph_hash, &communities);
     *index.louvain_communities.write() = Some(communities);
 }
@@ -3070,8 +3089,9 @@ fn ensure_louvain_communities(index: &Codebase) {
 fn louvain_graph_hash(index: &Codebase) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"codebase-mcp-louvain-v2");
-    hasher.update(index.graph.nodes.len().to_string().as_bytes());
-    hasher.update(index.graph.edges.len().to_string().as_bytes());
+    let graph = index.graph_summary();
+    hasher.update(graph.nodes.to_string().as_bytes());
+    hasher.update(graph.edges.to_string().as_bytes());
     for file in index.files.values() {
         hasher.update(file.path.as_bytes());
         hasher.update(file.content_hash.as_bytes());
@@ -3141,10 +3161,9 @@ fn ensure_louvain_subcommunities(index: &Codebase, parent: &GraphCommunity) -> V
         }
     }
 
+    let graph = index.graph();
     let communities =
-        index
-            .graph
-            .louvain_subcommunities(&parent.nodes, &index.files, Some(&parent.label));
+        graph.louvain_subcommunities(&parent.nodes, &index.files, Some(&parent.label));
     {
         let mut guard = index.louvain_subcommunities.write();
         guard.insert(parent.id, communities.clone());
@@ -3205,7 +3224,8 @@ fn save_louvain_subcommunities_cache(
 
 fn handle_analyze(index: &Codebase, args: &Value) -> Result<String> {
     let top_n = get_usize(args, "top_n").unwrap_or(10).clamp(1, 100);
-    serde_json::to_string_pretty(&index.graph.analysis(top_n)).map_err(Into::into)
+    let graph = index.graph();
+    serde_json::to_string_pretty(&graph.analysis(top_n)).map_err(Into::into)
 }
 
 fn handle_export(index: &Codebase, args: &Value) -> Result<String> {
@@ -3215,10 +3235,11 @@ fn handle_export(index: &Codebase, args: &Value) -> Result<String> {
         get_usize(args, "max_nodes").unwrap_or(if returning { 1000 } else { usize::MAX });
     let max_edges =
         get_usize(args, "max_edges").unwrap_or(if returning { 3000 } else { usize::MAX });
+    let graph = index.graph();
     let content = match format.as_str() {
-        "json" => serde_json::to_string_pretty(&index.graph.limited_json(max_nodes, max_edges))?,
-        "graphml" => index.graph.to_graphml(max_nodes, max_edges),
-        "cypher" | "neo4j" => index.graph.to_cypher(max_nodes, max_edges),
+        "json" => serde_json::to_string_pretty(&graph.limited_json(max_nodes, max_edges))?,
+        "graphml" => graph.to_graphml(max_nodes, max_edges),
+        "cypher" | "neo4j" => graph.to_cypher(max_nodes, max_edges),
         other => {
             return Ok(format!(
                 "error: unsupported export format: {other}; use json, graphml, or cypher"
@@ -3277,6 +3298,8 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
     let Some(ops) = args.get("ops").and_then(Value::as_array) else {
         return Ok("error: missing 'ops'".to_string());
     };
+    let timing = get_bool(args, "timing");
+    let discard_output = get_bool(args, "discard_output");
     let mut out = String::new();
     for (idx, op) in ops.iter().take(MAX_BATCH_ITEMS).enumerate() {
         let tool = get_str(op, "tool").unwrap_or_default();
@@ -3293,10 +3316,21 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
             continue;
         }
         let arguments = op.get("arguments").unwrap_or(op);
+        let start = Instant::now();
+        let result = dispatch_tool(manager, &tool, arguments);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         out.push_str(&format!("--- [{}] {} ---\n", idx, tool));
-        out.push_str(&dispatch_tool(manager, &tool, arguments));
-        if !out.ends_with('\n') {
-            out.push('\n');
+        if timing {
+            out.push_str(&format!("time_ms: {:.3}\n", elapsed_ms));
+        }
+        if discard_output {
+            let first_line = result.lines().next().unwrap_or_default();
+            out.push_str(&format!("summary: {first_line}\n"));
+        } else {
+            out.push_str(&result);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
         }
     }
     if ops.len() > MAX_BATCH_ITEMS {
@@ -3341,12 +3375,15 @@ fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
     out
 }
 
-fn format_chunk_hits(query: &str, hits: Vec<crate::types::ChunkSearchHit>) -> String {
+fn format_chunk_hits(
+    index: &Codebase,
+    query: &str,
+    hits: Vec<crate::types::ChunkSearchHit>,
+) -> Result<String> {
     let mut out = format!("{} results for '{}':\n", hits.len(), query);
     for hit in hits {
-        let preview = hit
-            .chunk
-            .content
+        let content = index.chunk_content(&hit.chunk)?;
+        let preview = content
             .lines()
             .filter(|line| !is_comment_or_blank(line))
             .take(5)
@@ -3355,7 +3392,7 @@ fn format_chunk_hits(query: &str, hits: Vec<crate::types::ChunkSearchHit>) -> St
             .join("\n    ");
         out.push_str(&format!(
             "  {}:{}-{}  [score={:.3}, {}]\n    {}\n",
-            hit.chunk.file_path,
+            index.chunk_file_path(&hit.chunk),
             hit.chunk.start_line,
             hit.chunk.end_line,
             hit.score,
@@ -3363,7 +3400,7 @@ fn format_chunk_hits(query: &str, hits: Vec<crate::types::ChunkSearchHit>) -> St
             preview
         ));
     }
-    out
+    Ok(out)
 }
 
 fn extract_lines(content: &str, start: usize, end: usize, compact: bool) -> String {
@@ -3387,20 +3424,20 @@ fn transitive_deps(
     forward: bool,
     max_depth: Option<usize>,
 ) -> Vec<String> {
-    let graph = if forward {
-        &index.deps_forward
-    } else {
-        &index.deps_reverse
-    };
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([(path.to_string(), 0usize)]);
     while let Some((current, depth)) = queue.pop_front() {
         if max_depth.is_some_and(|max| depth >= max) {
             continue;
         }
-        for dep in graph.get(&current).into_iter().flatten() {
+        let deps = if forward {
+            index.deps_for(&current)
+        } else {
+            index.reverse_deps_for(&current)
+        };
+        for dep in deps {
             if seen.insert(dep.clone()) {
-                queue.push_back((dep.clone(), depth + 1));
+                queue.push_back((dep, depth + 1));
             }
         }
     }

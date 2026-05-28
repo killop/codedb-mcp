@@ -4,6 +4,10 @@
 
 ## Unreleased - 2026-05-28
 
+### Added
+
+- Added Lua language support through `tree-sitter-lua`, including `.lua` scanning, `require()` import extraction, common Lua function outline extraction, and Lua comment handling for compact search output.
+
 ### Changed
 
 - Changed source scanning so nested Git worktrees/submodules under the target root are indexed as normal source directories. `respect_gitignore=true` still honors project `.gitignore` files, but `.git/info/exclude`, global gitignore, and nested Git repository boundaries no longer define the codebase boundary.
@@ -44,7 +48,7 @@
 
 - Recorded Unity C# benchmark data for `u3dclient`: 19,030 indexed files, 129,790 chunks, 277,008 symbols, 296,941 graph nodes, and 691,419 graph edges.
 - Recorded Java benchmark data for `gameserver`: 6,940 files, 55,057 chunks, and 245,238 symbols.
-- Recorded multi-language smoke coverage for C#, Java, Rust, Python, TypeScript, C, and C++ paths.
+- Recorded multi-language smoke coverage for C#, Java, Rust, Python, Lua, TypeScript, C, and C++ paths.
 - Recorded warm MCP tool timings for `codedb_search`, `codedb_callers`, `codedb_deps`, `codedb_outline`, `codedb_find`, `codedb_query`, `codedb_analyze`, and `codedb_bundle`.
 - Validated `code-module-atlas` on `u3dclient`, generating 16,361 file nodes, 62,771 dependency edges, and 1,374 modules for the viewer dataset.
 

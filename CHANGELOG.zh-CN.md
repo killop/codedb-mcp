@@ -4,6 +4,10 @@
 
 ## Unreleased - 2026-05-28
 
+### 新增
+
+- 新增 Lua 语言支持：接入 `tree-sitter-lua`，支持 `.lua` 扫描、`require()` import 抽取、常见 Lua 函数 outline 抽取，并补充 Lua 注释识别用于 compact search 输出。
+
 ### 变更
 
 - 调整源码扫描逻辑：目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录索引。`respect_gitignore=true` 仍然读取项目内 `.gitignore`，但 `.git/info/exclude`、全局 gitignore 和嵌套 Git 仓库边界不再决定 codebase 边界。
@@ -44,7 +48,7 @@
 
 - 记录 Unity C# benchmark 数据，目标为 `u3dclient`：19,030 个 indexed files、129,790 个 chunks、277,008 个 symbols、296,941 个 graph nodes、691,419 条 graph edges。
 - 记录 Java benchmark 数据，目标为 `gameserver`：6,940 个 files、55,057 个 chunks、245,238 个 symbols。
-- 记录 C#、Java、Rust、Python、TypeScript、C、C++ 路径的多语言 smoke 覆盖。
+- 记录 C#、Java、Rust、Python、Lua、TypeScript、C、C++ 路径的多语言 smoke 覆盖。
 - 记录 warm MCP 工具耗时：`codedb_search`、`codedb_callers`、`codedb_deps`、`codedb_outline`、`codedb_find`、`codedb_query`、`codedb_analyze`、`codedb_bundle`。
 - 在 `u3dclient` 上验证 `code-module-atlas`，生成 16,361 个文件节点、62,771 条依赖边和 1,374 个模块。
 

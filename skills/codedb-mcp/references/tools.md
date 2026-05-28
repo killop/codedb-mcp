@@ -25,7 +25,7 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_deps` | File dependencies or reverse dependencies | Supports `direction=depends_on/imported_by`, `transitive=true`, and `max_depth`. C#/Java namespace/package imports are currently the most precise typed path; Rust `use`, C/C++ includes, and JS/Python imports are also indexed. |
+| `codedb_deps` | File dependencies or reverse dependencies | Supports `direction=depends_on/imported_by`, `transitive=true`, and `max_depth`. C#/Java namespace/package imports are currently the most precise typed path; Rust `use`, Lua `require()`, C/C++ includes, and JS/Python imports are also indexed. |
 | `codedb_graph` | Graph summary or limited graph export | Formats: `summary`, `json`, `graphml`, `cypher`. |
 | `codedb_explain` | Explain a graph node and neighbors | Use with fuzzy node names or labels. |
 | `codedb_path` | Shortest graph path between two nodes | Useful for cross-module coupling questions. |

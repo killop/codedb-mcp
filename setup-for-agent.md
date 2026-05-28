@@ -131,10 +131,11 @@ When writing the actual file, set `[embedding].model` to `$modelForToml` from st
 # - Java: java
 # - Rust: rs
 # - Python: py, pyw
+# - Lua: lua
 # - JavaScript/TypeScript: js, jsx, mjs, cjs, ts, tsx
 # - C/C++: c, h, cc, cpp, cxx, hpp, hh, hxx
 # Humans can remove or add extensions here before indexing.
-extensions = ["cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
+extensions = ["cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 
 # Skip extremely large generated files before parsing or embedding.
 max_file_bytes = 50000000

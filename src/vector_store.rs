@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::collections::HashSet;
 use vicinity::hnsw::HNSWIndex;
 
@@ -9,8 +9,12 @@ pub struct MinishVectorStore {
 }
 
 impl MinishVectorStore {
-    pub fn build(vectors: &[Vec<f32>]) -> Result<Self> {
-        let dim = vectors.first().map_or(0, Vec::len);
+    pub fn build(vectors: &[Vec<f32>], fallback_dim: usize) -> Result<Self> {
+        let dim = vectors
+            .iter()
+            .find(|vector| !vector.is_empty())
+            .map_or(fallback_dim, Vec::len)
+            .max(1);
         let mut index = HNSWIndex::builder(dim)
             .m(8)
             .ef_construction(80)
@@ -19,6 +23,12 @@ impl MinishVectorStore {
             .build()?;
 
         for (id, vector) in vectors.iter().enumerate() {
+            if vector.len() != dim {
+                bail!(
+                    "embedding dimension mismatch at vector {id}: expected {dim}, got {}",
+                    vector.len()
+                );
+            }
             index.add_slice(id as u32, vector)?;
         }
         index.build()?;

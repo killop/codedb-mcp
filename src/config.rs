@@ -159,8 +159,8 @@ impl Default for StorageConfig {
 
 fn default_extensions() -> Vec<String> {
     [
-        "cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc",
-        "cpp", "cxx", "hpp", "hh", "hxx",
+        "cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h",
+        "cc", "cpp", "cxx", "hpp", "hh", "hxx",
     ]
     .into_iter()
     .map(str::to_string)

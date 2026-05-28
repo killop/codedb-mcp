@@ -49,8 +49,8 @@ pub struct StorageOptions {
 
 fn default_source_extensions() -> Vec<String> {
     [
-        "cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc",
-        "cpp", "cxx", "hpp", "hh", "hxx",
+        "cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h",
+        "cc", "cpp", "cxx", "hpp", "hh", "hxx",
     ]
     .into_iter()
     .map(str::to_string)
@@ -373,7 +373,7 @@ impl Codebase {
         log_timing(timing, "encode_embeddings", stage);
 
         let stage = Instant::now();
-        let vectors = MinishVectorStore::build(&embeddings)?;
+        let vectors = MinishVectorStore::build(&embeddings, model.dim())?;
         log_timing(timing, "hnsw", stage);
         if project_cache.enabled() {
             let stage = Instant::now();
@@ -430,7 +430,7 @@ impl Codebase {
         log_timing(timing, "load_embedding_model", stage);
 
         let stage = Instant::now();
-        let vectors = MinishVectorStore::build(&payload.embeddings)?;
+        let vectors = MinishVectorStore::build(&payload.embeddings, model.dim())?;
         log_timing(timing, "hnsw", stage);
 
         let stage = Instant::now();
@@ -1068,6 +1068,9 @@ fn build_dependencies(
         if file.language == "rust" {
             collect_rust_module_file_dependencies(file, &indexed_paths, deps);
         }
+        if file.language == "lua" {
+            collect_lua_require_file_dependencies(file, &indexed_paths, deps);
+        }
         let Some(references) = references_by_file.get(&file.path) else {
             continue;
         };
@@ -1195,6 +1198,46 @@ fn rust_module_dependency_candidates(path: &str, name: &str) -> Vec<String> {
         format!("{base}/{name}")
     };
     vec![format!("{prefix}.rs"), format!("{prefix}/mod.rs")]
+}
+
+fn collect_lua_require_file_dependencies(
+    file: &FileEntry,
+    indexed_paths: &HashSet<&str>,
+    deps: &mut BTreeSet<String>,
+) {
+    for module in &file.imports {
+        for candidate in lua_require_dependency_candidates(module) {
+            if candidate == file.path {
+                continue;
+            }
+            if indexed_paths.contains(candidate.as_str()) {
+                deps.insert(candidate);
+                break;
+            }
+            if let Some(indexed) = indexed_paths
+                .iter()
+                .find(|path| path.ends_with(&format!("/{candidate}")))
+            {
+                deps.insert((*indexed).to_string());
+                break;
+            }
+        }
+    }
+}
+
+fn lua_require_dependency_candidates(module: &str) -> Vec<String> {
+    let module_path = module
+        .replace('\\', "/")
+        .replace('.', "/")
+        .trim_matches('/')
+        .to_string();
+    if module_path.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("{module_path}.lua"),
+        format!("{module_path}/init.lua"),
+    ]
 }
 
 fn rust_module_path_from_file(path: &str) -> String {
@@ -1649,6 +1692,10 @@ mod tests {
         file_with_language(path, "rust", content)
     }
 
+    fn lua_file(path: &str, content: &str) -> FileEntry {
+        file_with_language(path, "lua", content)
+    }
+
     fn file_with_language(path: &str, language: &str, content: &str) -> FileEntry {
         FileEntry {
             path: path.to_string(),
@@ -2018,5 +2065,36 @@ pub struct GuideType;
 
         let deps = dependency_paths(files, "src/lib.rs");
         assert!(deps.contains(&"src/guide.rs".to_string()));
+    }
+
+    #[test]
+    fn lua_dependencies_include_required_modules() {
+        let files = vec![
+            lua_file(
+                "scripts/main.lua",
+                r#"
+local player = require("game.player")
+
+local function start()
+    return player.new()
+end
+"#,
+            ),
+            lua_file(
+                "scripts/game/player.lua",
+                r#"
+local M = {}
+
+function M.new()
+    return M
+end
+
+return M
+"#,
+            ),
+        ];
+
+        let deps = dependency_paths(files, "scripts/main.lua");
+        assert!(deps.contains(&"scripts/game/player.lua".to_string()));
     }
 }

@@ -46,6 +46,7 @@ fn grammar(language: &str) -> Option<Language> {
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "lua" => Some(tree_sitter_lua::LANGUAGE.into()),
         "javascript" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -134,6 +135,13 @@ fn collect_namespace_or_import(node: Node<'_>, context: &mut ParseContext<'_>) {
                 }
             }
         }
+        "lua" => {
+            if kind == "function_call"
+                && let Some(module) = extract_lua_require(node, context.content)
+            {
+                context.imports.insert(module);
+            }
+        }
         "javascript" | "jsx" | "typescript" | "tsx" => {
             if matches!(kind, "import_statement" | "export_statement")
                 && let Some(module) = extract_quoted_module(node_text(node, context.content))
@@ -163,6 +171,9 @@ fn set_namespace_from_name_field(node: Node<'_>, context: &mut ParseContext<'_>)
 }
 
 fn symbol_from_node(node: Node<'_>, context: &ParseContext<'_>) -> Option<Symbol> {
+    if context.language == "lua" {
+        return lua_symbol_from_node(node, context);
+    }
     let kind = symbol_kind(context.language, node.kind())?;
     let name_node = symbol_name_node(node)?;
     let name = node_text(name_node, context.content).and_then(clean_symbol_name)?;
@@ -256,6 +267,88 @@ fn symbol_kind(language: &str, node_kind: &str) -> Option<&'static str> {
         },
         _ => None,
     }
+}
+
+fn lua_symbol_from_node(node: Node<'_>, context: &ParseContext<'_>) -> Option<Symbol> {
+    let (name_node, kind) = match node.kind() {
+        "function_declaration" => {
+            let name_node = node.child_by_field_name("name")?;
+            let kind = if name_node.kind() == "method_index_expression" {
+                "method"
+            } else {
+                "function"
+            };
+            (name_node, kind)
+        }
+        "assignment_statement" => {
+            if !contains_lua_function_value(node) {
+                return None;
+            }
+            (lua_assignment_name_node(node)?, "function")
+        }
+        "field" => {
+            if !node
+                .child_by_field_name("value")
+                .is_some_and(|value| value.kind() == "function_definition")
+            {
+                return None;
+            }
+            (node.child_by_field_name("name")?, "function")
+        }
+        _ => return None,
+    };
+    let name = node_text(name_node, context.content).and_then(clean_lua_symbol_name)?;
+    Some(Symbol {
+        name,
+        kind: kind.to_string(),
+        line_start: node.start_position().row + 1,
+        line_end: node.end_position().row + 1,
+        detail: detail_for_node(node, context.lines),
+    })
+}
+
+fn contains_lua_function_value(node: Node<'_>) -> bool {
+    let Some(expression_list) = first_named_child_kind(node, "expression_list") else {
+        return false;
+    };
+    contains_node_kind(expression_list, "function_definition")
+}
+
+fn lua_assignment_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let variable_list = first_named_child_kind(node, "variable_list")?;
+    first_field_node(variable_list, "name")
+}
+
+fn first_named_child_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn first_field_node<'a>(node: Node<'a>, field_name: &str) -> Option<Node<'a>> {
+    if let Some(child) = node.child_by_field_name(field_name) {
+        return Some(child);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_field_node(child, field_name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn contains_node_kind(node: Node<'_>, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| contains_node_kind(child, kind))
 }
 
 fn symbol_name_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -427,6 +520,16 @@ fn extract_rust_uses(text: Option<String>) -> Vec<String> {
         .into_iter()
         .filter_map(clean_rust_use_path)
         .collect()
+}
+
+fn extract_lua_require(node: Node<'_>, content: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    let function_name = node_text(name, content)?;
+    if function_name.trim() != "require" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    extract_quoted_module(node_text(arguments, content))
 }
 
 fn strip_rust_use_prefix(value: &str) -> Option<&str> {
@@ -608,4 +711,14 @@ fn clean_symbol_name(value: impl AsRef<str>) -> Option<String> {
         .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '~'))
         .collect::<String>();
     (!name.is_empty()).then_some(name)
+}
+
+fn clean_lua_symbol_name(value: impl AsRef<str>) -> Option<String> {
+    let mut text = value.as_ref().trim();
+    if let Some((_, suffix)) = text.rsplit_once(':') {
+        text = suffix;
+    } else if let Some((_, suffix)) = text.rsplit_once('.') {
+        text = suffix;
+    }
+    clean_symbol_name(text)
 }

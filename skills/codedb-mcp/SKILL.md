@@ -11,7 +11,7 @@ description: Operate an already configured local codebase-mcp server for tree-si
 - Keep all project configuration and generated index data under the target repo's `.codedb-mcp` directory.
 - Do not rely on environment variables for behavior. Read and edit `.codedb-mcp/codedb-mcp.toml`.
 - Do not perform installation from this skill. For setup, use the repository-level `setup-for-agent.md` guide, then ask the human before configuring a specific agent's MCP settings.
-- Treat indexed languages as explicit config, not hidden defaults. The template includes C#, Java, Rust, Python, JavaScript/TypeScript, C, and C++; humans can edit `.codedb-mcp/codedb-mcp.toml` before indexing.
+- Treat indexed languages as explicit config, not hidden defaults. The template includes C#, Java, Rust, Python, Lua, JavaScript/TypeScript, C, and C++; humans can edit `.codedb-mcp/codedb-mcp.toml` before indexing.
 
 ## Setup Boundary
 

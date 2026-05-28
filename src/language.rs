@@ -7,6 +7,7 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
         "java" => Some("java"),
         "rs" => Some("rust"),
         "py" | "pyw" => Some("python"),
+        "lua" => Some("lua"),
         "js" | "mjs" | "cjs" => Some("javascript"),
         "jsx" => Some("jsx"),
         "ts" => Some("typescript"),
@@ -269,6 +270,59 @@ class UserController:
                 .symbols
                 .iter()
                 .any(|s| s.kind == "function" && s.name == "handle")
+        );
+    }
+
+    #[test]
+    fn lua_tree_sitter_extracts_outline_and_requires() {
+        let parsed = analyze_source(
+            "lua",
+            r#"
+local M = {}
+local player = require("game.player")
+local audio = require 'game.audio'
+
+function M:start()
+end
+
+local function build_player()
+end
+
+M.stop = function()
+end
+
+return {
+    run = function()
+    end
+}
+"#,
+        );
+
+        assert!(parsed.imports.contains(&"game.player".to_string()));
+        assert!(parsed.imports.contains(&"game.audio".to_string()));
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "method" && s.name == "start")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "function" && s.name == "build_player")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "function" && s.name == "stop")
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.kind == "function" && s.name == "run")
         );
     }
 

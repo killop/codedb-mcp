@@ -6,7 +6,7 @@ const DESIRED_CHUNK_CHARS: usize = 1500;
 
 fn line_comment_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*(//|/\*|\*|\*/)").expect("valid comment regex"))
+    RE.get_or_init(|| Regex::new(r"^\s*(//|--|/\*|\*|\*/)").expect("valid comment regex"))
 }
 
 pub fn chunk_source(

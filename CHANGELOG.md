@@ -2,6 +2,16 @@
 
 [中文版本](CHANGELOG.zh-CN.md)
 
+## Unreleased - 2026-05-28
+
+### Changed
+
+- Changed source scanning so nested Git worktrees/submodules under the target root are indexed as normal source directories. `respect_gitignore=true` still honors project `.gitignore` files, but `.git/info/exclude`, global gitignore, and nested Git repository boundaries no longer define the codebase boundary.
+
+### Fixed
+
+- Fixed missing indexes for source files that live inside submodule directories under the main project root.
+
 ## Unreleased - 2026-05-27
 
 ### Added

@@ -764,9 +764,10 @@ fn collect_paths_from(
     let mut builder = WalkBuilder::new(start);
     builder
         .hidden(false)
-        .parents(true)
+        .parents(false)
         .git_ignore(respect_gitignore)
-        .git_exclude(respect_gitignore)
+        .git_exclude(false)
+        .git_global(false)
         .filter_entry(move |entry| {
             !is_skipped_entry(
                 &filter_root,
@@ -1701,6 +1702,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rel_paths.contains(&"Library/PackageCache/Included.cs".to_string()));
         assert!(!rel_paths.contains(&"Library/Other/Skipped.cs".to_string()));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_git_worktree_is_scanned_as_source_tree() {
+        let root = std::env::temp_dir().join(format!("codebase_mcp_submodule_{}", now_ms()));
+        let nested = root.join("Packages").join("NestedRepo");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        std::fs::write(
+            nested.join(".git"),
+            "gitdir: ../../.git/modules/Packages/NestedRepo",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".git").join("info").join("exclude"),
+            "Packages/NestedRepo/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("src").join("Nested.cs"),
+            "public class Nested {}",
+        )
+        .unwrap();
+
+        let mut options = IndexOptions::default();
+        options.extensions = vec!["cs".to_string()];
+        options.include_paths = Vec::new();
+        options.skip_dirs = vec![".git".to_string()];
+        options.respect_gitignore = true;
+
+        let paths = collect_paths(&root, &options).unwrap();
+        let rel_paths = paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(rel_paths.contains(&"Packages/NestedRepo/src/Nested.cs".to_string()));
 
         std::fs::remove_dir_all(root).unwrap();
     }

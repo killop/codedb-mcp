@@ -139,7 +139,9 @@ extensions = ["cs", "java", "rs", "py", "pyw", "js", "jsx", "mjs", "cjs", "ts", 
 # Skip extremely large generated files before parsing or embedding.
 max_file_bytes = 50000000
 
-# Respect .gitignore for the normal tree walk.
+# Respect .gitignore files under this project for the normal tree walk. Nested
+# Git worktrees/submodules under the target root are still scanned as source
+# directories; .git/info/exclude and global gitignore are not project boundaries.
 respect_gitignore = true
 
 # Extra paths to include even when the normal scan would ignore them.

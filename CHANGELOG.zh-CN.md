@@ -2,6 +2,16 @@
 
 [English version](CHANGELOG.md)
 
+## Unreleased - 2026-05-28
+
+### 变更
+
+- 调整源码扫描逻辑：目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录索引。`respect_gitignore=true` 仍然读取项目内 `.gitignore`，但 `.git/info/exclude`、全局 gitignore 和嵌套 Git 仓库边界不再决定 codebase 边界。
+
+### 修复
+
+- 修复主工程目录下的子模块源码不会被索引的问题。
+
 ## Unreleased - 2026-05-27
 
 ### 新增

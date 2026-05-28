@@ -240,7 +240,7 @@ MCP 命令形态：
 
 1. **显式配置层**：读取 `.codedb-mcp/codedb-mcp.toml`，配置扫描扩展、文件大小上限、gitignore 行为、include paths、skip dirs、embedding 模型、watch 和 storage。
 2. **本地存储层**：索引 payload、manifest、Louvain cache、DeepWiki 证据和文档都写入 `.codedb-mcp`。数据跟随项目目录，不写全局数据库。
-3. **扫描层**：基于配置遍历代码库。Unity 项目中可以跳过大部分 `Library`，同时显式包含 `Library/PackageCache`。
+3. **扫描层**：基于配置遍历代码库，读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录继续索引。Unity 项目中可以跳过大部分 `Library`，同时显式包含 `Library/PackageCache`。
 4. **语言解析层**：所有语言统一走 tree-sitter grammar，输出同一套 `FileEntry` 和 `Symbol` 结构。当前支持 C#、Java、Rust、Python、JavaScript、TypeScript/TSX、C、C++，解析时只遍历声明层，避免大型方法体拖慢索引。
 5. **代码语义增强层**：C#/Java 上继续做 namespace/package import、别名、静态 using、注解、属性后缀、限定名引用等轻量语义推断。
 6. **搜索索引层**：构建 chunks、identifier word hits、symbol definition chunks、BM25、Model2Vec embeddings、Vicinity HNSW。
@@ -274,7 +274,7 @@ enabled = true
 dir = ".codedb-mcp"
 ```
 
-`include_paths` 会覆盖被跳过的父目录，例如 Unity 项目中可以跳过 `Library`，但保留 `Library/PackageCache`。模型路径是显式绝对路径；Windows setup 会优先复用默认 HuggingFace cache，不存在时才走第二盘符。
+`include_paths` 会覆盖被跳过的父目录，例如 Unity 项目中可以跳过 `Library`，但保留 `Library/PackageCache`。`respect_gitignore=true` 会读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 仍会被当作源码目录索引，除非被 `skip_dirs` 或扩展名规则排除。模型路径是显式绝对路径；Windows setup 会优先复用默认 HuggingFace cache，不存在时才走第二盘符。
 
 ## 构建与 CLI
 

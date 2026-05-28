@@ -236,7 +236,7 @@ This project intentionally keeps installation explicit: setup prepares local pro
 
 1. **Explicit project-local config**: all behavior comes from `.codedb-mcp/codedb-mcp.toml`. There are no environment-variable switches for indexing behavior.
 2. **Project-local storage**: cache payloads, manifests, Louvain caches, and DeepWiki output live under `.codedb-mcp`. Deleting that directory removes all generated data for the repo.
-3. **Scanner**: walks the repo with explicit extensions, max file size, gitignore behavior, skip dirs, and include paths. Unity `Library/PackageCache` can be included while the rest of `Library` is skipped.
+3. **Scanner**: walks the repo with explicit extensions, max file size, project `.gitignore` behavior, skip dirs, and include paths. Nested Git worktrees/submodules under the target root are scanned as normal source directories. Unity `Library/PackageCache` can be included while the rest of `Library` is skipped.
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: builds chunks, exact identifier hits, symbol-definition chunk hits, dependency references, BM25 lexical search, Model2Vec file embeddings, and a Vicinity HNSW vector index.
@@ -272,7 +272,7 @@ enabled = true
 dir = ".codedb-mcp"
 ```
 
-There are no environment-variable toggles. Edit the config file explicitly. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive.
+There are no environment-variable toggles. Edit the config file explicitly. `respect_gitignore=true` reads project `.gitignore` files, but nested Git worktrees/submodules inside the target root are still indexed unless excluded by `skip_dirs` or file extension rules. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive.
 
 ## Build And CLI
 

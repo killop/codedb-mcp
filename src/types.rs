@@ -1,6 +1,12 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+const WORD_HIT_BYTES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SymbolKind {
@@ -224,7 +230,7 @@ pub struct SemanticUnit {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WordHit {
     pub file_id: u32,
     pub line: u32,
@@ -239,7 +245,10 @@ pub struct WordHitRange {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WordIndex {
     ranges: HashMap<String, WordHitRange>,
+    #[serde(skip)]
     hits: Vec<WordHit>,
+    #[serde(skip)]
+    hits_path: Option<PathBuf>,
 }
 
 impl WordIndex {
@@ -258,16 +267,64 @@ impl WordIndex {
                 ranges.insert(key, WordHitRange { start, len });
             }
         }
-        Self { ranges, hits }
+        Self {
+            ranges,
+            hits,
+            hits_path: None,
+        }
     }
 
-    pub fn get(&self, word: &str) -> &[WordHit] {
+    pub fn hits(&self, word: &str) -> Result<Vec<WordHit>> {
         let Some(range) = self.ranges.get(word) else {
-            return &[];
+            return Ok(Vec::new());
         };
         let start = range.start as usize;
         let end = start + range.len as usize;
-        self.hits.get(start..end).unwrap_or(&[])
+        if let Some(hits) = self.hits.get(start..end) {
+            return Ok(hits.to_vec());
+        }
+        self.read_hits(start, end)
+    }
+
+    pub fn write_hits(&self, path: &Path) -> Result<()> {
+        let file = File::create(path)
+            .with_context(|| format!("failed to create word hits {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        for hit in &self.hits {
+            writer.write_all(&hit.file_id.to_le_bytes())?;
+            writer.write_all(&hit.line.to_le_bytes())?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn use_hits_file(&mut self, path: PathBuf) {
+        self.hits.clear();
+        self.hits.shrink_to_fit();
+        self.hits_path = Some(path);
+    }
+
+    fn read_hits(&self, start: usize, end: usize) -> Result<Vec<WordHit>> {
+        let Some(path) = &self.hits_path else {
+            return Ok(Vec::new());
+        };
+        let count = end.saturating_sub(start);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut file = File::open(path)
+            .with_context(|| format!("failed to open word hits {}", path.display()))?;
+        file.seek(SeekFrom::Start((start * WORD_HIT_BYTES) as u64))?;
+        let mut bytes = vec![0u8; count * WORD_HIT_BYTES];
+        file.read_exact(&mut bytes)?;
+        let mut hits = Vec::with_capacity(count);
+        for item in bytes.chunks_exact(WORD_HIT_BYTES) {
+            hits.push(WordHit {
+                file_id: u32::from_le_bytes(item[0..4].try_into().expect("word hit file id bytes")),
+                line: u32::from_le_bytes(item[4..8].try_into().expect("word hit line bytes")),
+            });
+        }
+        Ok(hits)
     }
 }
 

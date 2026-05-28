@@ -16,6 +16,8 @@
 - Replaced the resident Vicinity HNSW vector index with a lazy flat-cosine file-vector scan for natural-language search, removing the HNSW dependency and its graph memory.
 - Compacted repeated in-memory metadata by storing symbol kinds and source languages as small enums and storing chunk file paths as file ids instead of duplicating path strings per chunk.
 - Moved forward dependencies into a lazy `deps.bin` sidecar so search/status/callers do not keep the dependency graph resident; dependency and graph/module tools load it on demand.
+- Split cache v18 into a small JSON manifest plus binary source fingerprints, a compact hot `index.bin`, lazy BM25 postings, lazy word-index sidecars, lazy dependencies, and lazy embeddings. One-shot `codedb_status`, `codedb_find`, and `codedb_deps` can now answer from sidecars without deserializing the full index.
+- Added a BM25-enough fast path for business phrase searches so common multi-token queries can return lexical results without loading Model2Vec, and reused file-content reads while formatting search previews.
 
 ### Fixed
 
@@ -24,10 +26,10 @@
 
 ### Benchmark And Validation
 
-- Re-measured `u3dclient` after cache v14: 19,035 indexed files, 129,858 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
-- Re-ran README benchmarks on `u3dclient`: cache-hit non-semantic one-shot tools now sit around 258-269 MB working set and 318-351 MB private memory; dependency lookup peaks at 325.4 MB working set after loading `deps.bin`; one-shot natural-language search peaks at 403.8 MB working set and 453.6 MB private memory.
+- Re-measured `u3dclient` after cache v18: 19,035 indexed files, 129,858 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
+- Re-ran fast one-shot wall-time checks on `u3dclient`: `codedb_status` 0.281s, `codedb_find PoolManager` 0.407s, `codedb_deps PoolManager.cs` 0.322s, `codedb_search PoolManager` usually about 0.966s with a 1.297s outlier, and `codedb_callers PoolManager` about 1.116-1.346s due the first lazy `word_index.bin` load.
 - Re-ran the `gameserver` Java benchmark after fixing its explicit model path: 6,940 files, 55,057 chunks, and 245,238 symbols rebuild in 10.477s, then reopen from cache in 1.027s.
-- Updated the README `rg` comparison to reflect the cache v14 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
+- Updated the README `rg` comparison to reflect the cache v18 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
 - Verified source-on-demand tools after removing resident full-file bodies: `codedb_search PoolManager`, definition-anchored `codedb_callers PoolManager`, and `codedb_read PoolManager.cs`.
 
 ## Unreleased - 2026-05-27

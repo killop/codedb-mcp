@@ -16,6 +16,8 @@
 - 将常驻 Vicinity HNSW 向量索引替换为自然语言搜索时懒加载的 flat cosine 文件向量扫描，移除 HNSW 依赖和对应图内存。
 - 压缩重复内存元数据：symbol kind 和源码 language 改为小枚举；chunk 文件路径改为 file id，避免每个 chunk 重复保存路径字符串。
 - 将正向依赖图移动到懒加载的 `deps.bin` sidecar，search/status/callers 不再常驻依赖图；dependency 和 graph/module 工具按需加载。
+- 将 cache v18 拆成小 JSON manifest、二进制源码 fingerprint、紧凑 hot `index.bin`、懒加载 BM25 postings、懒加载 word-index sidecar、懒加载依赖和懒加载 embedding。单次 `codedb_status`、`codedb_find`、`codedb_deps` 现在可以直接从 sidecar 返回，不反序列化完整 index。
+- 为业务短语搜索增加 BM25 候选足够时的 fast path，常见多词 query 可直接返回 lexical 结果而不加载 Model2Vec；同时在格式化 search preview 时复用同一文件内容读取。
 
 ### 修复
 
@@ -24,10 +26,10 @@
 
 ### Benchmark 与验证
 
-- cache v14 后重新测量 `u3dclient`：19,035 个 indexed files、129,858 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
-- 重新测量 README benchmark：`u3dclient` cache-hit 非语义单次工具约 258-269 MB working set、318-351 MB private memory；依赖查询加载 `deps.bin` 后峰值为 325.4 MB working set；单次自然语言语义搜索峰值为 403.8 MB working set 和 453.6 MB private memory。
+- cache v18 后重新测量 `u3dclient`：19,035 个 indexed files、129,858 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
+- 重新测量 `u3dclient` fast one-shot wall time：`codedb_status` 0.281s，`codedb_find PoolManager` 0.407s，`codedb_deps PoolManager.cs` 0.322s，`codedb_search PoolManager` 通常约 0.966s、一次 outlier 为 1.297s，`codedb_callers PoolManager` 约 1.116-1.346s，主要成本是首次懒加载 `word_index.bin`。
 - 修正 `gameserver` 显式模型路径后重新测量 Java benchmark：6,940 个 files、55,057 个 chunks、245,238 个 symbols，重建 10.477s，cache hit 重新打开 1.027s。
-- 更新 README 里的 `rg` 对比：cache v14 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
+- 更新 README 里的 `rg` 对比：cache v18 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
 - 验证移除常驻完整文件源码正文后的按需读文件工具：`codedb_search PoolManager`、基于定义锚点的 `codedb_callers PoolManager`、`codedb_read PoolManager.cs`。
 
 ## Unreleased - 2026-05-27

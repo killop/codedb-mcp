@@ -2,16 +2,20 @@ use crate::bm25::Bm25Index;
 use crate::indexer::{IndexOptions, LightweightGraphStats, StorageOptions};
 use crate::types::{Chunk, FileEntry, LanguageId, SemanticUnit, Symbol, WordIndex};
 use anyhow::{Context, Result, anyhow};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 14;
+const CACHE_VERSION: u32 = 18;
 const MANIFEST_FILE: &str = "manifest.json";
+const FINGERPRINTS_FILE: &str = "fingerprints.bin";
 const PAYLOAD_FILE: &str = "index.bin";
 const BM25_POSTINGS_FILE: &str = "bm25.postings";
+const WORD_INDEX_FILE: &str = "word_index.bin";
+const WORD_HITS_FILE: &str = "word_hits.bin";
 const EMBEDDINGS_FILE: &str = "embeddings.bin";
 const DEPS_FILE: &str = "deps.bin";
 
@@ -23,8 +27,15 @@ pub struct SourceFingerprint {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceDirectoryFingerprint {
+    pub path: String,
+    pub modified_unix_ms: i128,
+}
+
 pub struct ProjectCache {
     enabled: bool,
+    root: PathBuf,
     dir: PathBuf,
 }
 
@@ -39,7 +50,32 @@ struct CacheManifest {
     chunk_count: usize,
     semantic_unit_count: usize,
     vector_count: usize,
+    #[serde(default)]
+    graph_stats: LightweightGraphStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheFingerprints {
     files: Vec<SourceFingerprint>,
+    dirs: Vec<SourceDirectoryFingerprint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedStatusSnapshot {
+    pub seq: i128,
+    pub files: usize,
+    pub chunks: usize,
+    pub embedding_model: String,
+    pub embedding_dims: usize,
+    pub vector_count: usize,
+    pub graph_stats: LightweightGraphStats,
+    pub storage_dir: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedDepsSnapshot {
+    pub files: Vec<String>,
+    pub deps_forward: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +87,6 @@ pub struct CachedIndexPayload {
     pub vector_count: usize,
     pub graph_stats: LightweightGraphStats,
     pub bm25: Bm25Index,
-    pub word_index: WordIndex,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,7 +111,6 @@ struct CachedIndexPayloadRef<'a> {
     vector_count: usize,
     graph_stats: LightweightGraphStats,
     bm25: &'a Bm25Index,
-    word_index: &'a WordIndex,
 }
 
 #[derive(Serialize)]
@@ -107,11 +141,16 @@ impl ProjectCache {
         if !storage.enabled {
             return Ok(Self {
                 enabled: false,
+                root: root.to_path_buf(),
                 dir: root.join(&storage.dir),
             });
         }
         let dir = local_storage_dir(root, &storage.dir)?;
-        Ok(Self { enabled: true, dir })
+        Ok(Self {
+            enabled: true,
+            root: root.to_path_buf(),
+            dir,
+        })
     }
 
     pub fn enabled(&self) -> bool {
@@ -126,6 +165,14 @@ impl ProjectCache {
         self.dir.join(BM25_POSTINGS_FILE)
     }
 
+    pub fn word_hits_path(&self) -> PathBuf {
+        self.dir.join(WORD_HITS_FILE)
+    }
+
+    pub fn word_index_path(&self) -> PathBuf {
+        self.dir.join(WORD_INDEX_FILE)
+    }
+
     pub fn embeddings_path(&self) -> PathBuf {
         self.dir.join(EMBEDDINGS_FILE)
     }
@@ -134,31 +181,36 @@ impl ProjectCache {
         self.dir.join(DEPS_FILE)
     }
 
-    pub fn load(
-        &self,
-        options: &IndexOptions,
-        fingerprints: &[SourceFingerprint],
-    ) -> Result<Option<CachedIndexPayload>> {
+    pub fn load(&self, options: &IndexOptions) -> Result<Option<CachedIndexPayload>> {
         if !self.enabled {
             return Ok(None);
         }
         let manifest_path = self.dir.join(MANIFEST_FILE);
+        let fingerprints_path = self.dir.join(FINGERPRINTS_FILE);
         let payload_path = self.dir.join(PAYLOAD_FILE);
         let embeddings_path = self.dir.join(EMBEDDINGS_FILE);
         let deps_path = self.dir.join(DEPS_FILE);
+        let word_hits_path = self.dir.join(WORD_HITS_FILE);
+        let word_index_path = self.dir.join(WORD_INDEX_FILE);
         if !manifest_path.is_file()
+            || !fingerprints_path.is_file()
             || !payload_path.is_file()
             || !embeddings_path.is_file()
             || !deps_path.is_file()
+            || !word_hits_path.is_file()
+            || !word_index_path.is_file()
         {
             return Ok(None);
         }
 
         let manifest: CacheManifest = read_json(&manifest_path)?;
+        let fingerprints: CacheFingerprints = read_bin(&fingerprints_path)?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
             || manifest.embedding_model != options.embedding_model
-            || manifest.files != fingerprints
+            || fingerprints.files.len() != manifest.file_count
+            || !source_files_match_current(&self.root, &fingerprints.files, options.max_file_bytes)
+            || !source_dirs_match_current(&self.root, &fingerprints.dirs)
         {
             return Ok(None);
         }
@@ -179,6 +231,88 @@ impl ProjectCache {
         }
         payload.bm25.use_postings_file(postings_path);
         Ok(Some(payload))
+    }
+
+    pub fn load_status(&self, options: &IndexOptions) -> Result<Option<CachedStatusSnapshot>> {
+        let Some((manifest, _fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(None);
+        };
+        Ok(Some(CachedStatusSnapshot {
+            seq: manifest.created_unix_ms,
+            files: manifest.file_count,
+            chunks: manifest.chunk_count,
+            embedding_model: manifest.embedding_model,
+            embedding_dims: manifest.embedding_dims,
+            vector_count: manifest.vector_count,
+            graph_stats: manifest.graph_stats,
+            storage_dir: self.dir.display().to_string(),
+        }))
+    }
+
+    pub fn load_file_list(&self, options: &IndexOptions) -> Result<Option<Vec<String>>> {
+        let Some((_manifest, fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            fingerprints
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect(),
+        ))
+    }
+
+    pub fn load_deps_snapshot(&self, options: &IndexOptions) -> Result<Option<CachedDepsSnapshot>> {
+        let Some((_manifest, fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(None);
+        };
+        let mut files = fingerprints
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        files.sort();
+        let deps_forward = read_deps_forward(&self.dir.join(DEPS_FILE))?;
+        Ok(Some(CachedDepsSnapshot {
+            files,
+            deps_forward,
+        }))
+    }
+
+    fn valid_manifest(
+        &self,
+        options: &IndexOptions,
+    ) -> Result<Option<(CacheManifest, CacheFingerprints)>> {
+        if !self.enabled || !self.required_files_exist() {
+            return Ok(None);
+        }
+        let manifest: CacheManifest = read_json(&self.dir.join(MANIFEST_FILE))?;
+        let fingerprints: CacheFingerprints = read_bin(&self.dir.join(FINGERPRINTS_FILE))?;
+        if manifest.version != CACHE_VERSION
+            || manifest.config_hash != config_hash(options)?
+            || manifest.embedding_model != options.embedding_model
+            || fingerprints.files.len() != manifest.file_count
+            || !source_files_match_current(&self.root, &fingerprints.files, options.max_file_bytes)
+            || !source_dirs_match_current(&self.root, &fingerprints.dirs)
+        {
+            return Ok(None);
+        }
+        Ok(Some((manifest, fingerprints)))
+    }
+
+    fn required_files_exist(&self) -> bool {
+        [
+            MANIFEST_FILE,
+            FINGERPRINTS_FILE,
+            PAYLOAD_FILE,
+            BM25_POSTINGS_FILE,
+            WORD_INDEX_FILE,
+            WORD_HITS_FILE,
+            EMBEDDINGS_FILE,
+            DEPS_FILE,
+        ]
+        .into_iter()
+        .all(|name| self.dir.join(name).is_file())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -203,6 +337,11 @@ impl ProjectCache {
             .iter()
             .map(SourceFingerprint::from_file_entry)
             .collect::<Vec<_>>();
+        let dirs = directory_fingerprints_from_files(&self.root, files)?;
+        let cache_fingerprints = CacheFingerprints {
+            files: fingerprints,
+            dirs,
+        };
         let manifest = CacheManifest {
             version: CACHE_VERSION,
             created_unix_ms: now_ms(),
@@ -213,9 +352,12 @@ impl ProjectCache {
             chunk_count: chunks.len(),
             semantic_unit_count: semantic_units.len(),
             vector_count: embeddings.len(),
-            files: fingerprints,
+            graph_stats,
         };
+        write_bin_atomic(&self.dir.join(FINGERPRINTS_FILE), &cache_fingerprints)?;
         bm25.write_postings(&self.dir.join(BM25_POSTINGS_FILE))?;
+        write_bin_atomic(&self.dir.join(WORD_INDEX_FILE), word_index)?;
+        word_index.write_hits(&self.dir.join(WORD_HITS_FILE))?;
         write_bin_atomic(&self.dir.join(EMBEDDINGS_FILE), embeddings)?;
         write_bin_atomic(&self.dir.join(DEPS_FILE), deps_forward)?;
         let payload = CachedIndexPayloadRef {
@@ -229,7 +371,6 @@ impl ProjectCache {
             vector_count: embeddings.len(),
             graph_stats,
             bm25,
-            word_index,
         };
         write_bin_atomic(&self.dir.join(PAYLOAD_FILE), &payload)?;
         write_json_atomic(&self.dir.join(MANIFEST_FILE), &manifest)?;
@@ -243,6 +384,12 @@ pub fn read_embeddings(path: &Path) -> Result<Vec<Vec<f32>>> {
 
 pub fn read_deps_forward(path: &Path) -> Result<std::collections::HashMap<String, Vec<String>>> {
     read_bin(path)
+}
+
+pub fn read_word_index(path: &Path, hits_path: &Path) -> Result<WordIndex> {
+    let mut index: WordIndex = read_bin(path)?;
+    index.use_hits_file(hits_path.to_path_buf());
+    Ok(index)
 }
 
 fn embedding_dims(embeddings: &[Vec<f32>]) -> usize {
@@ -278,6 +425,81 @@ impl CachedFileEntry {
             content: String::new(),
         }
     }
+}
+
+fn directory_fingerprints_from_files(
+    root: &Path,
+    files: &[FileEntry],
+) -> Result<Vec<SourceDirectoryFingerprint>> {
+    let mut dirs = std::collections::BTreeSet::new();
+    dirs.insert(String::new());
+    for file in files {
+        let mut current = Path::new(&file.path).parent();
+        while let Some(dir) = current {
+            let value = dir.to_string_lossy().replace('\\', "/");
+            dirs.insert(value);
+            current = dir.parent();
+        }
+    }
+    dirs.into_iter()
+        .map(|path| {
+            let absolute = if path.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(&path)
+            };
+            let metadata = fs::metadata(&absolute)
+                .with_context(|| format!("failed to stat directory {}", absolute.display()))?;
+            Ok(SourceDirectoryFingerprint {
+                path,
+                modified_unix_ms: modified_unix_ms(&metadata),
+            })
+        })
+        .collect()
+}
+
+fn source_files_match_current(
+    root: &Path,
+    cached: &[SourceFingerprint],
+    max_file_bytes: u64,
+) -> bool {
+    cached
+        .par_iter()
+        .all(|fingerprint| source_file_matches_current(root, fingerprint, max_file_bytes))
+}
+
+fn source_file_matches_current(
+    root: &Path,
+    fingerprint: &SourceFingerprint,
+    max_file_bytes: u64,
+) -> bool {
+    let path = root.join(&fingerprint.path);
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file()
+        && metadata.len() <= max_file_bytes
+        && metadata.len() as usize == fingerprint.byte_size
+        && modified_unix_ms(&metadata) == fingerprint.modified_unix_ms
+}
+
+fn source_dirs_match_current(root: &Path, cached: &[SourceDirectoryFingerprint]) -> bool {
+    !cached.is_empty()
+        && cached
+            .par_iter()
+            .all(|fingerprint| source_dir_matches_current(root, fingerprint))
+}
+
+fn source_dir_matches_current(root: &Path, fingerprint: &SourceDirectoryFingerprint) -> bool {
+    let path = if fingerprint.path.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&fingerprint.path)
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_dir() && modified_unix_ms(&metadata) == fingerprint.modified_unix_ms
 }
 
 impl<'a> CachedFileEntryRef<'a> {
@@ -367,6 +589,15 @@ fn replace_file(tmp: &Path, final_path: &Path) -> Result<()> {
             final_path.display()
         )
     })
+}
+
+fn modified_unix_ms(metadata: &fs::Metadata) -> i128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i128)
+        .unwrap_or(0)
 }
 
 fn now_ms() -> i128 {

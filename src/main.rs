@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use config::AppConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tools::{ProjectManager, dispatch_tool};
+use tools::{ProjectManager, dispatch_cached_cli_tool, dispatch_tool};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,8 +105,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Tool { name, arguments }) => {
-            let manager = ProjectManager::new(cli.root, options)?;
             let args: serde_json::Value = serde_json::from_str(&arguments)?;
+            if let Some(text) = dispatch_cached_cli_tool(&cli.root, &options, &name, &args)? {
+                print!("{text}");
+                return Ok(());
+            }
+            let manager = ProjectManager::new_lazy(cli.root, options);
             let text = dispatch_tool(&manager, &name, &args);
             print!("{text}");
             Ok(())

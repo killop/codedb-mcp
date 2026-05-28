@@ -35,6 +35,14 @@ pub fn hybrid_search(
         return ranked_hits(index, scores, top_k, "symbol");
     }
 
+    if lexical_candidates_are_enough(query, top_k, bm25.len()) {
+        let mut scores = rrf_scores(&bm25);
+        boost_multi_chunk_files(index, &mut scores);
+        let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+        apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
+        return ranked_hits(index, scores, top_k, "lexical");
+    }
+
     let model = index.embedding_model()?;
     let query_vec = model.encode_one(query);
     let semantic_files = index
@@ -117,6 +125,17 @@ fn rrf_scores(scores: &HashMap<usize, f32>) -> HashMap<usize, f32> {
         .enumerate()
         .map(|(rank, (&idx, _))| (idx, 1.0 / (RRF_K + rank as f32 + 1.0)))
         .collect()
+}
+
+fn lexical_candidates_are_enough(query: &str, top_k: usize, candidate_len: usize) -> bool {
+    if candidate_len < top_k.clamp(5, 40) {
+        return false;
+    }
+    let meaningful_tokens = tokenize(query)
+        .into_iter()
+        .filter(|token| token.len() > 2 && !STOPWORDS.contains(&token.as_str()))
+        .count();
+    meaningful_tokens >= 2
 }
 
 fn semantic_chunk_scores(

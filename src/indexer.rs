@@ -1,6 +1,7 @@
 use crate::bm25::Bm25Index;
 use crate::cache::{
     CachedIndexPayload, ProjectCache, SourceFingerprint, read_deps_forward, read_embeddings,
+    read_word_index,
 };
 use crate::embedding::MinishEmbeddingModel;
 use crate::graph::CodeGraph;
@@ -10,14 +11,14 @@ use crate::types::{Chunk, FileEntry, SearchHit, SemanticUnit, Symbol, WordHit, W
 use crate::vector_store::MinishVectorStore;
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -205,7 +206,7 @@ pub struct IndexStats {
     pub cache: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize)]
 pub struct LightweightGraphStats {
     pub nodes: usize,
     pub edges: usize,
@@ -222,7 +223,9 @@ pub struct Codebase {
     pub semantic_units: Vec<SemanticUnit>,
     pub chunk_indices_by_file: HashMap<String, Vec<usize>>,
     pub symbol_definition_chunks: HashMap<String, Vec<usize>>,
-    pub word_index: WordIndex,
+    pub word_index: parking_lot::RwLock<Option<WordIndex>>,
+    pub word_index_path: Option<PathBuf>,
+    pub word_hits_path: Option<PathBuf>,
     pub deps_forward: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
     pub deps_path: Option<PathBuf>,
     pub deps_reverse: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
@@ -265,24 +268,13 @@ impl Codebase {
             ));
         }
 
-        let stage = Instant::now();
-        let paths = collect_paths(&root, &options)?;
-        log_timing(timing, "collect_paths", stage);
         let project_cache = ProjectCache::new(&root, &options.storage)?;
         let storage_dir = project_cache
             .enabled()
             .then(|| project_cache.dir().display().to_string());
-        let cache_fingerprints = if project_cache.enabled() {
-            let stage = Instant::now();
-            let fingerprints = fingerprint_paths(&root, &paths, options.max_file_bytes)?;
-            log_timing(timing, "fingerprint_sources", stage);
-            fingerprints
-        } else {
-            Vec::new()
-        };
         if project_cache.enabled() {
             let stage = Instant::now();
-            match project_cache.load(&options, &cache_fingerprints) {
+            match project_cache.load(&options) {
                 Ok(Some(payload)) => {
                     log_timing(timing, "load_project_cache", stage);
                     return Self::from_cached(
@@ -290,6 +282,8 @@ impl Codebase {
                         options,
                         payload,
                         storage_dir,
+                        Some(project_cache.word_index_path()),
+                        Some(project_cache.word_hits_path()),
                         Some(project_cache.embeddings_path()),
                         Some(project_cache.deps_path()),
                         total_start,
@@ -307,6 +301,10 @@ impl Codebase {
                 }
             }
         }
+
+        let stage = Instant::now();
+        let paths = collect_paths(&root, &options)?;
+        log_timing(timing, "collect_paths", stage);
 
         let stage = Instant::now();
         let mut files: Vec<FileEntry> = paths
@@ -406,6 +404,8 @@ impl Codebase {
         let vector_count = embeddings.len();
         let mut embeddings_path = None;
         let mut deps_path = None;
+        let mut word_index_path = None;
+        let mut word_hits_path = None;
         strip_semantic_unit_text(&mut semantic_units);
         strip_chunk_contents(&mut chunks);
         strip_chunk_paths(&mut chunks);
@@ -429,6 +429,8 @@ impl Codebase {
                 );
             } else {
                 bm25.use_postings_file(project_cache.bm25_postings_path());
+                word_index_path = Some(project_cache.word_index_path());
+                word_hits_path = Some(project_cache.word_hits_path());
                 embeddings_path = Some(project_cache.embeddings_path());
                 deps_path = Some(project_cache.deps_path());
             }
@@ -447,7 +449,13 @@ impl Codebase {
             semantic_units,
             chunk_indices_by_file,
             symbol_definition_chunks,
-            word_index,
+            word_index: parking_lot::RwLock::new(if word_index_path.is_some() {
+                None
+            } else {
+                Some(word_index)
+            }),
+            word_index_path,
+            word_hits_path,
             deps_forward: parking_lot::RwLock::new(if deps_path.is_some() {
                 None
             } else {
@@ -486,6 +494,8 @@ impl Codebase {
         options: IndexOptions,
         payload: CachedIndexPayload,
         storage_dir: Option<String>,
+        word_index_path: Option<PathBuf>,
+        word_hits_path: Option<PathBuf>,
         embeddings_path: Option<PathBuf>,
         deps_path: Option<PathBuf>,
         total_start: Instant,
@@ -511,7 +521,6 @@ impl Codebase {
             build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "restore_cached_files", stage);
 
-        let word_index = payload.word_index;
         let bm25 = payload.bm25;
         let embedding_model_id = options.embedding_model.clone();
         let mut file_map = files
@@ -532,7 +541,9 @@ impl Codebase {
             semantic_units: payload.semantic_units,
             chunk_indices_by_file,
             symbol_definition_chunks,
-            word_index,
+            word_index: parking_lot::RwLock::new(None),
+            word_index_path,
+            word_hits_path,
             deps_forward: parking_lot::RwLock::new(None),
             deps_path,
             deps_reverse: parking_lot::RwLock::new(None),
@@ -594,11 +605,6 @@ impl Codebase {
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
-    }
-
-    pub fn chunk_content(&self, chunk: &Chunk) -> Result<String> {
-        let mut cache = HashMap::new();
-        self.chunk_content_cached(chunk, &mut cache)
     }
 
     pub fn chunk_file_path<'a>(&'a self, chunk: &'a Chunk) -> &'a str {
@@ -725,6 +731,37 @@ impl Codebase {
             .as_ref()
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn word_hits(&self, word: &str) -> Result<Vec<WordHit>> {
+        self.ensure_word_index();
+        let guard = self.word_index.read();
+        let Some(index) = guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        index.hits(word)
+    }
+
+    fn ensure_word_index(&self) {
+        if self.word_index.read().is_some() {
+            return;
+        }
+        let mut guard = self.word_index.write();
+        if guard.is_some() {
+            return;
+        }
+        let index = match (&self.word_index_path, &self.word_hits_path) {
+            (Some(index_path), Some(hits_path)) => read_word_index(index_path, hits_path)
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "codebase-mcp word index cache load failed at {}: {err:#}",
+                        index_path.display()
+                    );
+                    WordIndex::default()
+                }),
+            _ => WordIndex::default(),
+        };
+        *guard = Some(index);
     }
 
     fn ensure_deps_forward(&self) {
@@ -1162,18 +1199,42 @@ fn collect_paths_from(
                 &filter_options,
             )
         });
-    for entry in builder.build() {
-        let entry = entry?;
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
-            continue;
-        };
-        if extensions.contains(&ext.to_ascii_lowercase()) {
-            paths.insert(path.to_path_buf());
-        }
+    let collected = Arc::new(StdMutex::new(Vec::new()));
+    let errors = Arc::new(StdMutex::new(Vec::new()));
+    builder.build_parallel().run(|| {
+        let collected = collected.clone();
+        let errors = errors.clone();
+        let extensions = extensions.clone();
+        Box::new(move |entry| {
+            match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        let path = entry.path();
+                        if let Some(ext) = path.extension().and_then(|ext| ext.to_str())
+                            && extensions.contains(&ext.to_ascii_lowercase())
+                        {
+                            collected
+                                .lock()
+                                .expect("path collector poisoned")
+                                .push(path.to_path_buf());
+                        }
+                    }
+                }
+                Err(err) => errors
+                    .lock()
+                    .expect("path error collector poisoned")
+                    .push(err.to_string()),
+            }
+            WalkState::Continue
+        })
+    });
+    let errors = errors.lock().expect("path error collector poisoned");
+    if let Some(error) = errors.first() {
+        return Err(anyhow!("failed to walk source tree: {error}"));
+    }
+    let mut collected = collected.lock().expect("path collector poisoned");
+    for path in collected.drain(..) {
+        paths.insert(path);
     }
     Ok(())
 }

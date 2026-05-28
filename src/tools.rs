@@ -1,3 +1,4 @@
+use crate::cache::{CachedDepsSnapshot, ProjectCache};
 use crate::graph::GraphCommunity;
 use crate::indexer::{
     ChangedFile, Codebase, IndexOptions, build_globset, fingerprint_project, hash_content,
@@ -122,6 +123,185 @@ impl ProjectManager {
         }
         Ok(false)
     }
+}
+
+pub fn dispatch_cached_cli_tool(
+    default_root: &Path,
+    options: &IndexOptions,
+    name: &str,
+    args: &Value,
+) -> Result<Option<String>> {
+    if !matches!(name, "codedb_status" | "codedb_find" | "codedb_deps") {
+        return Ok(None);
+    }
+    let root = tool_project_root(default_root, args)?;
+    let cache = ProjectCache::new(&root, &options.storage)?;
+    if !cache.enabled() {
+        return Ok(None);
+    }
+    match name {
+        "codedb_status" => Ok(cache
+            .load_status(options)?
+            .map(|status| format_cached_status(options, &status))),
+        "codedb_find" => Ok(cache
+            .load_file_list(options)?
+            .map(|files| handle_cached_find(&files, args))
+            .transpose()?),
+        "codedb_deps" => Ok(cache
+            .load_deps_snapshot(options)?
+            .map(|snapshot| handle_cached_deps(&snapshot, args))
+            .transpose()?),
+        _ => Ok(None),
+    }
+}
+
+fn tool_project_root(default_root: &Path, args: &Value) -> Result<PathBuf> {
+    let root = args
+        .get("project")
+        .and_then(Value::as_str)
+        .filter(|project| !project.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_root.to_path_buf());
+    Ok(root.canonicalize()?)
+}
+
+fn format_cached_status(
+    options: &IndexOptions,
+    status: &crate::cache::CachedStatusSnapshot,
+) -> String {
+    format!(
+        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  vector_index: lazy flat cosine ({} files vectors)\n  embedding_model: model2vec-rs {} ({} dims)\n  scan: ready\n  extensions: {}\n  cache: hit\n  storage: {}\n",
+        status.seq,
+        status.files,
+        status.files,
+        status.chunks,
+        status.graph_stats.nodes,
+        status.graph_stats.edges,
+        status.graph_stats.communities,
+        status.vector_count,
+        status.embedding_model,
+        status.embedding_dims,
+        options.extensions.join(","),
+        status.storage_dir
+    )
+}
+
+fn handle_cached_find(files: &[String], args: &Value) -> Result<String> {
+    let query = required_str(args, "query")?;
+    let max_results = get_usize(args, "max_results").unwrap_or(10).clamp(1, 50);
+    let mut matches = files
+        .iter()
+        .filter_map(|path| fuzzy_score(path, &query).map(|score| (path.clone(), score)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    matches.truncate(max_results);
+    if matches.is_empty() {
+        return Ok("no matches".to_string());
+    }
+    let mut out = String::new();
+    for (idx, (path, score)) in matches.into_iter().enumerate() {
+        out.push_str(&format!("{}. {} (score: {:.2})\n", idx + 1, path, score));
+    }
+    Ok(out)
+}
+
+fn handle_cached_deps(snapshot: &CachedDepsSnapshot, args: &Value) -> Result<String> {
+    let path = normalize_rel_path(&required_str(args, "path")?);
+    let direction = get_str(args, "direction").unwrap_or_else(|| "imported_by".to_string());
+    let transitive = get_bool(args, "transitive");
+    let max_depth = get_usize(args, "max_depth");
+    let forward = direction == "depends_on";
+    let results = if transitive {
+        cached_transitive_deps(&snapshot.deps_forward, &path, forward, max_depth)
+    } else if forward {
+        snapshot
+            .deps_forward
+            .get(&path)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        cached_reverse_deps(&snapshot.deps_forward, &path)
+    };
+
+    let mut out = if forward {
+        if transitive {
+            format!("{path} transitively depends on:\n")
+        } else {
+            format!("{path} depends on:\n")
+        }
+    } else if transitive {
+        format!("{path} is transitively imported by:\n")
+    } else {
+        format!("{path} is imported by:\n")
+    };
+    if results.is_empty() {
+        out.push_str("  (none)\n");
+        if snapshot.files.binary_search(&path).is_err() {
+            out.push_str(&cached_fuzzy_suggestions(&snapshot.files, &path));
+        }
+    } else {
+        for result in &results {
+            out.push_str(&format!("  {result}\n"));
+        }
+        out.push_str(&format!("({} files)\n", results.len()));
+    }
+    Ok(out)
+}
+
+fn cached_reverse_deps(deps_forward: &HashMap<String, Vec<String>>, path: &str) -> Vec<String> {
+    let mut results = deps_forward
+        .iter()
+        .filter_map(|(source, targets)| {
+            targets
+                .iter()
+                .any(|target| target == path)
+                .then_some(source.clone())
+        })
+        .collect::<Vec<_>>();
+    results.sort();
+    results
+}
+
+fn cached_transitive_deps(
+    deps_forward: &HashMap<String, Vec<String>>,
+    path: &str,
+    forward: bool,
+    max_depth: Option<usize>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([(path.to_string(), 0usize)]);
+    while let Some((current, depth)) = queue.pop_front() {
+        if max_depth.is_some_and(|max| depth >= max) {
+            continue;
+        }
+        let deps = if forward {
+            deps_forward.get(&current).cloned().unwrap_or_default()
+        } else {
+            cached_reverse_deps(deps_forward, &current)
+        };
+        for dep in deps {
+            if seen.insert(dep.clone()) {
+                queue.push_back((dep, depth + 1));
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+fn cached_fuzzy_suggestions(files: &[String], query: &str) -> String {
+    let mut matches = files
+        .iter()
+        .filter_map(|path| fuzzy_score(path, query).map(|score| (path.clone(), score)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if matches.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("did you mean:\n");
+    for (path, score) in matches.into_iter().take(5) {
+        out.push_str(&format!("  {path} (score: {score:.2})\n"));
+    }
+    out
 }
 
 fn initial_changes(index: &Codebase) -> Vec<ChangedFile> {
@@ -364,9 +544,9 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
 
 fn handle_word(index: &Codebase, args: &Value) -> Result<String> {
     let word = required_str(args, "word")?;
-    let hits = index.word_index.get(&word);
+    let hits = index.word_hits(&word)?;
     let mut out = format!("{} hits for '{}':\n", hits.len(), word);
-    for hit in hits {
+    for hit in &hits {
         if let Some(file) = index.file_by_id(hit.file_id) {
             out.push_str(&format!("  {}:{}\n", file.path, hit.line));
         }
@@ -476,13 +656,13 @@ fn batch_item_args(
 }
 
 fn reference_candidates(index: &Codebase, name: &str) -> Result<Vec<SearchHit>> {
-    let word_hits = index.word_index.get(name);
+    let word_hits = index.word_hits(name)?;
     if word_hits.is_empty() {
         return Ok(Vec::new());
     };
     let mut content_by_file = HashMap::<u32, String>::new();
     let mut results = Vec::new();
-    for hit in word_hits {
+    for hit in &word_hits {
         let Some(file) = index.file_by_id(hit.file_id) else {
             continue;
         };
@@ -3381,8 +3561,9 @@ fn format_chunk_hits(
     hits: Vec<crate::types::ChunkSearchHit>,
 ) -> Result<String> {
     let mut out = format!("{} results for '{}':\n", hits.len(), query);
+    let mut content_by_file = HashMap::new();
     for hit in hits {
-        let content = index.chunk_content(&hit.chunk)?;
+        let content = index.chunk_content_cached(&hit.chunk, &mut content_by_file)?;
         let preview = content
             .lines()
             .filter(|line| !is_comment_or_blank(line))

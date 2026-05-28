@@ -18,6 +18,7 @@
 - 将正向依赖图移动到懒加载的 `deps.bin` sidecar，search/status/callers 不再常驻依赖图；dependency 和 graph/module 工具按需加载。
 - 将 cache v18 拆成小 JSON manifest、二进制源码 fingerprint、紧凑 hot `index.bin`、懒加载 BM25 postings、懒加载 word-index sidecar、懒加载依赖和懒加载 embedding。单次 `codedb_status`、`codedb_find`、`codedb_deps` 现在可以直接从 sidecar 返回，不反序列化完整 index。
 - 为业务短语搜索增加 BM25 候选足够时的 fast path，常见多词 query 可直接返回 lexical 结果而不加载 Model2Vec；同时在格式化 search preview 时复用同一文件内容读取。
+- 为 definition-anchored `codedb_callers` 增加懒生成的 `callers.bin` sidecar。未缓存 target 第一次仍走完整 caller 路径并写入 sidecar；重复 one-shot 查询可直接从 sidecar 返回，不加载完整 index。
 
 ### 修复
 
@@ -27,7 +28,7 @@
 ### Benchmark 与验证
 
 - cache v18 后重新测量 `u3dclient`：19,035 个 indexed files、129,858 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
-- 重新测量 `u3dclient` fast one-shot wall time：`codedb_status` 0.281s，`codedb_find PoolManager` 0.407s，`codedb_deps PoolManager.cs` 0.322s，`codedb_search PoolManager` 通常约 0.966s、一次 outlier 为 1.297s，`codedb_callers PoolManager` 约 1.116-1.346s，主要成本是首次懒加载 `word_index.bin`。
+- 重新测量 `u3dclient` fast one-shot wall time 和峰值内存：`codedb_status` 0.252s、14.1 MB WS / 7.9 MB private，`codedb_find PoolManager` 0.283s、14.4 MB WS / 8.2 MB private，`codedb_deps PoolManager.cs` 0.303s、34.8 MB WS / 28.3 MB private，`codedb_search PoolManager` 0.739s、151.5 MB WS / 154.8 MB private，`codedb_callers PoolManager` sidecar hit 0.243s、14.2 MB WS / 7.8 MB private。
 - 修正 `gameserver` 显式模型路径后重新测量 Java benchmark：6,940 个 files、55,057 个 chunks、245,238 个 symbols，重建 10.477s，cache hit 重新打开 1.027s。
 - 更新 README 里的 `rg` 对比：cache v18 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
 - 验证移除常驻完整文件源码正文后的按需读文件工具：`codedb_search PoolManager`、基于定义锚点的 `codedb_callers PoolManager`、`codedb_read PoolManager.cs`。

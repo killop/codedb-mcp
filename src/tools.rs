@@ -1,4 +1,4 @@
-use crate::cache::{CachedDepsSnapshot, ProjectCache};
+use crate::cache::{CachedCallerEntry, CachedCallerHit, CachedDepsSnapshot, ProjectCache};
 use crate::graph::GraphCommunity;
 use crate::indexer::{
     ChangedFile, Codebase, IndexOptions, build_globset, fingerprint_project, hash_content,
@@ -131,7 +131,10 @@ pub fn dispatch_cached_cli_tool(
     name: &str,
     args: &Value,
 ) -> Result<Option<String>> {
-    if !matches!(name, "codedb_status" | "codedb_find" | "codedb_deps") {
+    if !matches!(
+        name,
+        "codedb_status" | "codedb_find" | "codedb_deps" | "codedb_callers"
+    ) {
         return Ok(None);
     }
     let root = tool_project_root(default_root, args)?;
@@ -151,6 +154,7 @@ pub fn dispatch_cached_cli_tool(
             .load_deps_snapshot(options)?
             .map(|snapshot| handle_cached_deps(&snapshot, args))
             .transpose()?),
+        "codedb_callers" => handle_cached_callers(&cache, options, args),
         _ => Ok(None),
     }
 }
@@ -300,6 +304,60 @@ fn cached_fuzzy_suggestions(files: &[String], query: &str) -> String {
     let mut out = String::from("did you mean:\n");
     for (path, score) in matches.into_iter().take(5) {
         out.push_str(&format!("  {path} (score: {score:.2})\n"));
+    }
+    out
+}
+
+fn handle_cached_callers(
+    cache: &ProjectCache,
+    options: &IndexOptions,
+    args: &Value,
+) -> Result<Option<String>> {
+    if args.get("targets").is_some() {
+        return Ok(None);
+    }
+    let Some(name) = get_str(args, "name") else {
+        return Ok(None);
+    };
+    let Some(path) = get_str(args, "definition_path").or_else(|| get_str(args, "path")) else {
+        return Ok(None);
+    };
+    let Some(line_start) = get_usize(args, "definition_line").or_else(|| get_usize(args, "line"))
+    else {
+        return Ok(None);
+    };
+    let path = normalize_rel_path(&path);
+    let max_results = get_usize(args, "max_results")
+        .unwrap_or(50)
+        .clamp(1, 10_000);
+    Ok(cache
+        .load_caller_entry(options, &name, &path, line_start)?
+        .map(|entry| format_cached_caller_entry(&entry, max_results)))
+}
+
+fn format_cached_caller_entry(entry: &CachedCallerEntry, max_results: usize) -> String {
+    let hits = entry
+        .hits
+        .iter()
+        .take(max_results.min(entry.hits.len()))
+        .collect::<Vec<_>>();
+    let mut out = format!(
+        "{} references for '{}' resolved to {}:{} ({})\n",
+        hits.len(),
+        entry.name,
+        entry.path,
+        entry.line_start,
+        entry.kind
+    );
+    for hit in hits {
+        if let Some(scope) = &hit.scope {
+            out.push_str(&format!(
+                "  {}:{}: {}  [in {} ({}, L{}-L{})]\n",
+                hit.path, hit.line, hit.text, scope.name, scope.kind, scope.start, scope.end
+            ));
+        } else {
+            out.push_str(&format!("  {}:{}: {}\n", hit.path, hit.line, hit.text));
+        }
     }
     out
 }
@@ -609,6 +667,7 @@ fn handle_callers_one(index: &Codebase, args: &Value) -> Result<String> {
         .collect::<BTreeSet<_>>();
     let mut hits = reference_candidates(index, &name)?;
     hits.retain(|hit| is_lsp_like_reference(index, &target, hit, &all_definition_sites));
+    save_cached_caller_entry(index, &target, &hits);
     hits.truncate(max_results);
     let mut out = format!(
         "{} references for '{}' resolved to {}:{} ({})\n",
@@ -629,6 +688,33 @@ fn handle_callers_one(index: &Codebase, args: &Value) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+fn save_cached_caller_entry(index: &Codebase, target: &SymbolTarget, hits: &[SearchHit]) {
+    let Ok(cache) = ProjectCache::new(&index.root, &index.options.storage) else {
+        return;
+    };
+    if !cache.enabled() {
+        return;
+    }
+    let entry = CachedCallerEntry {
+        name: target.name.clone(),
+        path: target.path.clone(),
+        line_start: target.line_start,
+        kind: target.kind.clone(),
+        hits: hits
+            .iter()
+            .map(|hit| CachedCallerHit {
+                path: hit.path.clone(),
+                line: hit.line,
+                text: hit.text.clone(),
+                scope: hit.scope.clone(),
+            })
+            .collect(),
+    };
+    if let Err(err) = cache.save_caller_entry(entry) {
+        eprintln!("codebase-mcp caller sidecar save failed: {err:#}");
+    }
 }
 
 fn batch_item_args(

@@ -88,22 +88,22 @@ Current index status with the Unity C# benchmark config:
 - Graph: 19,941 nodes and 166,132 edges.
 - Vector search: lazy Model2Vec `minishlab/potion-code-16M` file embeddings with flat cosine scan.
 - Storage: `u3dclient\.codedb-mcp`.
-- Cache v18 sidecars: compact `index.bin`, lazy `bm25.postings`, lazy `word_index.bin`/`word_hits.bin`, lazy `deps.bin`, lazy `embeddings.bin`, and binary source fingerprints.
-- Last full memory sampling before cache v18: non-semantic one-shot calls were about 267 MB WS / 351 MB private. The v18 fast pass below re-measured wall time only.
+- Cache v18 sidecars: compact `index.bin`, lazy `bm25.postings`, lazy `word_index.bin`/`word_hits.bin`, lazy `callers.bin`, lazy `deps.bin`, lazy `embeddings.bin`, and binary source fingerprints.
+- Peak memory below is sampled Working Set / Private Bytes for short one-shot child processes. The cold rebuild row was not rerun in the short memory pass.
 
 Index timings on this machine:
 
 | Scenario | Cache | Internal total | Peak memory | Notes |
 |---|---|---:|---:|---|
-| Cache v18 rebuild in project storage | miss | 36.820s wall | not resampled | scan, tree-sitter declaration parse, embeddings, BM25, compact sidecar cache save |
-| Cache-hit index open | hit | 0.983s wall | not resampled | includes process startup, source fingerprint validation, and cache load |
-| One-shot `codedb_status` CLI | hit | 0.281s wall | not resampled | manifest/fingerprint fast path; no full index deserialize |
-| One-shot `codedb_find PoolManager` | hit | 0.407s wall | not resampled | manifest/fingerprint fast path over cached file list |
-| One-shot symbol `codedb_search PoolManager` | hit | 0.966s / 0.966s / 1.297s wall | not resampled | symbol-shaped queries use BM25 plus exact symbol boosts and do not load embeddings |
-| One-shot `codedb_callers PoolManager` | hit | 1.116s / 1.124s / 1.346s wall | not resampled | definition-anchored typed caller lookup; first query lazy-loads `word_index.bin` |
-| One-shot `codedb_deps PoolManager.cs` | hit | 0.322s wall | not resampled | dependency fast path from `deps.bin`; no full index deserialize |
-| One-shot business phrase `codedb_search` | hit | 1.047s wall | not resampled | enough BM25 candidates return lexical results without loading Model2Vec |
-| One-shot `codedb_bundle` with 20 symbol searches | hit | 0.984s-1.548s wall | not resampled | one process load plus 20 inner symbol searches |
+| Cache v18 rebuild in project storage | miss | 36.820s wall | not rerun | scan, tree-sitter declaration parse, embeddings, BM25, compact sidecar cache save |
+| Cache-hit index open | hit | 0.768s wall | 151.1 MB WS / 154.7 MB private | includes process startup, source fingerprint validation, and cache load |
+| One-shot `codedb_status` CLI | hit | 0.252s wall | 14.1 MB WS / 7.9 MB private | manifest/fingerprint fast path; no full index deserialize |
+| One-shot `codedb_find PoolManager` | hit | 0.283s wall | 14.4 MB WS / 8.2 MB private | manifest/fingerprint fast path over cached file list |
+| One-shot symbol `codedb_search PoolManager` | hit | 0.739s wall | 151.5 MB WS / 154.8 MB private | symbol-shaped queries use BM25 plus exact symbol boosts and do not load embeddings |
+| One-shot `codedb_callers PoolManager` | hit | 0.243s wall | 14.2 MB WS / 7.8 MB private | `callers.bin` sidecar hit; first uncached target populates the sidecar through the full caller path |
+| One-shot `codedb_deps PoolManager.cs` | hit | 0.303s wall | 34.8 MB WS / 28.3 MB private | dependency fast path from `deps.bin`; no full index deserialize |
+| One-shot business phrase `codedb_search` | hit | 0.777s wall | 152.1 MB WS / 154.7 MB private | enough BM25 candidates return lexical results without loading Model2Vec |
+| One-shot `codedb_bundle` with 20 symbol searches | hit | 0.895s wall | 154.3 MB WS / 156.9 MB private | one process load plus 20 inner symbol searches |
 | One-shot `codedb_module_atlas` export | hit | 12.355s wall | 471.3 MB WS / 527.9 MB private | includes cache-hit index load plus atlas JSON export |
 | Warm module atlas generation | ready | 7.223s internal | already loaded | 1,373 modules and 16,365 plotted files from dependency-connected file graph |
 
@@ -254,7 +254,7 @@ This project intentionally keeps installation explicit: setup prepares local pro
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, Lua `require()` imports, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: builds chunks, exact identifier hits, symbol-definition chunk hits, dependency references, BM25 lexical search, and Model2Vec file embeddings. Symbol-shaped queries stay lexical/symbol-aware; natural-language queries lazy-load embeddings and run flat cosine vector search.
-7. **Memory-shaped cache**: cache v18 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, BM25 postings, word-index hits, embeddings, forward/reverse dependencies, graph objects, and Louvain results are no longer all resident by default. Tools read exact lines, postings, word hits, embeddings, dependencies, or graph data on demand.
+7. **Memory-shaped cache**: cache v18 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, BM25 postings, word-index hits, caller results, embeddings, forward/reverse dependencies, graph objects, and Louvain results are no longer all resident by default. Tools read exact lines, postings, word hits, caller sidecars, embeddings, dependencies, or graph data on demand.
 8. **Graph layer**: builds a graphify-style code graph lazily. Small repos keep file, namespace/package, symbol, dependency, and reference edges; large repos keep graph construction behind graph/community/module tools while symbol data stays in outline/search/callers indexes. Louvain communities and subcommunities are computed lazily on first request and cached under `.codedb-mcp`.
 9. **Module atlas layer**: `codedb_module_map` and `codedb_module_atlas` run in Rust. They first split files by dependency-connected components, then do dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary clustering basis. `codedb_module_atlas` exports Embedding Atlas-ready JSON.
 10. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.

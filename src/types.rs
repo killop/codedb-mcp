@@ -328,7 +328,7 @@ impl WordIndex {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
     pub name: String,
     pub kind: String,

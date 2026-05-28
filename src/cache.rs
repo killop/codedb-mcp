@@ -1,6 +1,6 @@
 use crate::bm25::Bm25Index;
 use crate::indexer::{IndexOptions, LightweightGraphStats, StorageOptions};
-use crate::types::{Chunk, FileEntry, LanguageId, SemanticUnit, Symbol, WordIndex};
+use crate::types::{Chunk, FileEntry, LanguageId, Scope, SemanticUnit, Symbol, WordIndex};
 use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ const WORD_INDEX_FILE: &str = "word_index.bin";
 const WORD_HITS_FILE: &str = "word_hits.bin";
 const EMBEDDINGS_FILE: &str = "embeddings.bin";
 const DEPS_FILE: &str = "deps.bin";
+const CALLERS_FILE: &str = "callers.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceFingerprint {
@@ -76,6 +77,29 @@ pub struct CachedStatusSnapshot {
 pub struct CachedDepsSnapshot {
     pub files: Vec<String>,
     pub deps_forward: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedCallerEntry {
+    pub name: String,
+    pub path: String,
+    pub line_start: usize,
+    pub kind: String,
+    pub hits: Vec<CachedCallerHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedCallerHit {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+    pub scope: Option<Scope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCallers {
+    source_seq: i128,
+    entries: Vec<CachedCallerEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -181,6 +205,10 @@ impl ProjectCache {
         self.dir.join(DEPS_FILE)
     }
 
+    pub fn callers_path(&self) -> PathBuf {
+        self.dir.join(CALLERS_FILE)
+    }
+
     pub fn load(&self, options: &IndexOptions) -> Result<Option<CachedIndexPayload>> {
         if !self.enabled {
             return Ok(None);
@@ -277,6 +305,69 @@ impl ProjectCache {
             files,
             deps_forward,
         }))
+    }
+
+    pub fn load_caller_entry(
+        &self,
+        options: &IndexOptions,
+        name: &str,
+        path: &str,
+        line_start: usize,
+    ) -> Result<Option<CachedCallerEntry>> {
+        let Some((manifest, _fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(None);
+        };
+        let callers_path = self.callers_path();
+        if !callers_path.is_file() {
+            return Ok(None);
+        }
+        let callers: CachedCallers = read_bin(&callers_path)?;
+        if callers.source_seq != manifest.created_unix_ms {
+            return Ok(None);
+        }
+        Ok(callers.entries.into_iter().find(|entry| {
+            entry.name == name && entry.path == path && entry.line_start == line_start
+        }))
+    }
+
+    pub fn save_caller_entry(&self, entry: CachedCallerEntry) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let manifest_path = self.dir.join(MANIFEST_FILE);
+        if !manifest_path.is_file() {
+            return Ok(());
+        }
+        let manifest: CacheManifest = read_json(&manifest_path)?;
+        let callers_path = self.callers_path();
+        let mut callers = if callers_path.is_file() {
+            read_bin(&callers_path).unwrap_or(CachedCallers {
+                source_seq: manifest.created_unix_ms,
+                entries: Vec::new(),
+            })
+        } else {
+            CachedCallers {
+                source_seq: manifest.created_unix_ms,
+                entries: Vec::new(),
+            }
+        };
+        if callers.source_seq != manifest.created_unix_ms {
+            callers.source_seq = manifest.created_unix_ms;
+            callers.entries.clear();
+        }
+        callers.entries.retain(|current| {
+            !(current.name == entry.name
+                && current.path == entry.path
+                && current.line_start == entry.line_start)
+        });
+        callers.entries.push(entry);
+        callers.entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+        });
+        write_bin_atomic(&callers_path, &callers)
     }
 
     fn valid_manifest(

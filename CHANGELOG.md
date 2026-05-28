@@ -18,6 +18,7 @@
 - Moved forward dependencies into a lazy `deps.bin` sidecar so search/status/callers do not keep the dependency graph resident; dependency and graph/module tools load it on demand.
 - Split cache v18 into a small JSON manifest plus binary source fingerprints, a compact hot `index.bin`, lazy BM25 postings, lazy word-index sidecars, lazy dependencies, and lazy embeddings. One-shot `codedb_status`, `codedb_find`, and `codedb_deps` can now answer from sidecars without deserializing the full index.
 - Added a BM25-enough fast path for business phrase searches so common multi-token queries can return lexical results without loading Model2Vec, and reused file-content reads while formatting search previews.
+- Added a lazy `callers.bin` sidecar for definition-anchored `codedb_callers` results. The first uncached target still uses the full caller path and writes the sidecar; repeated one-shot lookups can return directly from the sidecar without loading the full index.
 
 ### Fixed
 
@@ -27,7 +28,7 @@
 ### Benchmark And Validation
 
 - Re-measured `u3dclient` after cache v18: 19,035 indexed files, 129,858 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
-- Re-ran fast one-shot wall-time checks on `u3dclient`: `codedb_status` 0.281s, `codedb_find PoolManager` 0.407s, `codedb_deps PoolManager.cs` 0.322s, `codedb_search PoolManager` usually about 0.966s with a 1.297s outlier, and `codedb_callers PoolManager` about 1.116-1.346s due the first lazy `word_index.bin` load.
+- Re-ran fast one-shot wall-time and peak-memory checks on `u3dclient`: `codedb_status` 0.252s at 14.1 MB WS / 7.9 MB private, `codedb_find PoolManager` 0.283s at 14.4 MB WS / 8.2 MB private, `codedb_deps PoolManager.cs` 0.303s at 34.8 MB WS / 28.3 MB private, `codedb_search PoolManager` 0.739s at 151.5 MB WS / 154.8 MB private, and `codedb_callers PoolManager` sidecar hit 0.243s at 14.2 MB WS / 7.8 MB private.
 - Re-ran the `gameserver` Java benchmark after fixing its explicit model path: 6,940 files, 55,057 chunks, and 245,238 symbols rebuild in 10.477s, then reopen from cache in 1.027s.
 - Updated the README `rg` comparison to reflect the cache v18 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
 - Verified source-on-demand tools after removing resident full-file bodies: `codedb_search PoolManager`, definition-anchored `codedb_callers PoolManager`, and `codedb_read PoolManager.cs`.

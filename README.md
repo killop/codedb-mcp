@@ -78,7 +78,7 @@ The intended distribution model is setup-guide first: give an agent `setup-for-a
 
 Benchmark target: `u3dclient`.
 
-Benchmarks were rerun on 2026-05-28 on Windows. One-shot rows include process startup and cache load. Warm rows use `codedb_bundle timing=true` inside one loaded process after warmup. Memory is sampled peak Working Set / Private Bytes for the child process.
+Benchmarks were rerun on 2026-05-29 on Windows. `warm` timings run inside one loaded MCP process after warmup. `one-shot` timings launch a CLI child process and include startup/cache load. Peak memory is sampled as MB Working Set / Private Bytes.
 
 Current index status with the Unity C# benchmark config:
 
@@ -91,69 +91,59 @@ Current index status with the Unity C# benchmark config:
 - Cache v20 sidecars: compact `index.bin`, spilled `bm25.postings`, lazy `word_index.bin`/`word_hits.bin`, lazy `callers.bin`, lazy `deps.bin`, optional legacy `embeddings.bin`, and binary source fingerprints.
 - Peak memory below is sampled Working Set / Private Bytes for child processes. The cold rebuild row was measured with memory sampling enabled, so its wall time is not directly comparable to the faster no-sampling rebuild pass.
 
-Index timings on this machine:
+Index and cache baseline:
 
-| Scenario | Cache | Internal total | Peak memory | Notes |
-|---|---|---:|---:|---|
-| Cache v20 rebuild in project storage | miss | 26.335s internal / 26.621s wall | 256.4 MB WS / 250.2 MB private | memory-sampled cold rebuild; tree-sitter declaration parse, source-on-demand dependencies, spill-to-disk BM25, lazy embeddings, compact sidecar cache save |
-| Cache-hit index open | hit | 0.873s internal / 1.132s wall | 134.9 MB WS / 136.0 MB private | includes process startup, source fingerprint validation, and cache load |
-| One-shot `codedb_status` CLI | hit | 0.252s wall | 14.1 MB WS / 7.9 MB private | manifest/fingerprint fast path; no full index deserialize |
-| One-shot `codedb_find PoolManager` | hit | 0.283s wall | 14.4 MB WS / 8.2 MB private | manifest/fingerprint fast path over cached file list |
-| One-shot symbol `codedb_search PoolManager` | hit | 0.739s wall | 151.5 MB WS / 154.8 MB private | symbol-shaped queries use BM25 plus exact symbol boosts and do not load embeddings |
-| One-shot `codedb_callers PoolManager` | hit | 0.243s wall | 14.2 MB WS / 7.8 MB private | `callers.bin` sidecar hit; first uncached target populates the sidecar through the full caller path |
-| One-shot `codedb_deps PoolManager.cs` | hit | 0.303s wall | 34.8 MB WS / 28.3 MB private | dependency fast path from `deps.bin`; no full index deserialize |
-| One-shot business phrase `codedb_search` | hit | 0.777s wall | 152.1 MB WS / 154.7 MB private | enough BM25 candidates return lexical results without loading Model2Vec |
-| One-shot `codedb_bundle` with 20 symbol searches | hit | 0.895s wall | 154.3 MB WS / 156.9 MB private | one process load plus 20 inner symbol searches |
-| One-shot `codedb_module_atlas` export | hit | 12.355s wall | 471.3 MB WS / 527.9 MB private | includes cache-hit index load plus atlas JSON export |
-| Warm module atlas generation | ready | 7.223s internal | already loaded | 1,373 modules and 16,365 plotted files from dependency-connected file graph |
+| Scenario | Time | Peak memory | Notes |
+|---|---:|---:|---|
+| Cache v20 cold rebuild | 30.258s wall | 255.8 / 249.6 MB | tree-sitter declaration parse, source-on-demand dependencies, spill-to-disk BM25, lazy embeddings, compact cache save |
+| Cache-hit index open | 0.873s internal / 1.132s wall | 134.9 / 136.0 MB | process startup, source fingerprint validation, and cache load |
+| `codedb_index` cache-hit tool call | 1.556s wall | 141.5 / 140.4 MB | explicit tool call after cache is already valid |
+
+## MCP Tool Benchmark Matrix
+
+The table is intentionally three columns so it fits GitHub README pages without horizontal scrolling. Memory values are MB Working Set / Private Bytes.
+
+| Tool / Purpose | MCP benchmark | rg comparison |
+|---|---|---|
+| `codedb_index`<br>Build/rebuild local index | cold 30.258s, 255.8 / 249.6 MB<br>cache-hit tool 1.556s, 141.5 / 140.4 MB | none |
+| `codedb_status`<br>Health, counts, scan state | one-shot 0.561s, 14.2 / 7.9 MB | none |
+| `codedb_tree`<br>Indexed tree with language, lines, symbols | warm 11.891ms<br>one-shot 1.018s, 142.0 / 141.0 MB | partial file list only |
+| `codedb_outline`<br>One-file symbol outline | warm 0.074ms<br>one-shot 1.279s, 140.2 / 140.3 MB | none |
+| `codedb_symbol`<br>Symbol definition lookup | warm 2.106ms<br>one-shot 1.034s, 140.7 / 140.0 MB | regex approximates text only |
+| `codedb_search`<br>Hybrid search, regex, batch queries | warm scoped regex 7.120ms<br>one-shot 1.097s, 142.3 / 140.5 MB | scoped `rg` 0.047s, MCP 6.6x faster warm<br>broad grep is 1.5-1.8x slower |
+| `codedb_word`<br>Exact identifier inverted index | warm first lazy load 94.403ms<br>one-shot 1.033s, 167.3 / 172.6 MB | partial word grep only |
+| `codedb_callers`<br>Definition-anchored references | warm 3.422ms<br>one-shot 1.309s, 168.5 / 173.0 MB | no semantic anchor |
+| `codedb_hot`<br>Recently modified indexed files | warm 7.069ms<br>one-shot 1.454s, 141.4 / 140.5 MB | none |
+| `codedb_deps`<br>Direct/reverse/transitive file deps | warm 0.098ms<br>one-shot 0.528s, 29.5 / 23.0 MB | none |
+| `codedb_read`<br>Indexed file or line-range read | warm 0.757ms<br>one-shot 1.307s, 141.7 / 140.1 MB | partial file print only |
+| `codedb_edit`<br>Read-only compatibility stub | one-shot 0.128s, 4.8 / 1.2 MB | none |
+| `codedb_changes`<br>Files changed since sequence | warm 10.818ms<br>one-shot 0.871s, 144.7 / 145.8 MB | none |
+| `codedb_snapshot`<br>JSON snapshot of files/symbols/deps | one-shot 2.421s, 634.0 / 715.8 MB | none |
+| `codedb_bundle`<br>Up to 100 tools in one request | warm 100 fast ops 57.725ms<br>one-shot 20 searches 1.107s, 143.3 / 141.5 MB | no MCP batching |
+| `codedb_remote`<br>Remote compatibility stub | one-shot 0.136s, 5.4 / 1.3 MB | none |
+| `codedb_projects`<br>Projects loaded in server process | one-shot 0.114s, 3.8 / 1.0 MB | none |
+| `codedb_find`<br>Fuzzy file/path lookup | warm 18.019-20.230ms<br>one-shot 0.406s, 14.1 / 7.8 MB | no fuzzy ranking |
+| `codedb_query`<br>find/search/filter/limit/outline pipeline | warm 6.786-25.139ms<br>one-shot 1.149s, 141.6 / 140.6 MB | no equivalent single tool |
+| `codedb_glob`<br>Glob over indexed paths | warm 4.231ms<br>one-shot 0.956s, 140.7 / 140.1 MB | `rg --files -g` 0.045s<br>MCP 10.6x faster warm |
+| `codedb_ls`<br>Immediate indexed directory children | warm 4.027ms<br>one-shot 0.940s, 139.3 / 138.8 MB | partial file list only |
+| `codedb_graph`<br>Graph summary/export | one-shot 1.988s, 389.4 / 396.8 MB | none |
+| `codedb_explain`<br>Explain graph node and edges | warm first graph explain 845.369ms<br>one-shot 1.854s, 392.8 / 397.6 MB | none |
+| `codedb_path`<br>Shortest graph path | warm after graph load 13.073ms<br>one-shot 1.790s, 392.6 / 397.2 MB | none |
+| `codedb_communities`<br>Lazy Louvain communities | warm 265.593ms<br>one-shot 1.905s, 390.8 / 400.1 MB | none |
+| `codedb_module_map`<br>DeepWiki module planning | warm 1.679s<br>one-shot 2.236s, 214.4 / 215.3 MB | none |
+| `codedb_module_atlas`<br>Module/file atlas JSON export | one-shot 2.917s, 236.2 / 237.9 MB | none |
+| `codedb_analyze`<br>Graph stats and suggested questions | warm graph analysis 830.637ms<br>one-shot 2.936s, 392.2 / 397.5 MB | none |
+| `codedb_export`<br>Graph JSON/GraphML/Cypher export | warm after graph load 10.313ms<br>one-shot 1.963s, 390.0 / 397.0 MB | none |
 
 Java smoke benchmark on `gameserver`:
 
 | Scenario | Files | Chunks | Symbols | Time | Peak memory |
 |---|---:|---:|---:|---:|---:|
-| Cold build after config/model-path change | 6,940 | 55,057 | 245,238 | 10.477s | 656.0 MB WS / 664.4 MB private |
-| Reopen with unchanged files/config | 6,940 | 55,057 | 245,238 | 1.027s | 129.4 MB WS / 176.4 MB private |
+| Cold build after config/model-path change | 6,940 | 55,057 | 245,238 | 10.477s | 656.0 / 664.4 MB |
+| Reopen with unchanged files/config | 6,940 | 55,057 | 245,238 | 1.027s | 129.4 / 176.4 MB |
 
 Multi-language smoke coverage includes C#, Java, Rust, Python, Lua, TypeScript, C, and C++ parser paths: 8 files, 8 chunks, 14 symbols, 0.219s.
 Rust smoke check on this repository: 29 indexed files, 1,752 chunks, 1,901 symbols; `codedb_outline`, `codedb_search`, and `codedb_deps` all returned Rust results.
-
-Warm persistent MCP tool timings below do not include server startup or index load unless the scenario explicitly says one-shot or cold. The `rg` baseline used `--no-ignore` because this Unity project intentionally includes `Library/PackageCache`. `rg` remains the better tool for ad hoc raw filesystem grep across arbitrary file types; the MCP tools are optimized for repeated code-aware work inside a configured source corpus.
-
-In the peak-memory column, `warm baseline` means the cache-hit process baseline measured above: 134.9 MB Working Set / 136.0 MB Private Bytes. Rows marked extra not sampled have measured latency, but no separate per-tool peak-memory run yet.
-
-## MCP Tool Benchmark Matrix
-
-| Tool | What it does | Benchmark scenario | MCP speed | Peak memory | rg equivalent | rg speed | MCP vs rg |
-|---|---|---|---:|---:|---|---:|---:|
-| `codedb_index` | Build/rebuild the configured local index | cold `u3dclient` v20 rebuild | 26.335s internal / 26.621s wall | 256.4 MB WS / 250.2 MB private | none | n/a | n/a |
-| `codedb_status` | Index health, counts, scan state, model path | one-shot cache-hit CLI | 0.252s wall | 14.1 MB WS / 7.9 MB private | none | n/a | n/a |
-| `codedb_tree` | Whole indexed tree with language, line, and symbol counts | warm tree summary | 11.891ms | warm baseline; extra not sampled | partial `rg --files`, no symbol/line metadata | n/a | n/a |
-| `codedb_outline` | Precomputed tree-sitter symbol outline for one file | `PoolManager.cs`, 36 symbols | 0.074ms; 100-call p95 0.118ms | warm baseline; extra not sampled | none | n/a | n/a |
-| `codedb_symbol` | Find definitions by symbol name | `PoolManager` definitions | 2.106ms | warm baseline; extra not sampled | partial regex only, no parser-defined symbol model | n/a | n/a |
-| `codedb_search` | Hybrid code search; regex mode; batch queries | scoped regex `Joystick`; symbol/NL examples | 7.342ms scoped regex; 3.9-49.1ms symbol/NL; 2.48-2.63s broad regex | 151.5-152.1 MB one-shot lexical search | scoped and broad raw grep | 0.133s scoped; 1.46-1.67s broad | scoped MCP 18.1x faster; broad MCP 1.5-1.8x slower |
-| `codedb_word` | Exact identifier inverted-index lookup | `PoolManager` identifier hits | 94.403ms first lazy word-index load | warm baseline; word sidecar extra not sampled | partial `rg` word grep, no indexed identifier sidecar | n/a | n/a |
-| `codedb_callers` | Definition-anchored references with C#/Java type filtering; batch targets | `PoolManager.cs:26` refs | 3.422ms avg / 3.619ms p95 | 14.2 MB WS / 7.8 MB private one-shot sidecar hit | no semantic anchor | n/a | n/a |
-| `codedb_hot` | Most recently modified indexed files | top 5 hot files | 7.069ms | warm baseline; extra not sampled | none | n/a | n/a |
-| `codedb_deps` | File dependencies, reverse dependencies, transitive traversal | `GameObjectPoolMgr.cs depends_on` | 0.098ms avg / 0.117ms p95; first reverse-deps load 132.938ms | 34.8 MB WS / 28.3 MB private one-shot | none | n/a | n/a |
-| `codedb_read` | Read an indexed file or line range with hash support | `PoolManager.cs` lines 1-40 | 0.757ms | warm baseline; extra not sampled | partial file print, no indexed hash/path contract | n/a | n/a |
-| `codedb_edit` | Read-only compatibility stub | edit attempt returns error | immediate stub | not sampled | none | n/a | n/a |
-| `codedb_changes` | Files changed since a sequence number | `since=0` change listing | 10.818ms | warm baseline; extra not sampled | none | n/a | n/a |
-| `codedb_snapshot` | JSON snapshot of files, symbols, and dependency graph | full snapshot, output discarded | 1.303s | warm baseline; snapshot output extra not sampled | none | n/a | n/a |
-| `codedb_bundle` | Up to 100 `codedb_*` calls in one MCP request | 100 fast mixed metadata/deps/outline/read ops | 57.725ms inner sum; 61.005ms avg repeated | 154.3 MB WS / 156.9 MB private for one-shot 20-search bundle | no MCP batching | n/a | n/a |
-| `codedb_remote` | Remote-query compatibility stub | remote attempt returns stub response | immediate stub | not sampled | none | n/a | n/a |
-| `codedb_projects` | List projects loaded in the current server process | warm project list | 0.059ms | warm baseline; extra not sampled | none | n/a | n/a |
-| `codedb_find` | Fuzzy file name/path lookup | `NetworkListenerManager`, `Joystick`, typo `ResTypDef` | 18.019-20.230ms avg | 14.4 MB WS / 8.2 MB private one-shot | no fuzzy ranking | n/a | n/a |
-| `codedb_query` | Small pipeline: find, search, filter, limit, outline | four tested pipelines | 6.786-25.139ms avg | warm baseline; extra not sampled | no equivalent single tool | n/a | n/a |
-| `codedb_glob` | Glob match against indexed paths | Alliance UI `.cs` glob, 52 hits | 4.231ms avg / 4.254ms p95 | warm baseline; extra not sampled | `rg --files --no-ignore -g` | 0.045s avg / 0.051s p95 | MCP 10.6x faster |
-| `codedb_ls` | Immediate children of an indexed directory | root directory listing | 4.027ms | warm baseline; extra not sampled | partial `rg --files`, no directory object view | n/a | n/a |
-| `codedb_graph` | Graphify-style graph summary or limited export | first lazy graph summary | 943.431ms | warm baseline; graph extra not sampled | none | n/a | n/a |
-| `codedb_explain` | Explain graph node matches and incoming/outgoing edges | first graph-backed `PoolManager` explain | 845.369ms | warm baseline; graph extra not sampled | none | n/a | n/a |
-| `codedb_path` | Shortest graph path between files/symbols/nodes | `PoolManager` to `GameObjectPoolMgr` after graph load | 13.073ms | warm baseline; extra not sampled | none | n/a | n/a |
-| `codedb_communities` | Lazy Louvain communities and subcommunities | top 10 communities after graph load | 265.593ms | warm baseline; Louvain extra not sampled | none | n/a | n/a |
-| `codedb_module_map` | DeepWiki module planning from dependency-connected file graph | `Assets/Scripts`, 20 modules, no file list | 1.679s | warm baseline; module graph extra not sampled | none | n/a | n/a |
-| `codedb_module_atlas` | Export module/file atlas JSON for the viewer skill | one-shot atlas export | 12.355s wall | 471.3 MB WS / 527.9 MB private | none | n/a | n/a |
-| `codedb_analyze` | Graph stats, top nodes, relation counts, suggested questions | graph analysis | 830.637ms first lazy graph build; about 36.8ms warm | warm baseline; graph extra not sampled | none | n/a | n/a |
-| `codedb_export` | Export graph as JSON, GraphML, or Cypher | limited JSON export after graph load | 10.313ms | warm baseline; output extra not sampled | none | n/a | n/a |
 
 ## Recommended Setup Flow
 

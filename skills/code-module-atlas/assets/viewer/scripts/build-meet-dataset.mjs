@@ -120,6 +120,59 @@ function buildFileEdges(points) {
   return edges.sort((left, right) => left.source.localeCompare(right.source) || left.target.localeCompare(right.target));
 }
 
+function buildDependencyRefMaps(points) {
+  const pointById = new Map(points.map((point) => [point.id, point]));
+  const incomingRefs = new Map();
+  const outgoingRefs = new Map();
+
+  for (const point of points) {
+    const sourceId = `file-${point.id}`;
+    const targets = (point.depOutIds ?? [])
+      .filter((targetId) => targetId !== point.id && pointById.has(targetId))
+      .sort((left, right) => {
+        const leftPoint = pointById.get(left);
+        const rightPoint = pointById.get(right);
+        const leftDegree = (leftPoint?.depIn ?? 0) + (leftPoint?.depOut ?? 0);
+        const rightDegree = (rightPoint?.depIn ?? 0) + (rightPoint?.depOut ?? 0);
+        return rightDegree - leftDegree || left - right;
+      });
+
+    outgoingRefs.set(sourceId, targets.map((targetId) => `file-${targetId}`));
+
+    for (const targetId of targets) {
+      const targetFileId = `file-${targetId}`;
+      const refs = incomingRefs.get(targetFileId) ?? [];
+      refs.push(sourceId);
+      incomingRefs.set(targetFileId, refs);
+    }
+  }
+
+  for (const [fileId, refs] of incomingRefs.entries()) {
+    refs.sort((left, right) => {
+      const leftPoint = pointById.get(Number(left.replace("file-", "")));
+      const rightPoint = pointById.get(Number(right.replace("file-", "")));
+      const leftDegree = (leftPoint?.depIn ?? 0) + (leftPoint?.depOut ?? 0);
+      const rightDegree = (rightPoint?.depIn ?? 0) + (rightPoint?.depOut ?? 0);
+      return rightDegree - leftDegree || left.localeCompare(right);
+    });
+    incomingRefs.set(fileId, refs);
+  }
+
+  return { incomingRefs, outgoingRefs };
+}
+
+function summarizeRefs(refIds, pointByFileId, limit = 6) {
+  return (refIds ?? []).slice(0, limit).map((fileId) => {
+    const point = pointByFileId.get(fileId);
+    const path = point?.path ?? fileId;
+    return {
+      id: fileId,
+      title: basename(path),
+      path
+    };
+  });
+}
+
 function summarizeFile(point, module) {
   const symbols = (point.symbols ?? []).slice(0, 8).join(", ");
   const metrics = `${point.languageLabel ?? point.language} file, ${point.lineCount} lines, ${point.symbols?.length ?? 0} symbols, ${point.depIn ?? 0} incoming deps, ${point.depOut ?? 0} outgoing deps`;
@@ -148,6 +201,8 @@ function main() {
   const edges = buildFileEdges(points);
   const incoming = new Map();
   const outgoing = new Map();
+  const pointByFileId = new Map(points.map((point) => [`file-${point.id}`, point]));
+  const dependencyRefs = buildDependencyRefMaps(points);
 
   for (const edge of edges) {
     outgoing.set(edge.source, (outgoing.get(edge.source) ?? 0) + 1);
@@ -169,9 +224,14 @@ function main() {
       language: point.language,
       languageLabel: point.languageLabel ?? point.language,
       lineCount: point.lineCount,
+      symbols: point.symbols ?? [],
       symbolCount: point.symbols?.length ?? 0,
-      inDegree: incoming.get(id) ?? 0,
-      outDegree: outgoing.get(id) ?? 0,
+      inDegree: point.depIn ?? incoming.get(id) ?? 0,
+      outDegree: point.depOut ?? outgoing.get(id) ?? 0,
+      visualInDegree: incoming.get(id) ?? 0,
+      visualOutDegree: outgoing.get(id) ?? 0,
+      incomingRefs: summarizeRefs(dependencyRefs.incomingRefs.get(id), pointByFileId),
+      outgoingRefs: summarizeRefs(dependencyRefs.outgoingRefs.get(id), pointByFileId),
       crawledAt: generatedAt,
       depth: 3,
       category: classify(module ?? { label: point.moduleLabel, terms: [], pathRoots: [{ path: point.path }] })

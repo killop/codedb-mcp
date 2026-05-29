@@ -2,13 +2,14 @@ use crate::types::{Chunk, Scope, Symbol};
 use regex::{Regex, RegexBuilder};
 use std::sync::OnceLock;
 
-const DESIRED_CHUNK_CHARS: usize = 1500;
+const DESIRED_CHUNK_CHARS: usize = 8192;
 
 fn line_comment_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^\s*(//|--|/\*|\*|\*/)").expect("valid comment regex"))
 }
 
+#[cfg(test)]
 pub fn chunk_source(
     content: &str,
     file_path: &str,
@@ -61,6 +62,60 @@ pub fn chunk_source(
                     content,
                 })
             }
+        })
+        .collect()
+}
+
+pub fn chunk_source_metadata(
+    content: &str,
+    file_path: &str,
+    language: &str,
+    symbols: &[Symbol],
+) -> Vec<Chunk> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::<(usize, usize)>::new();
+    if symbols.is_empty() {
+        ranges.extend(line_chunks(&lines, 1, lines.len()));
+    } else {
+        let mut cursor = 1usize;
+        for symbol in symbols {
+            if cursor < symbol.line_start {
+                ranges.extend(line_chunks(&lines, cursor, symbol.line_start - 1));
+            }
+            ranges.extend(line_chunks(
+                &lines,
+                symbol.line_start,
+                symbol.line_end.min(lines.len()),
+            ));
+            cursor = symbol.line_end.saturating_add(1);
+        }
+        if cursor <= lines.len() {
+            ranges.extend(line_chunks(&lines, cursor, lines.len()));
+        }
+    }
+
+    merge_adjacent_ranges(&lines, ranges)
+        .into_iter()
+        .filter(|(start, end)| {
+            lines[start - 1..*end]
+                .iter()
+                .any(|line| !line.trim().is_empty())
+        })
+        .map(|(start, end)| Chunk {
+            id: 0,
+            file_id: 0,
+            file_path: file_path.to_string(),
+            start_line: start,
+            end_line: end,
+            language: language.into(),
+            content: String::new(),
         })
         .collect()
 }

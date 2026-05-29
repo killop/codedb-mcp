@@ -287,6 +287,14 @@ impl WordIndex {
     }
 
     pub fn write_hits(&self, path: &Path) -> Result<()> {
+        if self.hits.is_empty()
+            && self
+                .hits_path
+                .as_ref()
+                .is_some_and(|current| current == path)
+        {
+            return Ok(());
+        }
         let file = File::create(path)
             .with_context(|| format!("failed to create word hits {}", path.display()))?;
         let mut writer = BufWriter::new(file);

@@ -29,7 +29,7 @@
 
 `codebase-mcp` turns a local repository into a persistent MCP code intelligence service. It keeps tree-sitter indexed source data, symbols, references, dependencies, graph metadata, lexical indexes, and vector search data under the target repo's `.codedb-mcp` directory.
 
-Warm MCP calls are designed to be millisecond-level inside a persistent server process. See [Benchmark Snapshot](#benchmark-snapshot), [MCP vs rg](#mcp-vs-rg), and [Warm Tool Validation](#warm-tool-validation) for measured latency and accuracy checks.
+Warm MCP calls are designed to be millisecond-level inside a persistent server process. See [Benchmark Snapshot](#benchmark-snapshot) and [MCP Tool Benchmark Matrix](#mcp-tool-benchmark-matrix) for measured latency, peak memory, and `rg` comparisons.
 
 ## Feature Overview
 
@@ -83,20 +83,20 @@ Benchmarks were rerun on 2026-05-28 on Windows. One-shot rows include process st
 Current index status with the Unity C# benchmark config:
 
 - Indexed files: 19,035.
-- Chunks: 129,858.
+- Chunks: 31,949.
 - Symbols: 277,213.
 - Graph: 19,941 nodes and 166,132 edges.
-- Vector search: lazy Model2Vec `minishlab/potion-code-16M` file embeddings with flat cosine scan.
+- Vector search: Model2Vec `minishlab/potion-code-16M` file embeddings are built lazily on first natural-language search and queried with flat cosine scan.
 - Storage: `u3dclient\.codedb-mcp`.
-- Cache v18 sidecars: compact `index.bin`, lazy `bm25.postings`, lazy `word_index.bin`/`word_hits.bin`, lazy `callers.bin`, lazy `deps.bin`, lazy `embeddings.bin`, and binary source fingerprints.
-- Peak memory below is sampled Working Set / Private Bytes for short one-shot child processes. The cold rebuild row was not rerun in the short memory pass.
+- Cache v20 sidecars: compact `index.bin`, spilled `bm25.postings`, lazy `word_index.bin`/`word_hits.bin`, lazy `callers.bin`, lazy `deps.bin`, optional legacy `embeddings.bin`, and binary source fingerprints.
+- Peak memory below is sampled Working Set / Private Bytes for child processes. The cold rebuild row was measured with memory sampling enabled, so its wall time is not directly comparable to the faster no-sampling rebuild pass.
 
 Index timings on this machine:
 
 | Scenario | Cache | Internal total | Peak memory | Notes |
 |---|---|---:|---:|---|
-| Cache v18 rebuild in project storage | miss | 36.820s wall | not rerun | scan, tree-sitter declaration parse, embeddings, BM25, compact sidecar cache save |
-| Cache-hit index open | hit | 0.768s wall | 151.1 MB WS / 154.7 MB private | includes process startup, source fingerprint validation, and cache load |
+| Cache v20 rebuild in project storage | miss | 26.335s internal / 26.621s wall | 256.4 MB WS / 250.2 MB private | memory-sampled cold rebuild; tree-sitter declaration parse, source-on-demand dependencies, spill-to-disk BM25, lazy embeddings, compact sidecar cache save |
+| Cache-hit index open | hit | 0.873s internal / 1.132s wall | 134.9 MB WS / 136.0 MB private | includes process startup, source fingerprint validation, and cache load |
 | One-shot `codedb_status` CLI | hit | 0.252s wall | 14.1 MB WS / 7.9 MB private | manifest/fingerprint fast path; no full index deserialize |
 | One-shot `codedb_find PoolManager` | hit | 0.283s wall | 14.4 MB WS / 8.2 MB private | manifest/fingerprint fast path over cached file list |
 | One-shot symbol `codedb_search PoolManager` | hit | 0.739s wall | 151.5 MB WS / 154.8 MB private | symbol-shaped queries use BM25 plus exact symbol boosts and do not load embeddings |
@@ -117,105 +117,43 @@ Java smoke benchmark on `gameserver`:
 Multi-language smoke coverage includes C#, Java, Rust, Python, Lua, TypeScript, C, and C++ parser paths: 8 files, 8 chunks, 14 symbols, 0.219s.
 Rust smoke check on this repository: 29 indexed files, 1,752 chunks, 1,901 symbols; `codedb_outline`, `codedb_search`, and `codedb_deps` all returned Rust results.
 
-Warm persistent MCP tool timings below do not include server startup or index load.
+Warm persistent MCP tool timings below do not include server startup or index load unless the scenario explicitly says one-shot or cold. The `rg` baseline used `--no-ignore` because this Unity project intentionally includes `Library/PackageCache`. `rg` remains the better tool for ad hoc raw filesystem grep across arbitrary file types; the MCP tools are optimized for repeated code-aware work inside a configured source corpus.
 
-## MCP vs rg
+In the peak-memory column, `warm baseline` means the cache-hit process baseline measured above: 134.9 MB Working Set / 136.0 MB Private Bytes. Rows marked extra not sampled have measured latency, but no separate per-tool peak-memory run yet.
 
-For exact text and regex search, `codedb_search regex=true` and `rg` can both answer the query. The `rg` baseline used `--no-ignore` because this Unity project intentionally includes `Library/PackageCache`.
+## MCP Tool Benchmark Matrix
 
-Cache v18 no longer keeps full file bodies resident and splits heavy indexes into lazy sidecars. Broad unscoped regex scans therefore read source files on demand and can be slower than `rg`; path-scoped regex, file glob, symbol search, callers, deps, and outlines are the intended fast MCP path.
-
-| Scenario | MCP tool | MCP hits | MCP avg / p95 | rg baseline | rg hits | rg avg / p95 |
-|---|---|---:|---:|---|---:|---:|
-| Exact `PoolManager` | `codedb_search regex=true` | 154 | 2.625s / 2.733s | `rg --no-ignore -n -i -F` | 154 | 1.595s / 1.754s |
-| Exact `Joystick` | `codedb_search regex=true` | 938 | 2.577s / 2.590s | `rg --no-ignore -n -i -F` | 938 | 1.461s / 1.484s |
-| Exact `NetworkListenerManager` | `codedb_search regex=true` | 14 | 2.482s / 2.494s | `rg --no-ignore -n -i -F` | 14 | 1.570s / 1.679s |
-| Exact `GameObjectPoolMgr` | `codedb_search regex=true` | 8 | 2.556s / 2.621s | `rg --no-ignore -n -i -F` | 8 | 1.491s / 1.517s |
-| Exact `AllianceManager` | `codedb_search regex=true` | 16 | 2.559s / 2.634s | `rg --no-ignore -n -i -F` | 16 | 1.669s / 1.762s |
-| Scoped `Joystick` in Joystick Pack | `codedb_search regex=true path_glob=...` | 46 | 7.342ms / 7.870ms | scoped `rg --no-ignore -n -i -F` | 46 | 0.133s / 0.203s |
-| Scoped `NetworkListenerManager` in UnityNativeTools | `codedb_search regex=true path_glob=...` | 14 | 7.120ms / 7.416ms | scoped `rg --no-ignore -n -i -F` | 14 | 0.047s / 0.050s |
-| Alliance UI ranking/donation/gift regex | `codedb_search regex=true path_glob=...` | 176 | 14.001ms / 14.577ms | scoped `rg --no-ignore -n -i` | 176 | 0.097s / 0.184s |
-| Alliance UI `.cs` file glob | `codedb_glob` | 52 | 4.231ms / 4.254ms | `rg --files --no-ignore -g` | 52 | 0.045s / 0.051s |
-
-Feature comparison:
-
-| Capability | codedb-mcp | rg |
-|---|---|---|
-| Raw exact grep | yes, indexed via `codedb_search regex=true` | yes |
-| Regex line search | yes, indexed source corpus | yes, direct filesystem scan |
-| Scoped file/path filtering | yes, `path_glob`, `codedb_find`, `codedb_query` | yes, `-g`, shell paths |
-| Fuzzy file lookup | yes, `codedb_find` | no direct fuzzy ranking |
-| Symbol/name search | yes, BM25 plus exact symbol boosts without loading embeddings | no |
-| Natural-language vector search | yes, BM25 plus lazy Model2Vec flat cosine vectors | no |
-| Symbol outline | yes, `codedb_outline` from precomputed tree-sitter symbols | no |
-| Definition-anchored callers | yes, `codedb_callers` | no semantic anchor |
-| File dependency graph | yes, `codedb_deps` | no |
-| Code graph export/analysis | yes, `codedb_graph`, `codedb_analyze`, `codedb_export` | no |
-| Batch calls in one MCP round trip | yes, batch params and `codedb_bundle` | no MCP batching |
-| Arbitrary non-indexed binary/text corpus | no, source extensions from config | yes |
-
-MCP-only measured features:
-
-| Scenario | MCP tool | Results | Time | rg equivalent |
-|---|---|---:|---:|---|
-| Symbol-aware search for `PoolManager` related chunks | `codedb_search` | 20 | 3.898ms | none |
-| Symbol-aware search for `Joystick` related chunks | `codedb_search` | 20 | 4.076ms | none |
-| Symbol-aware search for `NetworkListenerManager` related chunks | `codedb_search` | 20 | 3.908ms | none |
-| Business semantic search: `alliance member ranking donation gift` under `Assets/Scripts` | `codedb_search path_glob=...` | 20 | 49.068ms | none |
-| Definition-anchored references for `PoolManager` at `PoolManager.cs:26` | `codedb_callers` | 7 | 3.422ms | none |
-| Definition-anchored references for `Joystick` at `Joystick.cs:8` | `codedb_callers` | 7 | 10.854ms | none |
-
-`rg` remains the better tool for ad hoc raw filesystem grep across arbitrary file types. `codedb-mcp` is for repeated code-aware work inside a configured source corpus.
-
-## Warm Tool Validation
-
-These calls were measured through `codedb_bundle timing=true` in one already-loaded process on `u3dclient`; exact regex searches were checked against `rg --no-ignore` on the same scoped corpus.
-
-| Scenario | Tool | Accuracy Check | avg | p95 |
-|---|---|---:|---:|---:|
-| Scoped exact `PoolManager` | `codedb_search regex=true` | MCP 52 = rg 52 | 6.663ms | 7.053ms |
-| Scoped exact `Joystick` | `codedb_search regex=true` | MCP 46 = rg 46 | 7.325ms | 7.784ms |
-| Scoped exact `NetworkListenerManager` | `codedb_search regex=true` | MCP 14 = rg 14 | 7.348ms | 8.120ms |
-| Symbol-aware `PoolManager` | `codedb_search` | 20 results | 3.898ms | 4.354ms |
-| Symbol-aware `Joystick` | `codedb_search` | 20 results | 4.076ms | 4.264ms |
-| Symbol-aware `NetworkListenerManager` | `codedb_search` | 20 results | 3.908ms | 4.458ms |
-| Business phrase `alliance member ranking donation gift` | `codedb_search` | 20 Alliance-related results | 49.068ms | 51.448ms |
-| Definition refs for `PoolManager` | `codedb_callers` | 7 refs | 3.422ms | 3.619ms |
-| Definition refs for `Joystick` | `codedb_callers` | 7 refs | 10.854ms | 11.426ms |
-| `GameObjectPoolMgr.cs depends_on` | `codedb_deps` | 7 files, expected deps present | 0.098ms | 0.117ms |
-| `NetworkListenerManager.cs imported_by` | `codedb_deps` | 3 files, expected importers present | 0.076ms | 0.087ms |
-| `NetworkListenerManager.cs transitive imported_by` | `codedb_deps` | 62 files | 0.149ms | 0.177ms |
-| `NetworkListenerManager.cs` path lookup | `codedb_find` | top1 correct | 20.230ms | 20.655ms |
-| `Joystick Pack Base Joystick` path lookup | `codedb_find` | top1 correct | 18.019ms | 18.311ms |
-| `ResTypDef` typo-ish lookup | `codedb_find` | `ResourceTypeDefine.cs` rank 3 | 19.024ms | 19.347ms |
-| `find NetworkListenerManager -> outline` | `codedb_query` | expected outline present | 21.085ms | 21.874ms |
-| `filter Joystick Pack -> limit 3 -> outline` | `codedb_query` | expected outlines present | 6.786ms | 7.201ms |
-| `filter UnityNativeTools -> search NetworkListenerManager` | `codedb_query` | expected results present | 9.366ms | 9.808ms |
-| `find GameObjectPoolMgr -> search PoolManager` | `codedb_query` | 17 results | 25.139ms | 26.146ms |
-
-Additional tool timings:
-
-| Tool / Scenario | Result | Time |
-|---|---:|---:|
-| `codedb_deps` `GameObjectPoolMgr.cs depends_on` | 7 files | 0.098ms |
-| `codedb_deps` `NetworkListenerManager.cs imported_by` | 3 files | 0.076ms warm, 132.938ms first reverse-deps lazy load |
-| `codedb_deps` `AndroidPlatform.cs depends_on` | 3 files | 0.069ms |
-| `codedb_outline` `NetworkListenerManager.cs` | 2 symbols | 0.069ms |
-| `codedb_outline` `Joystick.cs` | 19 symbols | 0.069ms |
-| `codedb_outline` `PoolManager.cs` | 36 symbols | 0.074ms |
-| `codedb_outline` `NEON_AArch64.cs` | 1,116 symbols | 0.324ms |
-| 100 `codedb_outline compact=true` calls | p95 | 0.118ms |
-| `codedb_analyze` on `u3dclient` | graph analysis | 830.637ms first lazy graph build, then about 36.8ms warm |
-
-`codedb_bundle` runs up to 100 inner operations in one MCP request. Requests above 100 execute the first 100 and include a truncation notice.
-
-| Scenario | Inner ops requested | Repeats | Inner ops executed | Time |
-|---|---:|---:|---:|---:|
-| Fast mixed metadata/deps/outline/read bundle | 100 | 1 | 100 | 57.725ms inner sum |
-| Overflow bundle | 120 | 1 | 100 + truncation notice | 58.606ms inner sum |
-| Repeated fast bundle | 100 | 10 | 1,000 total | avg 61.005ms, p95 94.948ms inner sum |
-| Mixed search/callers/deps/outline bundle | 100 | 1 | 100 | 326.347ms inner sum |
-| Heavy regex search bundle | 100 | 1 | 100 | 142.002s inner sum |
+| Tool | What it does | Benchmark scenario | MCP speed | Peak memory | rg equivalent | rg speed | MCP vs rg |
+|---|---|---|---:|---:|---|---:|---:|
+| `codedb_index` | Build/rebuild the configured local index | cold `u3dclient` v20 rebuild | 26.335s internal / 26.621s wall | 256.4 MB WS / 250.2 MB private | none | n/a | n/a |
+| `codedb_status` | Index health, counts, scan state, model path | one-shot cache-hit CLI | 0.252s wall | 14.1 MB WS / 7.9 MB private | none | n/a | n/a |
+| `codedb_tree` | Whole indexed tree with language, line, and symbol counts | warm tree summary | 11.891ms | warm baseline; extra not sampled | partial `rg --files`, no symbol/line metadata | n/a | n/a |
+| `codedb_outline` | Precomputed tree-sitter symbol outline for one file | `PoolManager.cs`, 36 symbols | 0.074ms; 100-call p95 0.118ms | warm baseline; extra not sampled | none | n/a | n/a |
+| `codedb_symbol` | Find definitions by symbol name | `PoolManager` definitions | 2.106ms | warm baseline; extra not sampled | partial regex only, no parser-defined symbol model | n/a | n/a |
+| `codedb_search` | Hybrid code search; regex mode; batch queries | scoped regex `Joystick`; symbol/NL examples | 7.342ms scoped regex; 3.9-49.1ms symbol/NL; 2.48-2.63s broad regex | 151.5-152.1 MB one-shot lexical search | scoped and broad raw grep | 0.133s scoped; 1.46-1.67s broad | scoped MCP 18.1x faster; broad MCP 1.5-1.8x slower |
+| `codedb_word` | Exact identifier inverted-index lookup | `PoolManager` identifier hits | 94.403ms first lazy word-index load | warm baseline; word sidecar extra not sampled | partial `rg` word grep, no indexed identifier sidecar | n/a | n/a |
+| `codedb_callers` | Definition-anchored references with C#/Java type filtering; batch targets | `PoolManager.cs:26` refs | 3.422ms avg / 3.619ms p95 | 14.2 MB WS / 7.8 MB private one-shot sidecar hit | no semantic anchor | n/a | n/a |
+| `codedb_hot` | Most recently modified indexed files | top 5 hot files | 7.069ms | warm baseline; extra not sampled | none | n/a | n/a |
+| `codedb_deps` | File dependencies, reverse dependencies, transitive traversal | `GameObjectPoolMgr.cs depends_on` | 0.098ms avg / 0.117ms p95; first reverse-deps load 132.938ms | 34.8 MB WS / 28.3 MB private one-shot | none | n/a | n/a |
+| `codedb_read` | Read an indexed file or line range with hash support | `PoolManager.cs` lines 1-40 | 0.757ms | warm baseline; extra not sampled | partial file print, no indexed hash/path contract | n/a | n/a |
+| `codedb_edit` | Read-only compatibility stub | edit attempt returns error | immediate stub | not sampled | none | n/a | n/a |
+| `codedb_changes` | Files changed since a sequence number | `since=0` change listing | 10.818ms | warm baseline; extra not sampled | none | n/a | n/a |
+| `codedb_snapshot` | JSON snapshot of files, symbols, and dependency graph | full snapshot, output discarded | 1.303s | warm baseline; snapshot output extra not sampled | none | n/a | n/a |
+| `codedb_bundle` | Up to 100 `codedb_*` calls in one MCP request | 100 fast mixed metadata/deps/outline/read ops | 57.725ms inner sum; 61.005ms avg repeated | 154.3 MB WS / 156.9 MB private for one-shot 20-search bundle | no MCP batching | n/a | n/a |
+| `codedb_remote` | Remote-query compatibility stub | remote attempt returns stub response | immediate stub | not sampled | none | n/a | n/a |
+| `codedb_projects` | List projects loaded in the current server process | warm project list | 0.059ms | warm baseline; extra not sampled | none | n/a | n/a |
+| `codedb_find` | Fuzzy file name/path lookup | `NetworkListenerManager`, `Joystick`, typo `ResTypDef` | 18.019-20.230ms avg | 14.4 MB WS / 8.2 MB private one-shot | no fuzzy ranking | n/a | n/a |
+| `codedb_query` | Small pipeline: find, search, filter, limit, outline | four tested pipelines | 6.786-25.139ms avg | warm baseline; extra not sampled | no equivalent single tool | n/a | n/a |
+| `codedb_glob` | Glob match against indexed paths | Alliance UI `.cs` glob, 52 hits | 4.231ms avg / 4.254ms p95 | warm baseline; extra not sampled | `rg --files --no-ignore -g` | 0.045s avg / 0.051s p95 | MCP 10.6x faster |
+| `codedb_ls` | Immediate children of an indexed directory | root directory listing | 4.027ms | warm baseline; extra not sampled | partial `rg --files`, no directory object view | n/a | n/a |
+| `codedb_graph` | Graphify-style graph summary or limited export | first lazy graph summary | 943.431ms | warm baseline; graph extra not sampled | none | n/a | n/a |
+| `codedb_explain` | Explain graph node matches and incoming/outgoing edges | first graph-backed `PoolManager` explain | 845.369ms | warm baseline; graph extra not sampled | none | n/a | n/a |
+| `codedb_path` | Shortest graph path between files/symbols/nodes | `PoolManager` to `GameObjectPoolMgr` after graph load | 13.073ms | warm baseline; extra not sampled | none | n/a | n/a |
+| `codedb_communities` | Lazy Louvain communities and subcommunities | top 10 communities after graph load | 265.593ms | warm baseline; Louvain extra not sampled | none | n/a | n/a |
+| `codedb_module_map` | DeepWiki module planning from dependency-connected file graph | `Assets/Scripts`, 20 modules, no file list | 1.679s | warm baseline; module graph extra not sampled | none | n/a | n/a |
+| `codedb_module_atlas` | Export module/file atlas JSON for the viewer skill | one-shot atlas export | 12.355s wall | 471.3 MB WS / 527.9 MB private | none | n/a | n/a |
+| `codedb_analyze` | Graph stats, top nodes, relation counts, suggested questions | graph analysis | 830.637ms first lazy graph build; about 36.8ms warm | warm baseline; graph extra not sampled | none | n/a | n/a |
+| `codedb_export` | Export graph as JSON, GraphML, or Cypher | limited JSON export after graph load | 10.313ms | warm baseline; output extra not sampled | none | n/a | n/a |
 
 ## Recommended Setup Flow
 
@@ -242,7 +180,7 @@ This project intentionally keeps installation explicit: setup prepares local pro
 - Indexes configured source languages through one explicit config file: `<repo-root>/.codedb-mcp/codedb-mcp.toml`.
 - Stores generated data inside the target repo under `.codedb-mcp`. Delete that directory to remove local cache and generated wiki/index data.
 - Uses a unified tree-sitter parser layer, not Roslyn/JDT. C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, and C++ all emit the same `FileEntry`/`Symbol` model. C#/Java typed callers and dependencies remain the strongest path because their namespace/package import rules are implemented on top of that shared AST output.
-- Uses Minish ecosystem pieces: `model2vec-rs` with explicit-path `minishlab/potion-code-16M`, file-level semantic units, BM25 lexical ranking, exact identifier indexes, and lazy flat-cosine vectors for natural-language search.
+- Uses Minish ecosystem pieces: `model2vec-rs` with explicit-path `minishlab/potion-code-16M`, file-level semantic units, BM25 lexical ranking, exact identifier indexes, and on-demand flat-cosine vectors for natural-language search.
 - Builds a graphify-style code graph, computes Louvain communities lazily for `codedb_communities`, and exposes Rust-native `codedb_module_map`/`codedb_module_atlas` outputs from a dependency-connected file graph with label propagation, dependency cohesion, cross-folder evidence, semantic-neighbor probes, key symbols, and c-TF-IDF-like labels.
 - Watches configured source extensions in MCP mode and rebuilds after a debounce.
 
@@ -253,8 +191,8 @@ This project intentionally keeps installation explicit: setup prepares local pro
 3. **Scanner**: walks the repo with explicit extensions, max file size, project `.gitignore` behavior, skip dirs, and include paths. Nested Git worktrees/submodules under the target root are scanned as normal source directories. Unity `Library/PackageCache` can be included while the rest of `Library` is skipped.
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, Lua `require()` imports, and graph nodes, but not Roslyn/JDT-level semantic binding.
-6. **Search indexes**: builds chunks, exact identifier hits, symbol-definition chunk hits, dependency references, BM25 lexical search, and Model2Vec file embeddings. Symbol-shaped queries stay lexical/symbol-aware; natural-language queries lazy-load embeddings and run flat cosine vector search.
-7. **Memory-shaped cache**: cache v18 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, BM25 postings, word-index hits, caller results, embeddings, forward/reverse dependencies, graph objects, and Louvain results are no longer all resident by default. Tools read exact lines, postings, word hits, caller sidecars, embeddings, dependencies, or graph data on demand.
+6. **Search indexes**: builds chunk metadata, symbol-definition chunk hits, dependency references, and spill-to-disk BM25 lexical search during cold indexing. Exact identifier hits and Model2Vec file embeddings are generated lazily when callers or natural-language search actually need them.
+7. **Memory-shaped cache**: cache v20 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, BM25 postings, word-index hits, caller results, embeddings, forward/reverse dependencies, graph objects, and Louvain results are no longer all resident by default. Tools read exact lines, postings, word hits, caller sidecars, embeddings, dependencies, or graph data on demand.
 8. **Graph layer**: builds a graphify-style code graph lazily. Small repos keep file, namespace/package, symbol, dependency, and reference edges; large repos keep graph construction behind graph/community/module tools while symbol data stays in outline/search/callers indexes. Louvain communities and subcommunities are computed lazily on first request and cached under `.codedb-mcp`.
 9. **Module atlas layer**: `codedb_module_map` and `codedb_module_atlas` run in Rust. They first split files by dependency-connected components, then do dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary clustering basis. `codedb_module_atlas` exports Embedding Atlas-ready JSON.
 10. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.

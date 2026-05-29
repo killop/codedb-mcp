@@ -38,6 +38,7 @@ pub fn parse_imports(language: &str, content: &str) -> Vec<String> {
     analyze_source(language, content).imports
 }
 
+#[cfg(test)]
 pub fn chunk_source(
     language: &str,
     content: &str,
@@ -45,6 +46,15 @@ pub fn chunk_source(
     symbols: &[Symbol],
 ) -> Vec<Chunk> {
     crate::source::chunk_source(content, file_path, language, symbols)
+}
+
+pub fn chunk_source_metadata(
+    language: &str,
+    content: &str,
+    file_path: &str,
+    symbols: &[Symbol],
+) -> Vec<Chunk> {
+    crate::source::chunk_source_metadata(content, file_path, language, symbols)
 }
 
 pub fn scope_for_line(symbols: &[Symbol], line: usize) -> Option<Scope> {

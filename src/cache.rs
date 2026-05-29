@@ -9,7 +9,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 18;
+const CACHE_VERSION: u32 = 20;
 const MANIFEST_FILE: &str = "manifest.json";
 const FINGERPRINTS_FILE: &str = "fingerprints.bin";
 const PAYLOAD_FILE: &str = "index.bin";
@@ -216,17 +216,11 @@ impl ProjectCache {
         let manifest_path = self.dir.join(MANIFEST_FILE);
         let fingerprints_path = self.dir.join(FINGERPRINTS_FILE);
         let payload_path = self.dir.join(PAYLOAD_FILE);
-        let embeddings_path = self.dir.join(EMBEDDINGS_FILE);
         let deps_path = self.dir.join(DEPS_FILE);
-        let word_hits_path = self.dir.join(WORD_HITS_FILE);
-        let word_index_path = self.dir.join(WORD_INDEX_FILE);
         if !manifest_path.is_file()
             || !fingerprints_path.is_file()
             || !payload_path.is_file()
-            || !embeddings_path.is_file()
             || !deps_path.is_file()
-            || !word_hits_path.is_file()
-            || !word_index_path.is_file()
         {
             return Ok(None);
         }
@@ -249,7 +243,6 @@ impl ProjectCache {
             || payload.semantic_units.len() != manifest.semantic_unit_count
             || payload.embedding_dims != manifest.embedding_dims
             || payload.vector_count != manifest.vector_count
-            || payload.semantic_units.len() != payload.vector_count
         {
             return Ok(None);
         }
@@ -397,9 +390,6 @@ impl ProjectCache {
             FINGERPRINTS_FILE,
             PAYLOAD_FILE,
             BM25_POSTINGS_FILE,
-            WORD_INDEX_FILE,
-            WORD_HITS_FILE,
-            EMBEDDINGS_FILE,
             DEPS_FILE,
         ]
         .into_iter()
@@ -413,11 +403,10 @@ impl ProjectCache {
         files: &[FileEntry],
         chunks: &[Chunk],
         semantic_units: &[SemanticUnit],
-        embeddings: &[Vec<f32>],
         bm25: &Bm25Index,
-        word_index: &WordIndex,
-        deps_forward: &std::collections::HashMap<String, Vec<String>>,
         graph_stats: LightweightGraphStats,
+        embedding_dims: usize,
+        vector_count: usize,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -438,19 +427,15 @@ impl ProjectCache {
             created_unix_ms: now_ms(),
             config_hash: config_hash(options)?,
             embedding_model: options.embedding_model.clone(),
-            embedding_dims: embedding_dims(embeddings),
+            embedding_dims,
             file_count: files.len(),
             chunk_count: chunks.len(),
             semantic_unit_count: semantic_units.len(),
-            vector_count: embeddings.len(),
+            vector_count,
             graph_stats,
         };
         write_bin_atomic(&self.dir.join(FINGERPRINTS_FILE), &cache_fingerprints)?;
         bm25.write_postings(&self.dir.join(BM25_POSTINGS_FILE))?;
-        write_bin_atomic(&self.dir.join(WORD_INDEX_FILE), word_index)?;
-        word_index.write_hits(&self.dir.join(WORD_HITS_FILE))?;
-        write_bin_atomic(&self.dir.join(EMBEDDINGS_FILE), embeddings)?;
-        write_bin_atomic(&self.dir.join(DEPS_FILE), deps_forward)?;
         let payload = CachedIndexPayloadRef {
             files: files
                 .iter()
@@ -458,14 +443,38 @@ impl ProjectCache {
                 .collect(),
             chunks,
             semantic_units,
-            embedding_dims: embedding_dims(embeddings),
-            vector_count: embeddings.len(),
+            embedding_dims,
+            vector_count,
             graph_stats,
             bm25,
         };
         write_bin_atomic(&self.dir.join(PAYLOAD_FILE), &payload)?;
         write_json_atomic(&self.dir.join(MANIFEST_FILE), &manifest)?;
         Ok(())
+    }
+
+    pub fn save_deps_forward(
+        &self,
+        deps_forward: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create cache dir {}", self.dir.display()))?;
+        write_bin_atomic(&self.dir.join(DEPS_FILE), deps_forward)
+    }
+
+    pub fn save_word_index(&self, word_index: &mut WordIndex) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create cache dir {}", self.dir.display()))?;
+        let hits_path = self.word_hits_path();
+        word_index.write_hits(&hits_path)?;
+        word_index.use_hits_file(hits_path);
+        write_bin_atomic(&self.word_index_path(), word_index)
     }
 }
 
@@ -481,13 +490,6 @@ pub fn read_word_index(path: &Path, hits_path: &Path) -> Result<WordIndex> {
     let mut index: WordIndex = read_bin(path)?;
     index.use_hits_file(hits_path.to_path_buf());
     Ok(index)
-}
-
-fn embedding_dims(embeddings: &[Vec<f32>]) -> usize {
-    embeddings
-        .iter()
-        .find(|vector| !vector.is_empty())
-        .map_or(0, Vec::len)
 }
 
 impl SourceFingerprint {

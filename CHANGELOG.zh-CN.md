@@ -16,9 +16,10 @@
 - 将常驻 Vicinity HNSW 向量索引替换为自然语言搜索时懒加载的 flat cosine 文件向量扫描，移除 HNSW 依赖和对应图内存。
 - 压缩重复内存元数据：symbol kind 和源码 language 改为小枚举；chunk 文件路径改为 file id，避免每个 chunk 重复保存路径字符串。
 - 将正向依赖图移动到懒加载的 `deps.bin` sidecar，search/status/callers 不再常驻依赖图；dependency 和 graph/module 工具按需加载。
-- 将 cache v18 拆成小 JSON manifest、二进制源码 fingerprint、紧凑 hot `index.bin`、懒加载 BM25 postings、懒加载 word-index sidecar、懒加载依赖和懒加载 embedding。单次 `codedb_status`、`codedb_find`、`codedb_deps` 现在可以直接从 sidecar 返回，不反序列化完整 index。
+- 将 cache v20 拆成小 JSON manifest、二进制源码 fingerprint、紧凑 hot `index.bin`、spill-to-disk BM25 postings、懒加载 word-index sidecar、懒加载依赖和按需生成 embedding。单次 `codedb_status`、`codedb_find`、`codedb_deps` 现在可以直接从 sidecar 返回，不反序列化完整 index。
 - 为业务短语搜索增加 BM25 候选足够时的 fast path，常见多词 query 可直接返回 lexical 结果而不加载 Model2Vec；同时在格式化 search preview 时复用同一文件内容读取。
 - 为 definition-anchored `codedb_callers` 增加懒生成的 `callers.bin` sidecar。未缓存 target 第一次仍走完整 caller 路径并写入 sidecar；重复 one-shot 查询可直接从 sidecar 返回，不加载完整 index。
+- 将 cold index 重构为 cache v20：每个文件 tree-sitter 解析并生成 chunk 元数据后立即释放源码正文；依赖和 BM25 按需重读源码；BM25 构建将 doc-term 记录 spill 到磁盘；Model2Vec embeddings 改为懒生成；cache save 前不再 clone 第二份 file/symbol 元数据。
 
 ### 修复
 
@@ -27,10 +28,12 @@
 
 ### Benchmark 与验证
 
-- cache v18 后重新测量 `u3dclient`：19,035 个 indexed files、129,858 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
+- cache v20 后重新测量 `u3dclient`：19,035 个 indexed files、31,949 个 chunks、277,213 个 symbols，graph 估算为 19,941 个 nodes / 166,132 条 edges，并只在 graph/module 工具需要时构建。
+- 对 `u3dclient` 重新执行 cache v20 冷重建峰值内存采样：26.335s internal / 26.621s wall、256.4 MB working set、250.2 MB private bytes。
+- 重新测量 cache-hit index open：0.873s internal / 1.132s wall、134.9 MB working set、136.0 MB private bytes。
 - 重新测量 `u3dclient` fast one-shot wall time 和峰值内存：`codedb_status` 0.252s、14.1 MB WS / 7.9 MB private，`codedb_find PoolManager` 0.283s、14.4 MB WS / 8.2 MB private，`codedb_deps PoolManager.cs` 0.303s、34.8 MB WS / 28.3 MB private，`codedb_search PoolManager` 0.739s、151.5 MB WS / 154.8 MB private，`codedb_callers PoolManager` sidecar hit 0.243s、14.2 MB WS / 7.8 MB private。
 - 修正 `gameserver` 显式模型路径后重新测量 Java benchmark：6,940 个 files、55,057 个 chunks、245,238 个 symbols，重建 10.477s，cache hit 重新打开 1.027s。
-- 更新 README 里的 `rg` 对比：cache v18 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
+- 更新 README 里的 `rg` 对比：cache v20 为降低内存不再常驻完整文件正文，所以未限定范围的大 regex 会按需读源码，可能比 `rg` 慢；path-scoped regex、符号搜索、引用、依赖、outline 和 bundle 仍保持低延迟。
 - 验证移除常驻完整文件源码正文后的按需读文件工具：`codedb_search PoolManager`、基于定义锚点的 `codedb_callers PoolManager`、`codedb_read PoolManager.cs`。
 
 ## Unreleased - 2026-05-27

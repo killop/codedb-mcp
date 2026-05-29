@@ -16,9 +16,10 @@
 - Replaced the resident Vicinity HNSW vector index with a lazy flat-cosine file-vector scan for natural-language search, removing the HNSW dependency and its graph memory.
 - Compacted repeated in-memory metadata by storing symbol kinds and source languages as small enums and storing chunk file paths as file ids instead of duplicating path strings per chunk.
 - Moved forward dependencies into a lazy `deps.bin` sidecar so search/status/callers do not keep the dependency graph resident; dependency and graph/module tools load it on demand.
-- Split cache v18 into a small JSON manifest plus binary source fingerprints, a compact hot `index.bin`, lazy BM25 postings, lazy word-index sidecars, lazy dependencies, and lazy embeddings. One-shot `codedb_status`, `codedb_find`, and `codedb_deps` can now answer from sidecars without deserializing the full index.
+- Split cache v20 into a small JSON manifest plus binary source fingerprints, a compact hot `index.bin`, spilled BM25 postings, lazy word-index sidecars, lazy dependencies, and on-demand embeddings. One-shot `codedb_status`, `codedb_find`, and `codedb_deps` can now answer from sidecars without deserializing the full index.
 - Added a BM25-enough fast path for business phrase searches so common multi-token queries can return lexical results without loading Model2Vec, and reused file-content reads while formatting search previews.
 - Added a lazy `callers.bin` sidecar for definition-anchored `codedb_callers` results. The first uncached target still uses the full caller path and writes the sidecar; repeated one-shot lookups can return directly from the sidecar without loading the full index.
+- Reworked cold indexing as cache v20: per-file source bodies are dropped immediately after tree-sitter parsing and chunk metadata generation, dependencies and BM25 reread source on demand, BM25 construction spills doc-term records to disk, Model2Vec embeddings are generated lazily, and cold indexing no longer clones file/symbol metadata into a second map before cache save.
 
 ### Fixed
 
@@ -27,10 +28,12 @@
 
 ### Benchmark And Validation
 
-- Re-measured `u3dclient` after cache v18: 19,035 indexed files, 129,858 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
+- Re-measured `u3dclient` after cache v20: 19,035 indexed files, 31,949 chunks, 277,213 symbols, and an estimated 19,941-node / 166,132-edge graph that is built lazily for graph/module tools.
+- Re-ran the cache v20 cold rebuild with peak-memory sampling on `u3dclient`: 26.335s internal / 26.621s wall, 256.4 MB working set, and 250.2 MB private bytes.
+- Re-ran cache-hit index open after cache v20: 0.873s internal / 1.132s wall, 134.9 MB working set, and 136.0 MB private bytes.
 - Re-ran fast one-shot wall-time and peak-memory checks on `u3dclient`: `codedb_status` 0.252s at 14.1 MB WS / 7.9 MB private, `codedb_find PoolManager` 0.283s at 14.4 MB WS / 8.2 MB private, `codedb_deps PoolManager.cs` 0.303s at 34.8 MB WS / 28.3 MB private, `codedb_search PoolManager` 0.739s at 151.5 MB WS / 154.8 MB private, and `codedb_callers PoolManager` sidecar hit 0.243s at 14.2 MB WS / 7.8 MB private.
 - Re-ran the `gameserver` Java benchmark after fixing its explicit model path: 6,940 files, 55,057 chunks, and 245,238 symbols rebuild in 10.477s, then reopen from cache in 1.027s.
-- Updated the README `rg` comparison to reflect the cache v18 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
+- Updated the README `rg` comparison to reflect the cache v20 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
 - Verified source-on-demand tools after removing resident full-file bodies: `codedb_search PoolManager`, definition-anchored `codedb_callers PoolManager`, and `codedb_read PoolManager.cs`.
 
 ## Unreleased - 2026-05-27

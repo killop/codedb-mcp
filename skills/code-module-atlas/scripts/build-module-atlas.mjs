@@ -8,6 +8,7 @@ const skillRoot = dirname(here);
 const repoRoot = resolve(skillRoot, "..", "..");
 const viewerRoot = join(skillRoot, "assets", "viewer");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const nodeCommand = process.execPath;
 
 function usage() {
   console.log(`Usage:
@@ -17,9 +18,10 @@ Options:
   --config <path>       Explicit codedb-mcp TOML config. Defaults to <repo-root>/.codedb-mcp/codedb-mcp.toml
   --codedb-exe <path>   Explicit codebase-mcp executable. Defaults to sibling skills/codedb-mcp/assets/codebase-mcp.exe
   --output <path>       codedb_module_atlas output path relative to repo root. Defaults to .codedb-mcp/module-atlas-data.json
-  --limit <n>           Maximum modules requested from codedb_module_atlas. Defaults to 2000
-  --min-files <n>       Minimum files per module. Defaults to 2
+  --limit <n>           Maximum modules requested from codedb_module_atlas. Defaults to 5000
+  --min-files <n>       Minimum dependency-module size. Defaults to 2; smaller components are folder-grouped so every indexed file remains a viewer node.
   --serve               Start the Vite viewer after data generation.
+  --host <host>         Host used with --serve. Defaults to 0.0.0.0 for LAN access.
   --port <n>            Port used with --serve. Defaults to 5174.
 `);
 }
@@ -64,9 +66,10 @@ function main() {
   const defaultExe = join(repoRoot, "skills", "codedb-mcp", "assets", "codebase-mcp.exe");
   const codedbExe = resolve(argValue(args, "--codedb-exe", defaultExe));
   const outputRel = argValue(args, "--output", ".codedb-mcp/module-atlas-data.json");
-  const limit = Number(argValue(args, "--limit", "2000"));
+  const limit = Number(argValue(args, "--limit", "5000"));
   const minFiles = Number(argValue(args, "--min-files", "2"));
   const serve = args.includes("--serve");
+  const host = argValue(args, "--host", "0.0.0.0");
   const port = argValue(args, "--port", "5174");
 
   if (!existsSync(targetRoot)) {
@@ -114,14 +117,14 @@ function main() {
     run(npmCommand, ["install"], viewerRoot);
   }
 
-  run(npmCommand, ["run", "build:meet-data"], viewerRoot);
-  run(npmCommand, ["run", "prepare:meet"], viewerRoot);
+  run(nodeCommand, ["scripts/build-meet-dataset.mjs"], viewerRoot);
+  run(nodeCommand, ["scripts/prepare-meet-assets.mjs"], viewerRoot);
 
   if (serve) {
-    run(npmCommand, ["run", "dev", "--", "--port", String(port), "--strictPort"], viewerRoot);
+    run(npmCommand, ["run", "dev", "--", "--host", String(host), "--port", String(port), "--strictPort"], viewerRoot);
   } else {
     console.log(`Viewer data is ready at ${viewerRoot}`);
-    console.log(`Run: cd ${viewerRoot} && npm run dev -- --port ${port} --strictPort`);
+    console.log(`Run: cd ${viewerRoot} && npm run dev -- --host ${host} --port ${port} --strictPort`);
   }
 }
 

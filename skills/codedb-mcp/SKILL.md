@@ -51,6 +51,7 @@ After config edits, run:
 Then call `codedb_status` through MCP. Confirm:
 
 - `extensions` contains the intended source extensions.
+- `root_paths`, `include_paths`, `exclude_paths`, and `skip_dirs` match the intended scan scope. For Unity runtime-only scans, prefer `root_paths = ["Assets", "Packages", "Library/PackageCache"]` plus `exclude_paths = ["**/Editor", "**/Editor/**"]`.
 - `storage_dir` points inside `<repo-root>\.codedb-mcp`.
 - `cache` is `hit` on repeated opens when files and config are unchanged.
 

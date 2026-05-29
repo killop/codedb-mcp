@@ -145,9 +145,18 @@ max_file_bytes = 50000000
 # directories; .git/info/exclude and global gitignore are not project boundaries.
 respect_gitignore = true
 
+# Optional scan roots relative to the project root. Empty means the whole root.
+# Unity runtime C# example:
+# root_paths = ["Assets", "Packages", "Library/PackageCache"]
+root_paths = []
+
 # Extra paths to include even when the normal scan would ignore them.
 # Unity projects often need Library/PackageCache while skipping the rest of Library.
 include_paths = ["Library/PackageCache"]
+
+# Glob paths to exclude after root/include selection. Unity runtime-only example:
+# exclude_paths = ["**/Editor", "**/Editor/**"]
+exclude_paths = []
 
 # Directory names to skip. A path listed in include_paths is still scanned even
 # when one of its parent directories is skipped here.

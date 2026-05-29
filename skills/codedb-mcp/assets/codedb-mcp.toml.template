@@ -17,8 +17,19 @@ max_file_bytes = 50000000
 # ignored packages can still be indexed.
 respect_gitignore = true
 
+# Optional scan roots relative to the project root. Empty means "walk the whole
+# project root". For Unity runtime-only C# indexing, use:
+# root_paths = ["Assets", "Packages", "Library/PackageCache"]
+root_paths = []
+
 # Extra paths to include even when the normal scan would ignore them.
 include_paths = ["Library/PackageCache"]
+
+# Glob paths to exclude after root/include selection. Useful for runtime-only
+# Unity indexing where Editor folders should not be part of the runtime graph.
+# Examples:
+# exclude_paths = ["**/Editor", "**/Editor/**"]
+exclude_paths = []
 
 # Directory names to skip. A path listed in include_paths is still scanned even
 # when one of its parent directories is skipped here.

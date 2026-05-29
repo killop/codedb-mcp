@@ -28,8 +28,16 @@ pub struct ScanConfig {
     pub max_file_bytes: u64,
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,
+    #[serde(
+        default = "default_root_paths",
+        alias = "roots",
+        alias = "source_roots"
+    )]
+    pub root_paths: Vec<String>,
     #[serde(default = "default_include_paths")]
     pub include_paths: Vec<String>,
+    #[serde(default = "default_exclude_paths", alias = "exclude_globs")]
+    pub exclude_paths: Vec<String>,
     #[serde(default = "default_skip_dirs")]
     pub skip_dirs: Vec<String>,
 }
@@ -83,6 +91,7 @@ impl AppConfig {
             max_file_bytes: self.scan.max_file_bytes,
             embedding_model: self.embedding.model.clone(),
             respect_gitignore: self.scan.respect_gitignore,
+            root_paths: normalize_config_paths(&self.scan.root_paths),
             include_paths: self
                 .scan
                 .include_paths
@@ -90,6 +99,7 @@ impl AppConfig {
                 .map(|item| item.replace('\\', "/").trim_matches('/').to_string())
                 .filter(|item| !item.is_empty())
                 .collect(),
+            exclude_paths: normalize_config_paths(&self.scan.exclude_paths),
             skip_dirs: self
                 .scan
                 .skip_dirs
@@ -119,7 +129,9 @@ impl Default for ScanConfig {
             extensions: default_extensions(),
             max_file_bytes: default_max_file_bytes(),
             respect_gitignore: true,
+            root_paths: default_root_paths(),
             include_paths: default_include_paths(),
+            exclude_paths: default_exclude_paths(),
             skip_dirs: default_skip_dirs(),
         }
     }
@@ -167,8 +179,16 @@ fn default_extensions() -> Vec<String> {
     .collect()
 }
 
+fn default_root_paths() -> Vec<String> {
+    Vec::new()
+}
+
 fn default_include_paths() -> Vec<String> {
     vec!["Library/PackageCache".to_string()]
+}
+
+fn default_exclude_paths() -> Vec<String> {
+    Vec::new()
 }
 
 fn default_skip_dirs() -> Vec<String> {
@@ -199,6 +219,14 @@ fn default_skip_dirs() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+fn normalize_config_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|item| item.replace('\\', "/").trim_matches('/').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 fn default_max_file_bytes() -> u64 {

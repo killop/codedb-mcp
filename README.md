@@ -131,7 +131,7 @@ The table is intentionally three columns so it fits GitHub README pages without 
 | `codedb_path`<br>Shortest graph path | warm after graph load 13.073ms<br>one-shot 1.790s, 392.6 / 397.2 MB | none |
 | `codedb_communities`<br>Lazy Louvain communities | warm 265.593ms<br>one-shot 1.905s, 390.8 / 400.1 MB | none |
 | `codedb_module_map`<br>DeepWiki module planning | warm 1.679s<br>one-shot 2.236s, 214.4 / 215.3 MB | none |
-| `codedb_module_atlas`<br>Module/file atlas JSON export | one-shot 2.917s, 236.2 / 237.9 MB | none |
+| `codedb_module_atlas`<br>Module/file atlas JSON export | Rust export 8.548s, 319.8 / 323.5 MB<br>full skill 10.870s wall, 371.8 / 369.9 MB sampled | none |
 | `codedb_analyze`<br>Graph stats and suggested questions | warm graph analysis 830.637ms<br>one-shot 2.936s, 392.2 / 397.5 MB | none |
 | `codedb_export`<br>Graph JSON/GraphML/Cypher export | warm after graph load 10.313ms<br>one-shot 1.963s, 390.0 / 397.0 MB | none |
 
@@ -151,7 +151,7 @@ Rust smoke check on this repository: 29 indexed files, 1,752 chunks, 1,901 symbo
 2. The agent creates `<repo-root>\.codedb-mcp` and `<repo-root>\.codedb-mcp\models`.
 3. On Windows, the agent checks the default HuggingFace hub cache first. If `minishlab/potion-code-16M` already has a valid snapshot there, config points to that snapshot. If the hub cache exists but the model is missing, the agent downloads to `C:\Users\<user>\.cache\huggingface\hub\codedb-mcp\models\potion-code-16M`. If the default hub cache does not exist, it uses the second available drive, such as `D:\codedb-mcp-cache\models\potion-code-16M`.
 4. The agent writes `<repo-root>\.codedb-mcp\codedb-mcp.toml` from the demo config, writes the model as an absolute path, and shows the human which languages are configured.
-5. The human can edit `extensions`, `include_paths`, `skip_dirs`, and the model path before first indexing.
+5. The human can edit `extensions`, `root_paths`, `include_paths`, `exclude_paths`, `skip_dirs`, and the model path before first indexing.
 6. The agent runs an index check.
 7. The agent asks whether this specific agent should register MCP. If yes, it uses its own MCP mechanism.
 8. Restart or reload the agent MCP session and check `/mcp`.
@@ -178,7 +178,7 @@ This project intentionally keeps installation explicit: setup prepares local pro
 
 1. **Explicit project-local config**: all behavior comes from `.codedb-mcp/codedb-mcp.toml`. There are no environment-variable switches for indexing behavior.
 2. **Project-local storage**: cache payloads, manifests, Louvain caches, and DeepWiki output live under `.codedb-mcp`. Deleting that directory removes all generated data for the repo.
-3. **Scanner**: walks the repo with explicit extensions, max file size, project `.gitignore` behavior, skip dirs, and include paths. Nested Git worktrees/submodules under the target root are scanned as normal source directories. Unity `Library/PackageCache` can be included while the rest of `Library` is skipped.
+3. **Scanner**: walks the repo with explicit extensions, max file size, project `.gitignore` behavior, scan roots, include paths, exclude globs, and skip dirs. Nested Git worktrees/submodules under the target root are scanned as normal source directories. Unity runtime scans can be limited to `Assets`, `Packages`, and `Library/PackageCache` while excluding `**/Editor/**`.
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, Lua `require()` imports, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: builds chunk metadata, symbol-definition chunk hits, dependency references, and spill-to-disk BM25 lexical search during cold indexing. Exact identifier hits and Model2Vec file embeddings are generated lazily when callers or natural-language search actually need them.
@@ -205,7 +205,9 @@ Important defaults:
 extensions = ["cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 max_file_bytes = 50000000
 respect_gitignore = true
+root_paths = []
 include_paths = ["Library/PackageCache"]
+exclude_paths = []
 
 [embedding]
 model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
@@ -215,7 +217,7 @@ enabled = true
 dir = ".codedb-mcp"
 ```
 
-There are no environment-variable toggles. Edit the config file explicitly. `respect_gitignore=true` reads project `.gitignore` files, but nested Git worktrees/submodules inside the target root are still indexed unless excluded by `skip_dirs` or file extension rules. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive.
+There are no environment-variable toggles. Edit the config file explicitly. `root_paths` can limit scanning to source roots such as `Assets`, `Packages`, and `Library/PackageCache`; `include_paths` adds extra roots even when a parent is skipped; `exclude_paths` accepts globs such as `**/Editor/**` for Unity runtime-only scans. `respect_gitignore=true` reads project `.gitignore` files, but nested Git worktrees/submodules inside the target root are still indexed unless excluded by `skip_dirs`, `exclude_paths`, or file extension rules. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive.
 
 ## Build And CLI
 

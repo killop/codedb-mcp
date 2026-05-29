@@ -10,10 +10,13 @@ use crate::tokens::{has_whole_word, split_identifier};
 use crate::types::{FileEntry, SearchHit, Symbol};
 use anyhow::{Result, anyhow};
 use parking_lot::{Mutex, RwLock};
+use serde::ser::{SerializeSeq, Serializer as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1670,13 +1673,13 @@ fn handle_module_map(index: &Codebase, args: &Value) -> Result<String> {
 
 fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
     let started = Instant::now();
-    let limit = get_usize(args, "limit").unwrap_or(2000).clamp(1, 5000);
+    let limit = get_usize(args, "limit").unwrap_or(5000).clamp(1, 5000);
     let min_files = get_usize(args, "min_files").unwrap_or(2).clamp(1, 1000);
     let include_files = get_bool(args, "include_files");
     let split_files = get_bool(args, "split_files");
     let path_prefix = get_str(args, "path_prefix")
         .and_then(|prefix| (!prefix.trim().is_empty()).then(|| normalize_dir_prefix(&prefix)));
-    let raws = build_file_module_raws(index, min_files, path_prefix.as_deref());
+    let raws = build_file_module_raws_for_atlas(index, min_files, path_prefix.as_deref());
     let term_document_frequency = module_term_document_frequency(&raws);
     let total_modules = raws.len();
     let mut modules = raws
@@ -1737,51 +1740,13 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
     }
 
     let layouts = module_layouts(index, &modules);
-    let mut path_to_point_id = HashMap::<String, usize>::new();
+    let mut path_to_point_id = HashMap::<&str, usize>::new();
     for module in &modules {
         for path in &module.files {
-            if index.files.contains_key(path) && !path_to_point_id.contains_key(path) {
+            if index.files.contains_key(path) && !path_to_point_id.contains_key(path.as_str()) {
                 let id = path_to_point_id.len();
-                path_to_point_id.insert(path.clone(), id);
+                path_to_point_id.insert(path.as_str(), id);
             }
-        }
-    }
-    let mut points = Vec::new();
-    for module in &modules {
-        let layout = layouts
-            .get(&module.community_id)
-            .copied()
-            .unwrap_or(ModuleLayout {
-                x: 0.0,
-                y: 0.0,
-                radius: module_layout_radius(module.file_count),
-            });
-        let local_offsets = module_file_offsets(index, module, layout.radius);
-        for path in &module.files {
-            let Some(file) = index.files.get(path) else {
-                continue;
-            };
-            let point_id = path_to_point_id.get(path).copied().unwrap_or(points.len());
-            let local = local_offsets.get(path).copied().unwrap_or((0.0, 0.0));
-            let dep_in = index.reverse_deps_for(path);
-            let dep_out = index.deps_for(path);
-            points.push(json!({
-                "id": point_id,
-                "path": path,
-                "language": file.language,
-                "languageLabel": language_label(file.language.as_str()),
-                "moduleId": module.community_id,
-                "moduleLabel": module.label,
-                "x": layout.x + local.0,
-                "y": layout.y + local.1,
-                "category": module.community_id % 12,
-                "symbols": file.symbols.iter().take(12).map(|symbol| symbol.name.clone()).collect::<Vec<_>>(),
-                "lineCount": file.line_count,
-                "depIn": dep_in.len(),
-                "depOut": dep_out.len(),
-                "depInIds": atlas_dependency_ids(Some(&dep_in), &path_to_point_id, 80),
-                "depOutIds": atlas_dependency_ids(Some(&dep_out), &path_to_point_id, 80),
-            }));
         }
     }
 
@@ -1847,7 +1812,7 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
         metadata["pointsPath"] = Value::String("module-atlas-points.json".to_string());
     }
 
-    let data = json!({
+    let mut data = json!({
         "metadata": {
             "project": metadata["project"].clone(),
             "root": metadata["root"].clone(),
@@ -1864,29 +1829,200 @@ fn handle_module_atlas(index: &Codebase, args: &Value) -> Result<String> {
             "pointsPath": metadata.get("pointsPath").cloned().unwrap_or(Value::Null),
         },
         "modules": modules_json,
-        "points": if split_files { Value::Null } else { Value::Array(points.clone()) },
+        "points": if split_files {
+            Value::Null
+        } else {
+            Value::Array(build_module_atlas_points_values(
+                index,
+                &modules,
+                &layouts,
+                &path_to_point_id,
+            ))
+        },
     });
-    let content = serde_json::to_string(&data)?;
     if let Some(output_path) = get_str(args, "output_path") {
         let output_path = resolve_output_path(&index.root, &output_path);
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&output_path, content)?;
         if split_files {
             let points_path = output_path
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("module-atlas-points.json");
-            fs::write(&points_path, serde_json::to_string(&points)?)?;
+            write_module_atlas_points(&points_path, index, &modules, &layouts, &path_to_point_id)?;
         }
+        data["metadata"]["generationMs"] = json!(started.elapsed().as_millis() as u64);
+        let file = File::create(&output_path)?;
+        serde_json::to_writer(BufWriter::new(file), &data)?;
         Ok(format!(
             "exported module atlas to {}",
             output_path.display()
         ))
     } else {
-        Ok(content)
+        data["metadata"]["generationMs"] = json!(started.elapsed().as_millis() as u64);
+        serde_json::to_string(&data).map_err(Into::into)
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModuleAtlasPoint<'a> {
+    id: usize,
+    path: &'a str,
+    language: crate::types::LanguageId,
+    language_label: &'static str,
+    module_id: usize,
+    module_label: &'a str,
+    x: f32,
+    y: f32,
+    category: usize,
+    symbols: Vec<&'a str>,
+    line_count: usize,
+    dep_in: usize,
+    dep_out: usize,
+    dep_in_ids: Vec<usize>,
+    dep_out_ids: Vec<usize>,
+}
+
+struct ModuleAtlasDeps<'a> {
+    forward: parking_lot::RwLockReadGuard<'a, Option<HashMap<String, Vec<String>>>>,
+    reverse: parking_lot::RwLockReadGuard<'a, Option<HashMap<String, Vec<String>>>>,
+}
+
+impl<'a> ModuleAtlasDeps<'a> {
+    fn outgoing(&self, path: &str) -> Option<&[String]> {
+        self.forward
+            .as_ref()
+            .and_then(|deps| deps.get(path).map(Vec::as_slice))
+    }
+
+    fn incoming(&self, path: &str) -> Option<&[String]> {
+        self.reverse
+            .as_ref()
+            .and_then(|deps| deps.get(path).map(Vec::as_slice))
+    }
+}
+
+fn module_atlas_deps(index: &Codebase) -> ModuleAtlasDeps<'_> {
+    let _ = index.deps_for("");
+    let _ = index.reverse_deps_for("");
+    ModuleAtlasDeps {
+        forward: index.deps_forward.read(),
+        reverse: index.deps_reverse.read(),
+    }
+}
+
+fn build_module_atlas_points_values(
+    index: &Codebase,
+    modules: &[ModuleAtlasModule],
+    layouts: &HashMap<usize, ModuleLayout>,
+    path_to_point_id: &HashMap<&str, usize>,
+) -> Vec<Value> {
+    let mut points = Vec::new();
+    for module in modules {
+        let layout = layouts
+            .get(&module.community_id)
+            .copied()
+            .unwrap_or(ModuleLayout {
+                x: 0.0,
+                y: 0.0,
+                radius: module_layout_radius(module.file_count),
+            });
+        let local_offsets = module_file_offsets(index, module, layout.radius);
+        let deps = module_atlas_deps(index);
+        for path in &module.files {
+            let Some(file) = index.files.get(path) else {
+                continue;
+            };
+            let point_id = path_to_point_id
+                .get(path.as_str())
+                .copied()
+                .unwrap_or(points.len());
+            let local = local_offsets.get(path).copied().unwrap_or((0.0, 0.0));
+            let dep_in = deps.incoming(path);
+            let dep_out = deps.outgoing(path);
+            points.push(json!({
+                "id": point_id,
+                "path": path,
+                "language": file.language,
+                "languageLabel": language_label(file.language.as_str()),
+                "moduleId": module.community_id,
+                "moduleLabel": module.label,
+                "x": layout.x + local.0,
+                "y": layout.y + local.1,
+                "category": module.community_id % 12,
+                "symbols": file.symbols.iter().take(12).map(|symbol| symbol.name.clone()).collect::<Vec<_>>(),
+                "lineCount": file.line_count,
+                "depIn": dep_in.map_or(0, |items| items.len()),
+                "depOut": dep_out.map_or(0, |items| items.len()),
+                "depInIds": atlas_dependency_ids(dep_in, path_to_point_id, 80),
+                "depOutIds": atlas_dependency_ids(dep_out, path_to_point_id, 80),
+            }));
+        }
+    }
+    points
+}
+
+fn write_module_atlas_points(
+    path: &Path,
+    index: &Codebase,
+    modules: &[ModuleAtlasModule],
+    layouts: &HashMap<usize, ModuleLayout>,
+    path_to_point_id: &HashMap<&str, usize>,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    let mut serializer = serde_json::Serializer::new(writer);
+    let mut sequence = serializer.serialize_seq(None)?;
+    for module in modules {
+        let layout = layouts
+            .get(&module.community_id)
+            .copied()
+            .unwrap_or(ModuleLayout {
+                x: 0.0,
+                y: 0.0,
+                radius: module_layout_radius(module.file_count),
+            });
+        let local_offsets = module_file_offsets(index, module, layout.radius);
+        let deps = module_atlas_deps(index);
+        for path in &module.files {
+            let Some(file) = index.files.get(path) else {
+                continue;
+            };
+            let Some(point_id) = path_to_point_id.get(path.as_str()).copied() else {
+                continue;
+            };
+            let local = local_offsets.get(path).copied().unwrap_or((0.0, 0.0));
+            let dep_in = deps.incoming(path);
+            let dep_out = deps.outgoing(path);
+            let point = ModuleAtlasPoint {
+                id: point_id,
+                path,
+                language: file.language,
+                language_label: language_label(file.language.as_str()),
+                module_id: module.community_id,
+                module_label: &module.label,
+                x: layout.x + local.0,
+                y: layout.y + local.1,
+                category: module.community_id % 12,
+                symbols: file
+                    .symbols
+                    .iter()
+                    .take(12)
+                    .map(|symbol| symbol.name.as_str())
+                    .collect(),
+                line_count: file.line_count,
+                dep_in: dep_in.map_or(0, |items| items.len()),
+                dep_out: dep_out.map_or(0, |items| items.len()),
+                dep_in_ids: atlas_dependency_ids(dep_in, path_to_point_id, 80),
+                dep_out_ids: atlas_dependency_ids(dep_out, path_to_point_id, 80),
+            };
+            sequence.serialize_element(&point)?;
+        }
+    }
+    sequence.end()?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1913,6 +2049,23 @@ fn build_file_module_raws(
     min_files: usize,
     path_prefix: Option<&str>,
 ) -> Vec<ModuleRaw> {
+    build_file_module_raws_inner(index, min_files, path_prefix, false)
+}
+
+fn build_file_module_raws_for_atlas(
+    index: &Codebase,
+    min_files: usize,
+    path_prefix: Option<&str>,
+) -> Vec<ModuleRaw> {
+    build_file_module_raws_inner(index, min_files, path_prefix, true)
+}
+
+fn build_file_module_raws_inner(
+    index: &Codebase,
+    min_files: usize,
+    path_prefix: Option<&str>,
+    group_small_modules: bool,
+) -> Vec<ModuleRaw> {
     let allowed = index
         .files
         .keys()
@@ -1923,34 +2076,51 @@ fn build_file_module_raws(
         return Vec::new();
     }
     let communities = detect_file_dependency_modules(index, &allowed);
-    communities
-        .into_iter()
-        .enumerate()
-        .filter_map(|(community_id, files)| {
-            if files.len() < min_files {
-                return None;
+    let mut raws = Vec::new();
+    let mut small_groups = BTreeMap::<String, Vec<String>>::new();
+    for files in communities {
+        if files.len() < min_files {
+            if group_small_modules {
+                for file in files {
+                    small_groups
+                        .entry(module_path_root(&file))
+                        .or_default()
+                        .push(file);
+                }
             }
-            let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
-            let token_counts = module_token_counts(index, &files);
-            let symbol_count = files
-                .iter()
-                .filter_map(|path| index.files.get(path))
-                .map(|file| file.symbols.len())
-                .sum();
-            let (internal_deps, outgoing_deps, incoming_deps) =
-                module_dependency_counts(index, &file_set);
-            Some(ModuleRaw {
-                community_id,
-                fallback_label: module_label_from_files(index, &files),
-                files,
-                token_counts,
-                symbol_count,
-                internal_deps,
-                outgoing_deps,
-                incoming_deps,
-            })
-        })
-        .collect()
+            continue;
+        }
+        let community_id = raws.len();
+        raws.push(module_raw_from_files(index, community_id, files));
+    }
+    if group_small_modules {
+        for (_, files) in small_groups {
+            let community_id = raws.len();
+            raws.push(module_raw_from_files(index, community_id, files));
+        }
+    }
+    raws
+}
+
+fn module_raw_from_files(index: &Codebase, community_id: usize, files: Vec<String>) -> ModuleRaw {
+    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    let token_counts = module_token_counts(index, &files);
+    let symbol_count = files
+        .iter()
+        .filter_map(|path| index.files.get(path))
+        .map(|file| file.symbols.len())
+        .sum();
+    let (internal_deps, outgoing_deps, incoming_deps) = module_dependency_counts(index, &file_set);
+    ModuleRaw {
+        community_id,
+        fallback_label: module_label_from_files(index, &files),
+        files,
+        token_counts,
+        symbol_count,
+        internal_deps,
+        outgoing_deps,
+        incoming_deps,
+    }
 }
 
 fn detect_file_dependency_modules(
@@ -2707,8 +2877,8 @@ fn top_terms_from_counts(counts: &BTreeMap<String, usize>, limit: usize) -> Vec<
 }
 
 fn atlas_dependency_ids(
-    paths: Option<&Vec<String>>,
-    path_to_point_id: &HashMap<String, usize>,
+    paths: Option<&[String]>,
+    path_to_point_id: &HashMap<&str, usize>,
     limit: usize,
 ) -> Vec<usize> {
     let Some(paths) = paths else {
@@ -2716,7 +2886,7 @@ fn atlas_dependency_ids(
     };
     let mut items = paths
         .iter()
-        .filter_map(|path| path_to_point_id.get(path).copied())
+        .filter_map(|path| path_to_point_id.get(path.as_str()).copied())
         .collect::<Vec<_>>();
     items.sort();
     items.dedup();
@@ -2882,26 +3052,47 @@ fn relax_module_layout(items: &mut [ModuleLayoutItem], edges: &[(usize, usize, f
         id_to_index.insert(item.id, idx);
     }
 
-    for _ in 0..180 {
+    for _ in 0..72 {
         let mut delta = vec![(0.0f32, 0.0f32); items.len()];
+        let mut grid = HashMap::<(i32, i32), Vec<usize>>::new();
         for i in 0..items.len() {
-            for j in (i + 1)..items.len() {
-                let dx = items[j].x - items[i].x;
-                let dy = items[j].y - items[i].y;
-                let distance_sq = (dx * dx + dy * dy).max(0.04);
-                let distance = distance_sq.sqrt();
-                let min_distance = items[i].radius + items[j].radius + 8.0;
-                let force = if distance < min_distance {
-                    (min_distance - distance) * 0.18
-                } else {
-                    ((items[i].radius * items[j].radius) / distance_sq).min(0.04)
-                };
-                let nx = dx / distance;
-                let ny = dy / distance;
-                delta[i].0 -= nx * force;
-                delta[i].1 -= ny * force;
-                delta[j].0 += nx * force;
-                delta[j].1 += ny * force;
+            let cell = (
+                (items[i].x / 48.0).floor() as i32,
+                (items[i].y / 48.0).floor() as i32,
+            );
+            grid.entry(cell).or_default().push(i);
+        }
+        for i in 0..items.len() {
+            let cell = (
+                (items[i].x / 48.0).floor() as i32,
+                (items[i].y / 48.0).floor() as i32,
+            );
+            for gx in (cell.0 - 1)..=(cell.0 + 1) {
+                for gy in (cell.1 - 1)..=(cell.1 + 1) {
+                    let Some(neighbors) = grid.get(&(gx, gy)) else {
+                        continue;
+                    };
+                    for &j in neighbors {
+                        if j <= i {
+                            continue;
+                        }
+                        let dx = items[j].x - items[i].x;
+                        let dy = items[j].y - items[i].y;
+                        let distance_sq = (dx * dx + dy * dy).max(0.04);
+                        let distance = distance_sq.sqrt();
+                        let min_distance = items[i].radius + items[j].radius + 8.0;
+                        if distance >= min_distance {
+                            continue;
+                        }
+                        let force = (min_distance - distance) * 0.18;
+                        let nx = dx / distance;
+                        let ny = dy / distance;
+                        delta[i].0 -= nx * force;
+                        delta[i].1 -= ny * force;
+                        delta[j].0 += nx * force;
+                        delta[j].1 += ny * force;
+                    }
+                }
             }
         }
 
@@ -2939,25 +3130,47 @@ fn relax_module_layout(items: &mut [ModuleLayoutItem], edges: &[(usize, usize, f
 }
 
 fn resolve_module_collisions(items: &mut [ModuleLayoutItem]) {
-    for _ in 0..80 {
+    for _ in 0..16 {
         let mut moved = false;
+        let mut grid = HashMap::<(i32, i32), Vec<usize>>::new();
         for i in 0..items.len() {
-            for j in (i + 1)..items.len() {
-                let dx = items[j].x - items[i].x;
-                let dy = items[j].y - items[i].y;
-                let distance = (dx * dx + dy * dy).sqrt().max(0.001);
-                let min_distance = items[i].radius + items[j].radius + 7.0;
-                if distance >= min_distance {
-                    continue;
+            let cell = (
+                (items[i].x / 48.0).floor() as i32,
+                (items[i].y / 48.0).floor() as i32,
+            );
+            grid.entry(cell).or_default().push(i);
+        }
+        for i in 0..items.len() {
+            let cell = (
+                (items[i].x / 48.0).floor() as i32,
+                (items[i].y / 48.0).floor() as i32,
+            );
+            for gx in (cell.0 - 1)..=(cell.0 + 1) {
+                for gy in (cell.1 - 1)..=(cell.1 + 1) {
+                    let Some(neighbors) = grid.get(&(gx, gy)) else {
+                        continue;
+                    };
+                    for &j in neighbors {
+                        if j <= i {
+                            continue;
+                        }
+                        let dx = items[j].x - items[i].x;
+                        let dy = items[j].y - items[i].y;
+                        let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+                        let min_distance = items[i].radius + items[j].radius + 7.0;
+                        if distance >= min_distance {
+                            continue;
+                        }
+                        let push = (min_distance - distance) * 0.52;
+                        let nx = dx / distance;
+                        let ny = dy / distance;
+                        items[i].x -= nx * push;
+                        items[i].y -= ny * push;
+                        items[j].x += nx * push;
+                        items[j].y += ny * push;
+                        moved = true;
+                    }
                 }
-                let push = (min_distance - distance) * 0.52;
-                let nx = dx / distance;
-                let ny = dy / distance;
-                items[i].x -= nx * push;
-                items[i].y -= ny * push;
-                items[j].x += nx * push;
-                items[j].y += ny * push;
-                moved = true;
             }
         }
         if !moved {
@@ -3109,25 +3322,42 @@ fn file_layout_edges(index: &Codebase, module: &ModuleAtlasModule) -> Vec<(usize
 }
 
 fn relax_file_layout(items: &mut [FileLayoutItem], edges: &[(usize, usize, f32)], radius: f32) {
-    for _ in 0..70 {
+    let cell_size = (radius * 0.09).max(0.75);
+    for _ in 0..36 {
         let mut delta = vec![(0.0f32, 0.0f32); items.len()];
-        for i in 0..items.len() {
-            for j in (i + 1)..items.len() {
-                let dx = items[j].x - items[i].x;
-                let dy = items[j].y - items[i].y;
-                let distance_sq = (dx * dx + dy * dy).max(0.0004);
-                let distance = distance_sq.sqrt();
-                let min_distance = items[i].radius + items[j].radius + radius * 0.018;
-                if distance >= min_distance {
-                    continue;
+        if items.len() <= 96 {
+            for i in 0..items.len() {
+                for j in (i + 1)..items.len() {
+                    repel_file_layout_pair(items, &mut delta, radius, i, j);
                 }
-                let force = (min_distance - distance) * 0.24;
-                let nx = dx / distance;
-                let ny = dy / distance;
-                delta[i].0 -= nx * force;
-                delta[i].1 -= ny * force;
-                delta[j].0 += nx * force;
-                delta[j].1 += ny * force;
+            }
+        } else {
+            let mut grid = HashMap::<(i32, i32), Vec<usize>>::new();
+            for i in 0..items.len() {
+                let cell = (
+                    (items[i].x / cell_size).floor() as i32,
+                    (items[i].y / cell_size).floor() as i32,
+                );
+                grid.entry(cell).or_default().push(i);
+            }
+            for i in 0..items.len() {
+                let cell = (
+                    (items[i].x / cell_size).floor() as i32,
+                    (items[i].y / cell_size).floor() as i32,
+                );
+                for gx in (cell.0 - 1)..=(cell.0 + 1) {
+                    for gy in (cell.1 - 1)..=(cell.1 + 1) {
+                        let Some(neighbors) = grid.get(&(gx, gy)) else {
+                            continue;
+                        };
+                        for &j in neighbors {
+                            if j <= i {
+                                continue;
+                            }
+                            repel_file_layout_pair(items, &mut delta, radius, i, j);
+                        }
+                    }
+                }
             }
         }
 
@@ -3166,6 +3396,30 @@ fn relax_file_layout(items: &mut [FileLayoutItem], edges: &[(usize, usize, f32)]
             item.y = clamped.1;
         }
     }
+}
+
+fn repel_file_layout_pair(
+    items: &[FileLayoutItem],
+    delta: &mut [(f32, f32)],
+    radius: f32,
+    i: usize,
+    j: usize,
+) {
+    let dx = items[j].x - items[i].x;
+    let dy = items[j].y - items[i].y;
+    let distance_sq = (dx * dx + dy * dy).max(0.0004);
+    let distance = distance_sq.sqrt();
+    let min_distance = items[i].radius + items[j].radius + radius * 0.018;
+    if distance >= min_distance {
+        return;
+    }
+    let force = (min_distance - distance) * 0.24;
+    let nx = dx / distance;
+    let ny = dy / distance;
+    delta[i].0 -= nx * force;
+    delta[i].1 -= ny * force;
+    delta[j].0 += nx * force;
+    delta[j].1 += ny * force;
 }
 
 fn module_term_counts(module: &ModuleAtlasModule) -> BTreeMap<String, usize> {

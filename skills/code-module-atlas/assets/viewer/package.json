@@ -6,9 +6,9 @@
   "scripts": {
     "build:meet-data": "node scripts/build-meet-dataset.mjs",
     "prepare:meet": "node scripts/prepare-meet-assets.mjs",
-    "dev": "vite --host 127.0.0.1",
+    "dev": "vite --host 0.0.0.0",
     "build": "npm run build:meet-data && npm run prepare:meet && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 0.0.0.0"
   },
   "devDependencies": {
     "vite": "^6.3.6"

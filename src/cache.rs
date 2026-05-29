@@ -156,7 +156,9 @@ struct CacheConfigSignature<'a> {
     max_file_bytes: u64,
     embedding_model: &'a str,
     respect_gitignore: bool,
+    root_paths: &'a [String],
     include_paths: &'a [String],
+    exclude_paths: &'a [String],
     skip_dirs: &'a [String],
 }
 
@@ -635,7 +637,9 @@ fn config_hash(options: &IndexOptions) -> Result<String> {
         max_file_bytes: options.max_file_bytes,
         embedding_model: &options.embedding_model,
         respect_gitignore: options.respect_gitignore,
+        root_paths: &options.root_paths,
         include_paths: &options.include_paths,
+        exclude_paths: &options.exclude_paths,
         skip_dirs: &options.skip_dirs,
     };
     let bytes = serde_json::to_vec(&signature)?;

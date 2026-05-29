@@ -133,7 +133,7 @@ Benchmark 于 2026-05-29 在 Windows 上重跑。`warm` 耗时来自一个已加
 | `codedb_path`<br>图最短路径 | warm after graph load 13.073ms<br>one-shot 1.790s，392.6 / 397.2 MB | 无 |
 | `codedb_communities`<br>lazy Louvain communities | warm 265.593ms<br>one-shot 1.905s，390.8 / 400.1 MB | 无 |
 | `codedb_module_map`<br>DeepWiki 模块规划 | warm 1.679s<br>one-shot 2.236s，214.4 / 215.3 MB | 无 |
-| `codedb_module_atlas`<br>module/file atlas JSON 导出 | one-shot 2.917s，236.2 / 237.9 MB | 无 |
+| `codedb_module_atlas`<br>module/file atlas JSON 导出 | Rust export 8.548s，319.8 / 323.5 MB<br>完整 skill 10.870s wall，采样峰值 371.8 / 369.9 MB | 无 |
 | `codedb_analyze`<br>图统计和建议问题 | warm graph analysis 830.637ms<br>one-shot 2.936s，392.2 / 397.5 MB | 无 |
 | `codedb_export`<br>导出 JSON/GraphML/Cypher | warm after graph load 10.313ms<br>one-shot 1.963s，390.0 / 397.0 MB | 无 |
 
@@ -153,7 +153,7 @@ Rust smoke check：当前仓库 29 个索引文件，1,752 chunks，1,901 symbol
 2. agent 创建 `<repo-root>\.codedb-mcp` 和 `<repo-root>\.codedb-mcp\models`。
 3. Windows 上先检查默认 HuggingFace hub cache。如果 `minishlab/potion-code-16M` 已经有有效 snapshot，配置就指向这个 snapshot。如果默认 hub 存在但模型不存在，就下载到 `C:\Users\<user>\.cache\huggingface\hub\codedb-mcp\models\potion-code-16M`。如果默认 hub 不存在，再按盘符排序选择第二个盘符，例如 `D:\codedb-mcp-cache\models\potion-code-16M`。
 4. agent 写入 `<repo-root>\.codedb-mcp\codedb-mcp.toml` demo 配置，模型写绝对路径，并告诉人类当前会遍历哪些语言。
-5. 人类可以在第一次索引前修改 `extensions`、`include_paths`、`skip_dirs` 和模型路径。
+5. 人类可以在第一次索引前修改 `extensions`、`root_paths`、`include_paths`、`exclude_paths`、`skip_dirs` 和模型路径。
 6. agent 跑一次 index 检查。
 7. agent 询问人类是否要给当前特定 agent 配置 MCP；确认后才按该 agent 的方式配置。
 8. 重启或 reload agent MCP session，然后检查 `/mcp`。
@@ -180,9 +180,9 @@ MCP 命令形态：
 
 ## 技术架构
 
-1. **显式配置层**：读取 `.codedb-mcp/codedb-mcp.toml`，配置扫描扩展、文件大小上限、gitignore 行为、include paths、skip dirs、embedding 模型、watch 和 storage。
+1. **显式配置层**：读取 `.codedb-mcp/codedb-mcp.toml`，配置扫描扩展、文件大小上限、gitignore 行为、root paths、include paths、exclude globs、skip dirs、embedding 模型、watch 和 storage。
 2. **本地存储层**：索引 payload、manifest、Louvain cache、DeepWiki 证据和文档都写入 `.codedb-mcp`。数据跟随项目目录，不写全局数据库。
-3. **扫描层**：基于配置遍历代码库，读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录继续索引。Unity 项目中可以跳过大部分 `Library`，同时显式包含 `Library/PackageCache`。
+3. **扫描层**：基于配置遍历代码库，读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 会作为普通源码目录继续索引。Unity runtime 可以把 root paths 限定到 `Assets`、`Packages`、`Library/PackageCache`，并用 `**/Editor/**` 排除 Editor-only 代码。
 4. **语言解析层**：所有语言统一走 tree-sitter grammar，输出同一套 `FileEntry` 和 `Symbol` 结构。当前支持 C#、Java、Rust、Python、Lua、JavaScript、TypeScript/TSX、C、C++，解析时只遍历声明层，避免大型方法体拖慢索引。
 5. **代码语义增强层**：C#/Java 上继续做 namespace/package import、别名、静态 using、注解、属性后缀、限定名引用等轻量语义推断；Lua 会抽取 `require()` 并生成轻量文件依赖。
 6. **搜索索引层**：cold index 阶段构建 chunk 元数据、symbol definition chunks、dependency references 和 spill-to-disk BM25。identifier word hits 与 Model2Vec file embeddings 改为 callers 或自然语言搜索首次需要时懒生成。
@@ -207,7 +207,9 @@ MCP 命令形态：
 extensions = ["cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 max_file_bytes = 50000000
 respect_gitignore = true
+root_paths = []
 include_paths = ["Library/PackageCache"]
+exclude_paths = []
 
 [embedding]
 model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
@@ -217,7 +219,7 @@ enabled = true
 dir = ".codedb-mcp"
 ```
 
-`include_paths` 会覆盖被跳过的父目录，例如 Unity 项目中可以跳过 `Library`，但保留 `Library/PackageCache`。`respect_gitignore=true` 会读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 仍会被当作源码目录索引，除非被 `skip_dirs` 或扩展名规则排除。模型路径是显式绝对路径；Windows setup 会优先复用默认 HuggingFace cache，不存在时才走第二盘符。
+`root_paths` 可以把扫描限定在指定源码根目录，例如 Unity runtime 常用 `Assets`、`Packages`、`Library/PackageCache`；`include_paths` 会额外纳入路径并覆盖被跳过的父目录；`exclude_paths` 支持 `**/Editor/**` 这类 glob，用于排除 Editor-only 代码。`respect_gitignore=true` 会读取项目内 `.gitignore`，但目标 root 下的嵌套 Git worktree/submodule 仍会被当作源码目录索引，除非被 `skip_dirs`、`exclude_paths` 或扩展名规则排除。模型路径是显式绝对路径；Windows setup 会优先复用默认 HuggingFace cache，不存在时才走第二盘符。
 
 ## 构建与 CLI
 

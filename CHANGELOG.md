@@ -20,6 +20,8 @@
 - Added a BM25-enough fast path for business phrase searches so common multi-token queries can return lexical results without loading Model2Vec, and reused file-content reads while formatting search previews.
 - Added a lazy `callers.bin` sidecar for definition-anchored `codedb_callers` results. The first uncached target still uses the full caller path and writes the sidecar; repeated one-shot lookups can return directly from the sidecar without loading the full index.
 - Reworked cold indexing as cache v20: per-file source bodies are dropped immediately after tree-sitter parsing and chunk metadata generation, dependencies and BM25 reread source on demand, BM25 construction spills doc-term records to disk, Model2Vec embeddings are generated lazily, and cold indexing no longer clones file/symbol metadata into a second map before cache save.
+- Optimized `codedb_module_atlas` by streaming split file-point JSON to disk, avoiding a second in-memory point array for the default skill path, borrowing path keys during point id construction, and using a grid/direct hybrid layout pass. The atlas export now keeps every indexed file as a viewer node while grouping dependency-isolated single-file components by folder so they are not silently dropped or exploded into thousands of one-file modules. The `code-module-atlas` skill now invokes its bundled Node conversion scripts directly instead of paying repeated `npm run` startup cost.
+- Extended scan filtering with explicit `root_paths` and glob-based `exclude_paths` while keeping `include_paths` and `skip_dirs` compatible. Unity runtime scans can now be configured as `root_paths = ["Assets", "Packages", "Library/PackageCache"]` plus `exclude_paths = ["**/Editor", "**/Editor/**"]`.
 
 ### Fixed
 
@@ -35,6 +37,8 @@
 - Re-ran the `gameserver` Java benchmark after fixing its explicit model path: 6,940 files, 55,057 chunks, and 245,238 symbols rebuild in 10.477s, then reopen from cache in 1.027s.
 - Updated the README `rg` comparison to reflect the cache v20 memory tradeoff: broad unscoped regex reads source files on demand and is slower than `rg`, while path-scoped regex, symbol search, callers, deps, outlines, and bundle calls remain low-latency.
 - Verified source-on-demand tools after removing resident full-file bodies: `codedb_search PoolManager`, definition-anchored `codedb_callers PoolManager`, and `codedb_read PoolManager.cs`.
+- Re-ran the `code-module-atlas` benchmark on `u3dclient`: Rust `codedb_module_atlas` full default export now emits 19,035 file nodes and 1,850 modules, finishing in 8.548s with a sampled peak of 319.8 MB WS / 323.5 MB private; the full skill path finished in 10.870s wall time with a sampled process-tree peak of 371.8 MB WS / 369.9 MB private. The old atlas export emitted only 16,365 nodes because singleton dependency components were filtered by `min_files=2`.
+- Validated the Unity runtime scan config on `u3dclient`: `Assets`, `Packages`, and `Library/PackageCache` were indexed; `**/Editor/**/*.cs` returned no indexed matches; PackageCache runtime files remained searchable.
 
 ## Unreleased - 2026-05-27
 

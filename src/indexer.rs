@@ -32,7 +32,9 @@ pub struct IndexOptions {
     pub max_file_bytes: u64,
     pub embedding_model: String,
     pub respect_gitignore: bool,
+    pub root_paths: Vec<String>,
     pub include_paths: Vec<String>,
+    pub exclude_paths: Vec<String>,
     pub skip_dirs: Vec<String>,
     pub diagnostics: DiagnosticsOptions,
     pub storage: StorageOptions,
@@ -67,7 +69,9 @@ impl Default for IndexOptions {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             embedding_model: default_embedding_model_path(),
             respect_gitignore: true,
+            root_paths: Vec::new(),
             include_paths: vec!["Library/PackageCache".to_string()],
+            exclude_paths: Vec::new(),
             skip_dirs: vec![
                 ".git".to_string(),
                 ".hg".to_string(),
@@ -1204,16 +1208,36 @@ fn collect_paths(root: &Path, options: &IndexOptions) -> Result<Vec<PathBuf>> {
         .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
         .collect();
 
+    let exclude_globs = build_optional_globset(&options.exclude_paths)?.map(Arc::new);
     let mut paths = BTreeSet::new();
-    collect_paths_from(
-        root,
-        root,
-        &extensions,
-        options.respect_gitignore,
-        options,
-        None,
-        &mut paths,
-    )?;
+    if options.root_paths.is_empty() {
+        collect_paths_from(
+            root,
+            root,
+            &extensions,
+            options.respect_gitignore,
+            options,
+            None,
+            exclude_globs.clone(),
+            &mut paths,
+        )?;
+    } else {
+        for scan_root in &options.root_paths {
+            let scan_root = root.join(scan_root);
+            if scan_root.is_dir() {
+                collect_paths_from(
+                    root,
+                    &scan_root,
+                    &extensions,
+                    options.respect_gitignore,
+                    options,
+                    Some(&scan_root),
+                    exclude_globs.clone(),
+                    &mut paths,
+                )?;
+            }
+        }
+    }
 
     for include_path in &options.include_paths {
         let include_path = root.join(include_path);
@@ -1225,6 +1249,7 @@ fn collect_paths(root: &Path, options: &IndexOptions) -> Result<Vec<PathBuf>> {
                 false,
                 options,
                 Some(&include_path),
+                exclude_globs.clone(),
                 &mut paths,
             )?;
         }
@@ -1240,11 +1265,13 @@ fn collect_paths_from(
     respect_gitignore: bool,
     options: &IndexOptions,
     include_root: Option<&Path>,
+    exclude_globs: Option<Arc<GlobSet>>,
     paths: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let filter_root = root.to_path_buf();
     let filter_include_root = include_root.map(Path::to_path_buf);
     let filter_options = options.clone();
+    let filter_exclude_globs = exclude_globs.clone();
     let mut builder = WalkBuilder::new(start);
     builder
         .hidden(false)
@@ -1256,8 +1283,12 @@ fn collect_paths_from(
             !is_skipped_entry(
                 &filter_root,
                 entry.path(),
+                entry
+                    .file_type()
+                    .is_some_and(|file_type| file_type.is_dir()),
                 filter_include_root.as_deref(),
                 &filter_options,
+                filter_exclude_globs.as_deref(),
             )
         });
     let collected = Arc::new(StdMutex::new(Vec::new()));
@@ -1266,6 +1297,8 @@ fn collect_paths_from(
         let collected = collected.clone();
         let errors = errors.clone();
         let extensions = extensions.clone();
+        let exclude_globs = exclude_globs.clone();
+        let root = root.to_path_buf();
         Box::new(move |entry| {
             match entry {
                 Ok(entry) => {
@@ -1273,6 +1306,7 @@ fn collect_paths_from(
                         let path = entry.path();
                         if let Some(ext) = path.extension().and_then(|ext| ext.to_str())
                             && extensions.contains(&ext.to_ascii_lowercase())
+                            && !is_excluded_path(&root, path, false, exclude_globs.as_deref())
                         {
                             collected
                                 .lock()
@@ -1303,11 +1337,17 @@ fn collect_paths_from(
 fn is_skipped_entry(
     root: &Path,
     path: &Path,
+    is_dir: bool,
     include_root: Option<&Path>,
     options: &IndexOptions,
+    exclude_globs: Option<&GlobSet>,
 ) -> bool {
     if path == root || include_root.is_some_and(|include_root| path == include_root) {
         return false;
+    }
+
+    if is_excluded_path(root, path, is_dir, exclude_globs) {
+        return true;
     }
 
     let relative = include_root
@@ -1333,6 +1373,54 @@ fn is_skipped_entry(
     }
 
     false
+}
+
+fn build_optional_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+    let mut builder = GlobSetBuilder::new();
+    let mut added = false;
+    for pattern in patterns {
+        let pattern = normalize_rel_path(pattern.trim());
+        if pattern.is_empty() {
+            continue;
+        }
+        builder.add(Glob::new(&pattern)?);
+        added = true;
+    }
+    if added {
+        Ok(Some(builder.build()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_excluded_path(
+    root: &Path,
+    path: &Path,
+    is_dir: bool,
+    exclude_globs: Option<&GlobSet>,
+) -> bool {
+    let Some(exclude_globs) = exclude_globs else {
+        return false;
+    };
+    let Some(relative) = project_relative_path(root, path) else {
+        return false;
+    };
+    if relative.is_empty() || exclude_globs.is_match(relative.as_str()) {
+        return !relative.is_empty();
+    }
+    if is_dir {
+        let child_probe = format!("{relative}/__codedb_dir_probe__");
+        if exclude_globs.is_match(child_probe.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn load_embedding_model(root: &Path, model_id: &str) -> Result<MinishEmbeddingModel> {
@@ -2662,6 +2750,130 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(rel_paths.contains(&"Library/PackageCache/Included.cs".to_string()));
+        assert!(!rel_paths.contains(&"Library/Other/Skipped.cs".to_string()));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_paths_limit_scan_scope() {
+        let root = std::env::temp_dir().join(format!("codebase_mcp_root_paths_{}", now_ms()));
+        std::fs::create_dir_all(root.join("Assets")).unwrap();
+        std::fs::create_dir_all(root.join("Packages")).unwrap();
+        std::fs::create_dir_all(root.join("Docs")).unwrap();
+        std::fs::write(
+            root.join("Assets").join("Runtime.cs"),
+            "public class Runtime {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Packages").join("Package.cs"),
+            "public class Package {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Docs").join("Ignored.cs"),
+            "public class Ignored {}",
+        )
+        .unwrap();
+
+        let mut options = IndexOptions::default();
+        options.extensions = vec!["cs".to_string()];
+        options.root_paths = vec!["Assets".to_string(), "Packages".to_string()];
+        options.include_paths = Vec::new();
+        options.skip_dirs = vec![".git".to_string()];
+
+        let paths = collect_paths(&root, &options).unwrap();
+        let rel_paths = paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(rel_paths.contains(&"Assets/Runtime.cs".to_string()));
+        assert!(rel_paths.contains(&"Packages/Package.cs".to_string()));
+        assert!(!rel_paths.contains(&"Docs/Ignored.cs".to_string()));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unity_runtime_scope_keeps_runtime_roots_and_excludes_editor_dirs() {
+        let root = std::env::temp_dir().join(format!("codebase_mcp_unity_runtime_{}", now_ms()));
+        std::fs::create_dir_all(root.join("Assets").join("Scripts").join("Editor")).unwrap();
+        std::fs::create_dir_all(root.join("Packages").join("GamePackage")).unwrap();
+        std::fs::create_dir_all(
+            root.join("Library")
+                .join("PackageCache")
+                .join("UnityPackage"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("Library").join("Other")).unwrap();
+        std::fs::write(
+            root.join("Assets").join("Scripts").join("Runtime.cs"),
+            "public class Runtime {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Assets")
+                .join("Scripts")
+                .join("Editor")
+                .join("EditorOnly.cs"),
+            "public class EditorOnly {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Packages")
+                .join("GamePackage")
+                .join("PackageRuntime.cs"),
+            "public class PackageRuntime {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Library")
+                .join("PackageCache")
+                .join("UnityPackage")
+                .join("PackageCacheRuntime.cs"),
+            "public class PackageCacheRuntime {}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Library").join("Other").join("Skipped.cs"),
+            "public class Skipped {}",
+        )
+        .unwrap();
+
+        let mut options = IndexOptions::default();
+        options.extensions = vec!["cs".to_string()];
+        options.root_paths = vec![
+            "Assets".to_string(),
+            "Packages".to_string(),
+            "Library/PackageCache".to_string(),
+        ];
+        options.include_paths = Vec::new();
+        options.exclude_paths = vec!["**/Editor".to_string(), "**/Editor/**".to_string()];
+        options.skip_dirs = vec!["library".to_string(), ".git".to_string()];
+
+        let paths = collect_paths(&root, &options).unwrap();
+        let rel_paths = paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(rel_paths.contains(&"Assets/Scripts/Runtime.cs".to_string()));
+        assert!(rel_paths.contains(&"Packages/GamePackage/PackageRuntime.cs".to_string()));
+        assert!(
+            rel_paths
+                .contains(&"Library/PackageCache/UnityPackage/PackageCacheRuntime.cs".to_string())
+        );
+        assert!(!rel_paths.contains(&"Assets/Scripts/Editor/EditorOnly.cs".to_string()));
         assert!(!rel_paths.contains(&"Library/Other/Skipped.cs".to_string()));
 
         std::fs::remove_dir_all(root).unwrap();

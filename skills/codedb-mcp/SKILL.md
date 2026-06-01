@@ -2,18 +2,18 @@
 name: codedb-mcp
 description: >-
   For repositories configured with .codedb-mcp, use codedb tools before broad
-  source reads. Use `codedb_search` for natural-language, business-concept, or
-  fuzzy code lookup. Use `codedb_text_search` for exact text, regex, and string
-  search; use `rg` only to validate raw filesystem results or search outside the
-  configured index. Use `codedb_symbol`, `codedb_outline`, and `codedb_read` for
-  definitions, file outlines, and line-scoped code context. Use `codedb_callers`
-  for references, callers, or "where is this class/method used"; pass
+  source reads, and default to `codedb_bundle` whenever a task needs more than
+  one lookup. Batch status, search, outline, read, caller, and dependency checks
+  into one MCP round trip; use direct single tools only for truly one-step
+  questions. Use `codedb_search` for natural-language, business-concept, or fuzzy
+  lookup. Use `codedb_text_search` for exact text, regex, and string search, then
+  diagnose missing results with codedb status, scope, and reindex tools. Use
+  `codedb_symbol`, `codedb_outline`, and `codedb_read` for definitions, outlines,
+  and line-scoped context. Use `codedb_callers` for references/callers, with
   `definition_path` and `definition_line` when known. Use `codedb_deps` for
-  dependencies, reverse dependencies, and cross-module relationships. Use
-  `codedb_bundle`, `codedb_query`, or batch parameters when multiple searches,
-  outlines, reads, or dependency lookups are needed. Use `codedb_status`,
-  `codedb_changes`, or `codedb_hot` when the index may be stale or file watching
-  may not have applied changes.
+  dependencies and cross-module relationships. Use `codedb_query` for compact
+  find/search/filter/outline pipelines, and `codedb_status`, `codedb_changes`, or
+  `codedb_hot` when the index may be stale.
 ---
 
 # codedb-mcp
@@ -42,14 +42,15 @@ MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first
 
 Load `references/tools.md` when deciding which `codedb_*` tool to call. The common choices are:
 
+- Bundle first: when a task needs more than one codedb lookup, use `codedb_bundle` to combine status, search, outline, read, caller, and dependency calls into one MCP request. Use direct single-tool calls only for simple one-step questions.
 - Natural-language or fuzzy conceptual code search: use `codedb_search` first instead of reading broad source trees.
-- Exact text or regex lookup: use `codedb_text_search` first; compare with `rg` only when validating raw filesystem behavior or searching outside the configured index.
+- Exact text or regex lookup: use `codedb_text_search`; if results look incomplete, check `codedb_status`, scan scope, watch freshness, and reindex through codedb tools.
 - Symbol references or callers: use `codedb_callers` with `definition_path` and `definition_line` when known.
 - Definitions, file outlines, or code file context: use `codedb_symbol`, `codedb_outline`, and `codedb_read` before opening large files manually.
-- Dependencies and repeated lookups: use `codedb_deps`; use `codedb_bundle` or `codedb_query` to reduce MCP round trips and token usage.
+- Dependencies and repeated lookups: use `codedb_deps`; use `codedb_bundle` as the default way to reduce MCP round trips and token usage, or `codedb_query` for compact pipeline-style exploration.
 
 - `codedb_text_search`: trigram-accelerated exact/regex full-text search; supports `queries` batch, `path_glob`, compact output, and scopes.
-- `codedb_search`: BM25/symbol search or natural-language vector search; regex fallback delegates to `codedb_text_search`; supports `queries` batch.
+- `codedb_search`: BM25/symbol search or natural-language vector search; `regex=true` delegates to `codedb_text_search`; supports `queries` batch.
 - `codedb_callers`: LSP-like references anchored to a definition; supports `targets` batch. Accuracy is strongest for C#/Java.
 - `codedb_deps`: direct or transitive file dependencies and reverse dependencies. C#/Java namespace/package imports are the most precise path.
 - `codedb_outline`: precomputed file symbols.
@@ -59,7 +60,7 @@ Load `references/tools.md` when deciding which `codedb_*` tool to call. The comm
 - `codedb_status`, `codedb_changes`, `codedb_hot`: health and freshness checks.
 - `codedb_graph`, `codedb_communities`, `codedb_module_map`, `codedb_module_atlas`, `codedb_analyze`, `codedb_export`: graph inspection, DeepWiki module planning, viewer export, and graph export.
 
-Use `rg` alongside MCP when validating exact text behavior. Use MCP when the task needs indexed speed, typed references, dependencies, outlines, graph context, project-local cache reuse, or batch operations.
+Use codedb tools only for repository lookup. Stay inside the configured index and codedb status/config/reindex workflow when results need investigation.
 
 ## Operational Checks
 
@@ -77,4 +78,4 @@ Then call `codedb_status` through MCP. Confirm:
 - `cache` is `hit` on repeated opens when files and config are unchanged.
 - `[watch] enabled = true` and `poll_interval_seconds = 5` are present unless the human explicitly wants static benchmark behavior.
 
-For correctness checks, compare exact MCP regex search with `rg --no-ignore` on the same include/skip baseline, then use `codedb_callers` or `codedb_deps` for code-aware results that `rg` cannot reproduce directly.
+For correctness checks, use `codedb_status`, `codedb_changes`, `codedb_hot`, scan-scope inspection, and repeated `codedb_text_search`/`codedb_callers`/`codedb_deps` calls rather than switching tools.

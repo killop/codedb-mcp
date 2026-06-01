@@ -225,7 +225,7 @@ Read the existing file first and preserve its content. If the file does not exis
 ## 5. codedb-mcp 检索约定
 
 - 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
-- 当需要精确文本、正则或字符串搜索时，优先使用 `codedb_text_search`；只有在验证原始文件系统结果、或搜索未纳入索引的文件时，才补充使用 `rg`。
+- 当需要精确文本、正则或字符串搜索时，使用 `codedb_text_search`；如果结果看起来不完整，通过 `codedb_status`、扫描范围、监听状态和 codedb 重新索引流程排查。
 - 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
 - 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
 - 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。
@@ -240,7 +240,7 @@ $section = @'
 ## 5. codedb-mcp 检索约定
 
 - 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
-- 当需要精确文本、正则或字符串搜索时，优先使用 `codedb_text_search`；只有在验证原始文件系统结果、或搜索未纳入索引的文件时，才补充使用 `rg`。
+- 当需要精确文本、正则或字符串搜索时，使用 `codedb_text_search`；如果结果看起来不完整，通过 `codedb_status`、扫描范围、监听状态和 codedb 重新索引流程排查。
 - 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
 - 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
 - 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。

@@ -4,7 +4,7 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. This is the closest tool to `rg` and stays inside the indexed source corpus. |
+| `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. Stays inside the indexed source corpus. |
 | `codedb_search` | BM25/symbol or natural-language vector search | Use `query` for one lookup or `queries` for batch. Symbol-shaped default queries stay on the indexed lexical/symbol path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
 | `codedb_callers` | LSP-like symbol references | Pass `definition_path` and `definition_line` for same-name symbols. Use `targets` for batch. Strongest on C#/Java. |
 | `codedb_symbol` | Find definitions by symbol name | Add `body=true` only when the body is needed. |
@@ -43,13 +43,15 @@
 | `codedb_status` | Health and index stats | Check after setup, watch rebuild, or benchmark. |
 | `codedb_changes` | Files changed since sequence | Useful for incremental agent context. |
 | `codedb_index` | Reindex a local folder | Usually not needed when the server watches files. |
-| `codedb_bundle` | Up to 100 mixed tool calls | Use to reduce MCP round trips. Nested `codedb_bundle` is rejected. `timing=true` and `discard_output=true` are useful for benchmark runs. |
+| `codedb_bundle` | Up to 100 mixed tool calls | Prefer this whenever a task needs more than one codedb lookup. Batch status, search, outline, read, callers, and dependency calls into one MCP request. Nested `codedb_bundle` is rejected. `timing=true` and `discard_output=true` are useful for benchmark runs. |
 | `codedb_query` | Small find/filter/search/limit/outline pipeline | Good for compact exploration without writing a custom loop. |
 | `codedb_projects` | Projects loaded in this server process | Mostly diagnostic because storage is project-local under `.codedb-mcp`. |
 | `codedb_snapshot` | JSON snapshot of files, symbols, dependencies | Use carefully on large repos. |
 | `codedb_edit` | Compatibility stub | Read-only; returns an error. |
 | `codedb_remote` | Compatibility stub | Local build does not implement remote queries. |
 
-## rg Comparison
+## Codedb-Only Retrieval Policy
 
-Use `rg` for raw filesystem search across arbitrary file types. Use `codedb_text_search` when exact or regex text search should stay inside the indexed tree-sitter corpus and reuse the warm trigram index. Use `codedb_search` for hybrid lexical/symbol/vector ranking. Use `codedb_outline` across all configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior that `rg` does not model, with the highest confidence on C#/Java symbols.
+Use the codedb tool surface for repository lookup and stay inside codedb. Use `codedb_text_search` for exact or regex text search inside the indexed tree-sitter corpus. Use `codedb_search` for hybrid lexical/symbol/vector ranking. Use `codedb_outline` across configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior, with the highest confidence on C#/Java symbols. If results look incomplete, inspect `codedb_status`, scan roots, include/exclude rules, watch freshness, and reindex through codedb.
+
+Default to `codedb_bundle` for multi-step investigation. A typical bundle should combine the health check, search, outline/read, and dependency or caller follow-up calls that would otherwise be separate MCP round trips.

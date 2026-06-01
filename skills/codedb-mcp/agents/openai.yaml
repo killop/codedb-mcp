@@ -1,4 +1,4 @@
 interface:
   display_name: "codedb-mcp"
   short_description: "Use local indexed code lookup tools"
-  default_prompt: "Use the configured local codedb-mcp server for natural-language code search, exact text search, symbol references, file context, dependencies, and batched retrieval in this repository."
+  default_prompt: "Use the configured local codedb-mcp server for repository lookup, and combine multi-step searches, outlines, reads, callers, and dependency checks with codedb_bundle."

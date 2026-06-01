@@ -1293,6 +1293,39 @@ fn handle_deps(index: &Codebase, args: &Value) -> Result<String> {
 }
 
 fn handle_read(index: &Codebase, args: &Value) -> Result<String> {
+    if args.get("paths").is_some() {
+        let Some(items) = args.get("paths").and_then(Value::as_array) else {
+            return Ok("error: 'paths' must be an array".to_string());
+        };
+        return handle_read_batch(index, args, items);
+    }
+    handle_read_one(index, args)
+}
+
+fn handle_read_batch(index: &Codebase, base_args: &Value, items: &[Value]) -> Result<String> {
+    if items.is_empty() {
+        return Ok("error: 'paths' must not be empty".to_string());
+    }
+    let mut out = format!("{} codedb_read batch items:\n", items.len().min(MAX_BATCH_ITEMS));
+    for (idx, item) in items.iter().take(MAX_BATCH_ITEMS).enumerate() {
+        let args = batch_item_args(base_args, "paths", item, "path")?;
+        let path = get_str(&args, "path").unwrap_or_default();
+        out.push_str(&format!("--- [{idx}] codedb_read: {path} ---\n"));
+        out.push_str(&handle_read_one(index, &args)?);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if items.len() > MAX_BATCH_ITEMS {
+        out.push_str(&format!(
+            "(truncated: {} more batch items not executed)\n",
+            items.len() - MAX_BATCH_ITEMS
+        ));
+    }
+    Ok(out)
+}
+
+fn handle_read_one(index: &Codebase, args: &Value) -> Result<String> {
     let path = normalize_rel_path(&required_str(args, "path")?);
     if path.contains("..") || Path::new(&path).is_absolute() {
         return Ok("error: path traversal not allowed".to_string());

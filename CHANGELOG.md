@@ -7,6 +7,7 @@
 ### Added
 
 - Added `codedb_text_search`, a codedb-style trigram-accelerated full-text MCP tool with exact, regex, scoped, compact, scope, and batch query support.
+- Added batch support to `codedb_read` through `paths`, where each item can be a path string or an object overriding line range, compact, and hash options.
 - Added Lua language support through `tree-sitter-lua`, including `.lua` scanning, `require()` import extraction, common Lua function outline extraction, and Lua comment handling for compact search output.
 
 ### Changed
@@ -29,6 +30,7 @@
 - Replaced warm BM25 incremental rewrites with a live overlay over the base postings file. The overlay remaps unchanged base doc ids and stores changed/new docs in memory, avoiding full postings rewrites for MCP watcher updates.
 - Narrowed live dependency refreshes to changed-file symbol names and reused parsed file content for dependency and BM25 replacement work.
 - Split raw text search from hybrid semantic search: `codedb_text_search` now owns exact/regex line matching through a lazy `text_search_index.bin` trigram sidecar, while `codedb_search` remains the BM25/symbol/vector search surface and delegates regex fallback to the text index.
+- Updated `setup-for-agent.md` to append project-root `AGENTS.md` and `CLAUDE.md` codedb-mcp usage sections, asking future agents to prefer indexed MCP tools for semantic search, exact text search, symbol references, file context, dependencies, and batched lookups.
 
 ### Fixed
 

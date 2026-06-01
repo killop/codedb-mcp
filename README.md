@@ -293,6 +293,22 @@ MCP mode answers the protocol handshake before the initial index finishes, then 
 }
 ```
 
+`codedb_read` accepts `paths`:
+
+```json
+{
+  "compact": true,
+  "paths": [
+    "Assets/Scripts/HotFix/3rdExtend/Runtime/PoolManager/PoolManager.cs",
+    {
+      "path": "Assets/Plugins/3rdPlugins/Joystick Pack/Scripts/Runtime/Base/Joystick.cs",
+      "line_start": 1,
+      "line_end": 40
+    }
+  ]
+}
+```
+
 `codedb_communities` uses lazy Louvain clustering:
 
 ```powershell

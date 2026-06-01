@@ -212,8 +212,8 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_read",
-                "description": "Read indexed file contents, optionally a line range.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["path"]}
+                "description": "Read indexed file contents, optionally a line range. Pass path for one file, or paths for a batch of strings/objects.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "paths": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_edit",

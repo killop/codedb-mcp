@@ -217,7 +217,48 @@ dir = ".codedb-mcp"
 
 If this fails with a model load error, verify that `[embedding].model` points to the selected model directory and that the model files exist there.
 
-5. Ask the human whether this specific agent should register the MCP server.
+5. Update `<repo-root>\AGENTS.md` so future agents actively use `codedb-mcp` for code lookup.
+
+Read the existing file first and preserve its content. If the file does not exist, create it. Append the section below only when it is not already present:
+
+```markdown
+## 5. codedb-mcp 检索约定
+
+- 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
+- 当需要精确文本、正则或字符串搜索时，优先使用 `codedb_text_search`；只有在验证原始文件系统结果、或搜索未纳入索引的文件时，才补充使用 `rg`。
+- 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
+- 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
+- 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。
+- 当一次任务需要多个搜索、outline、read 或依赖查询时，优先使用 `codedb_bundle`、`codedb_query` 或工具自带的 batch 参数，减少 MCP 往返和 token 消耗。
+- 当怀疑索引不新鲜或监听未生效时，先调用 `codedb_status`、`codedb_changes` 或 `codedb_hot` 检查状态。
+```
+
+PowerShell helper:
+
+```powershell
+$section = @'
+## 5. codedb-mcp 检索约定
+
+- 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
+- 当需要精确文本、正则或字符串搜索时，优先使用 `codedb_text_search`；只有在验证原始文件系统结果、或搜索未纳入索引的文件时，才补充使用 `rg`。
+- 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
+- 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
+- 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。
+- 当一次任务需要多个搜索、outline、read 或依赖查询时，优先使用 `codedb_bundle`、`codedb_query` 或工具自带的 batch 参数，减少 MCP 往返和 token 消耗。
+- 当怀疑索引不新鲜或监听未生效时，先调用 `codedb_status`、`codedb_changes` 或 `codedb_hot` 检查状态。
+'@
+$path = Join-Path "<repo-root>" "AGENTS.md"
+if (Test-Path -LiteralPath $path) {
+  $content = Get-Content -LiteralPath $path -Raw
+  if ($content -notmatch '##\s*(\d+\.\s*)?codedb-mcp 检索约定') {
+    Add-Content -LiteralPath $path -Value "`r`n$section`r`n"
+  }
+} else {
+  Set-Content -LiteralPath $path -Value "# AGENTS.md`r`n`r`n$section`r`n"
+}
+```
+
+6. Ask the human whether this specific agent should register the MCP server.
 
 Do not silently edit agent-wide MCP settings. After the human agrees, configure the current agent using its own MCP mechanism. The command shape is:
 

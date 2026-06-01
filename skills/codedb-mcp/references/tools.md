@@ -10,7 +10,7 @@
 | `codedb_symbol` | Find definitions by symbol name | Add `body=true` only when the body is needed. |
 | `codedb_word` | Exact identifier inverted-index lookup | Fast primitive for debugging reference results. |
 | `codedb_outline` | File symbol outline | Prefer this before full reads. |
-| `codedb_read` | Indexed file content | Use line ranges and `compact=true` to keep context small. |
+| `codedb_read` | Indexed file content | Use `path` for one file or `paths` for batch. Line ranges and `compact=true` keep context small; object items in `paths` can override `line_start`, `line_end`, `compact`, and `if_hash`. |
 
 ## File Discovery
 

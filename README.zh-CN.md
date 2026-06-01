@@ -261,6 +261,7 @@ MCP 模式会先完成协议握手，再在后台构建默认项目索引；如�
 | `codedb_outline` | 返回预计算符号大纲，不在请求时重新 parse |
 | `codedb_symbol` | 按符号名找定义 |
 | `codedb_word` | 精确 identifier 倒排索引查询 |
+| `codedb_read` | 读取索引文件或行范围；支持 `paths` batch，数组项可以覆盖行号和 compact |
 | `codedb_find` | 模糊文件名/路径查找 |
 | `codedb_query` | find/search/filter/limit/outline 小型 pipeline |
 | `codedb_bundle` | 一次 MCP 请求里执行最多 100 个工具调用 |

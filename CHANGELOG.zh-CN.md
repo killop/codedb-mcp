@@ -7,6 +7,7 @@
 ### 新增
 
 - 新增 `codedb_text_search`：对齐 codedb 思路的 trigram 加速全文 MCP 工具，支持 exact、regex、path scope、compact、scope 和 batch 查询。
+- `codedb_read` 新增 `paths` batch 支持；数组项可以是路径字符串，也可以是覆盖行号、compact 和 hash 参数的对象。
 - 新增 Lua 语言支持：接入 `tree-sitter-lua`，支持 `.lua` 扫描、`require()` import 抽取、常见 Lua 函数 outline 抽取，并补充 Lua 注释识别用于 compact search 输出。
 
 ### 变更
@@ -29,6 +30,7 @@
 - warm BM25 增量从“重写 postings 文件”改为 base postings + live overlay。overlay 会 remap 未变化的 base doc id，并把变更/新增 doc 保存在内存层，避免 MCP watcher 更新时重写完整 postings。
 - 将 live dependency refresh 收窄到变更文件出现过的符号名，并复用刚 parse 出来的源码内容生成依赖和 BM25 replacement token。
 - 将 raw text search 从混合语义搜索里拆出来：`codedb_text_search` 通过懒加载的 `text_search_index.bin` trigram sidecar 负责 exact/regex 行匹配；`codedb_search` 保留 BM25/symbol/vector 混合搜索，并把 regex fallback 委托给 text index。
+- 更新 `setup-for-agent.md`：setup 时会给项目根目录 `AGENTS.md` 和 `CLAUDE.md` 追加 codedb-mcp 使用约定，要求后续 agent 在自然语义搜索、精确文本搜索、符号引用、文件上下文、依赖查询和批量查询时优先使用索引化 MCP 工具。
 
 ### 修复
 

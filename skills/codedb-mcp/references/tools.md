@@ -4,7 +4,8 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_search` | Regex, BM25/symbol, or natural-language vector search | Use `query` for one lookup or `queries` for batch. `regex=true` is closest to `rg`; symbol-shaped default queries stay on the indexed lexical/symbol path, while natural-language queries add lazy Model2Vec flat-cosine ranking. |
+| `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. This is the closest tool to `rg` and stays inside the indexed source corpus. |
+| `codedb_search` | BM25/symbol or natural-language vector search | Use `query` for one lookup or `queries` for batch. Symbol-shaped default queries stay on the indexed lexical/symbol path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
 | `codedb_callers` | LSP-like symbol references | Pass `definition_path` and `definition_line` for same-name symbols. Use `targets` for batch. Strongest on C#/Java. |
 | `codedb_symbol` | Find definitions by symbol name | Add `body=true` only when the body is needed. |
 | `codedb_word` | Exact identifier inverted-index lookup | Fast primitive for debugging reference results. |
@@ -51,4 +52,4 @@
 
 ## rg Comparison
 
-Use `rg` for raw filesystem search across arbitrary file types. Use `codedb_search regex=true` when exact text search should stay inside the indexed tree-sitter corpus and reuse the warm index. Use `codedb_outline` across all configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior that `rg` does not model, with the highest confidence on C#/Java symbols.
+Use `rg` for raw filesystem search across arbitrary file types. Use `codedb_text_search` when exact or regex text search should stay inside the indexed tree-sitter corpus and reuse the warm trigram index. Use `codedb_search` for hybrid lexical/symbol/vector ranking. Use `codedb_outline` across all configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior that `rg` does not model, with the highest confidence on C#/Java symbols.

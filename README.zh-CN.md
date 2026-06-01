@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <h1>codebase-mcp</h1>
 
@@ -29,7 +29,7 @@
 
 `codebase-mcp` 会把一个本地仓库变成常驻 MCP 代码智能服务。它把 tree-sitter 索引源码、符号、引用、依赖、图元数据、词法索引和向量搜索数据都放在目标仓库的 `.codedb-mcp` 目录下。
 
-常驻 MCP 进程内的 warm tool 调用目标是毫秒级响应。实测数据见 [Benchmark 速览](#benchmark-速览) 和 [MCP 工具 Benchmark 矩阵](#mcp-工具-benchmark-矩阵)，里面包含耗时、峰值内存和 `rg` 对比。
+常驻 MCP 进程内的 warm tool 调用目标是毫秒级响应。实测数据见 [Benchmark 速览](#benchmark-速览) 和 [MCP 工具 Benchmark 矩阵](#mcp-工具-benchmark-矩阵)，里面包含 warm 耗时和 `rg` 对比。
 
 ## 功能概览
 
@@ -78,64 +78,72 @@ npm run dev -- --port 5174 --strictPort
 
 测试目标：`u3dclient`。
 
-Benchmark 于 2026-05-29 在 Windows 上重跑。`warm` 耗时来自一个已加载的 MCP 进程；`one-shot` 耗时来自单独启动的 CLI 子进程，包含进程启动和 cache load。峰值内存口径是 MB Working Set / Private Bytes。
+以下 benchmark 于 2026-06-01 在 Windows 上重跑。工具耗时只记录已加载 server-style 进程内的 warm 调用；相关 lazy sidecar 已加载，不包含进程启动和 cache open 时间。
 
 当前 Unity C# benchmark 配置索引状态：
 
-- 19,035 indexed files
-- 31,949 chunks
-- 277,213 symbols
-- 19,941 graph nodes
-- 166,132 graph edges
+- 14,243 个 runtime indexed files
+- 23,508 chunks
+- 14,243 outlines
+- 14,885 graph nodes
+- 139,179 graph edges
 - Model2Vec `minishlab/potion-code-16M` 文件向量在首次自然语言搜索时懒生成
 - lazy flat cosine file vectors
 - 存储目录：`u3dclient\.codedb-mcp`
-- cache v20 sidecar：紧凑 `index.bin`、spill-to-disk `bm25.postings`、懒加载 `word_index.bin`/`word_hits.bin`、懒加载 `callers.bin`、懒加载 `deps.bin`、可选旧版 `embeddings.bin`，以及二进制源码 fingerprint。
-- 下方峰值内存为子进程 sampled Working Set / Private Bytes。冷重建行是在开启内存采样时测得，因此 wall time 不应直接和未采样的更快冷重建结果对比。
+- cache v23 sidecar：generation 命名的紧凑 `index.*.bin`、`fingerprints.*.bin`、offset-addressed `outlines.*.bin` / `outlines_index.*.bin`、spill-to-disk `bm25.*.postings`、懒加载 `word_index.bin`/`word_hits.bin`、懒加载 `text_search_index.bin`、懒加载 `callers.bin`、懒加载 `deps.*.bin`、可选旧版 `embeddings.bin`，并采用 manifest-last 提交。
 
 索引和 cache 基线：
 
-| 场景 | 耗时 | 峰值内存 | 说明 |
-|---|---:|---:|---|
-| cache v20 冷重建 | 30.258s wall | 255.8 / 249.6 MB | tree-sitter 声明解析、按需源码依赖、spill-to-disk BM25、懒 embedding、compact cache save |
-| cache-hit index open | 0.873s internal / 1.132s wall | 134.9 / 136.0 MB | 进程启动、源码 fingerprint 校验和 cache load |
-| `codedb_index` cache-hit 工具调用 | 1.556s wall | 141.5 / 140.4 MB | cache 已有效时的显式工具调用 |
+| 场景 | 耗时 | 说明 |
+|---|---:|---|
+| cold rebuild | 30.258s | tree-sitter 声明解析、按需源码依赖、spill-to-disk BM25、懒 embedding、compact cache save |
+| trigram text sidecar build | 5.2s | 第一次 regex/text-index 调用会构建一次 `text_search_index.bin`；之后是 warm 调用 |
+| text sidecar size | 84.3 MB | sorted trigram lookup + contiguous file-id postings |
+
+同一份 `u3dclient` runtime C# 配置下的增量 cache 维护：
+
+| 场景 | 耗时 | Cache 结果 | 说明 |
+|---|---:|---|---|
+| 新增 1,000 个小 `.cs` 文件 | 0.856s warm apply | `live-incremental` | event queue 批处理；只解析新增文件并写 BM25 overlay |
+| 修改 1,000 个小 `.cs` 文件 | 0.811s warm apply | `live-incremental` | deps 与 BM25 replacement token 复用刚 parse 出来的源码内容 |
+| 删除 1,000 个小 `.cs` 文件 | 0.375s warm apply | `live-incremental` | 过滤内存 deps，删除当前 doc，不重写完整 postings |
 
 ## MCP 工具 Benchmark 矩阵
 
-这个表刻意压成 3 列，避免 GitHub README 页面出现横向滚动条。内存口径是 MB Working Set / Private Bytes。
+这个表刻意压成 3 列，避免 GitHub README 页面出现横向滚动条。标注 `after load` 的行不包含同一进程里的首次 lazy sidecar 加载。
 
 | Tool / 用途 | MCP 实测 | rg 对比 |
 |---|---|---|
-| `codedb_index`<br>构建/重建本地索引 | cold 30.258s，255.8 / 249.6 MB<br>cache-hit tool 1.556s，141.5 / 140.4 MB | 无 |
-| `codedb_status`<br>健康状态、数量、扫描状态 | one-shot 0.561s，14.2 / 7.9 MB | 无 |
-| `codedb_tree`<br>索引树，含语言、行数、符号数 | warm 11.891ms<br>one-shot 1.018s，142.0 / 141.0 MB | 只能部分列文件 |
-| `codedb_outline`<br>单文件符号大纲 | warm 0.074ms<br>one-shot 1.279s，140.2 / 140.3 MB | 无 |
-| `codedb_symbol`<br>按符号名找定义 | warm 2.106ms<br>one-shot 1.034s，140.7 / 140.0 MB | regex 只能近似文本 |
-| `codedb_search`<br>混合搜索、regex、batch 查询 | warm scoped regex 7.120ms<br>one-shot 1.097s，142.3 / 140.5 MB | scoped `rg` 0.047s，warm MCP 快 6.6x<br>broad raw grep 慢 1.5-1.8x |
-| `codedb_word`<br>精确 identifier 倒排索引 | warm 首次 lazy load 94.403ms<br>one-shot 1.033s，167.3 / 172.6 MB | 只能部分 word grep |
-| `codedb_callers`<br>定义锚定引用 | warm 3.422ms<br>one-shot 1.309s，168.5 / 173.0 MB | 无语义锚定 |
-| `codedb_hot`<br>最近修改的索引文件 | warm 7.069ms<br>one-shot 1.454s，141.4 / 140.5 MB | 无 |
-| `codedb_deps`<br>正向/反向/传递文件依赖 | warm 0.098ms<br>one-shot 0.528s，29.5 / 23.0 MB | 无 |
-| `codedb_read`<br>读索引文件或行范围 | warm 0.757ms<br>one-shot 1.307s，141.7 / 140.1 MB | 只能部分打印文件 |
-| `codedb_edit`<br>只读兼容 stub | one-shot 0.128s，4.8 / 1.2 MB | 无 |
-| `codedb_changes`<br>按 sequence 查变更文件 | warm 10.818ms<br>one-shot 0.871s，144.7 / 145.8 MB | 无 |
-| `codedb_snapshot`<br>files/symbols/deps JSON 快照 | one-shot 2.421s，634.0 / 715.8 MB | 无 |
-| `codedb_bundle`<br>一次 MCP 请求内最多 100 个工具调用 | warm 100 fast ops 57.725ms<br>one-shot 20 searches 1.107s，143.3 / 141.5 MB | 无 MCP batching |
-| `codedb_remote`<br>remote 兼容 stub | one-shot 0.136s，5.4 / 1.3 MB | 无 |
-| `codedb_projects`<br>当前 server process 的项目列表 | one-shot 0.114s，3.8 / 1.0 MB | 无 |
-| `codedb_find`<br>模糊文件名/路径查找 | warm 18.019-20.230ms<br>one-shot 0.406s，14.1 / 7.8 MB | 无 fuzzy ranking |
-| `codedb_query`<br>find/search/filter/limit/outline pipeline | warm 6.786-25.139ms<br>one-shot 1.149s，141.6 / 140.6 MB | 无等价单工具 |
-| `codedb_glob`<br>索引路径 glob 匹配 | warm 4.231ms<br>one-shot 0.956s，140.7 / 140.1 MB | `rg --files -g` 0.045s<br>warm MCP 快 10.6x |
-| `codedb_ls`<br>索引目录直接子项 | warm 4.027ms<br>one-shot 0.940s，139.3 / 138.8 MB | 只能部分列文件 |
-| `codedb_graph`<br>图摘要/导出 | one-shot 1.988s，389.4 / 396.8 MB | 无 |
-| `codedb_explain`<br>解释图节点和出入边 | warm 首次 graph explain 845.369ms<br>one-shot 1.854s，392.8 / 397.6 MB | 无 |
-| `codedb_path`<br>图最短路径 | warm after graph load 13.073ms<br>one-shot 1.790s，392.6 / 397.2 MB | 无 |
-| `codedb_communities`<br>lazy Louvain communities | warm 265.593ms<br>one-shot 1.905s，390.8 / 400.1 MB | 无 |
-| `codedb_module_map`<br>DeepWiki 模块规划 | warm 1.679s<br>one-shot 2.236s，214.4 / 215.3 MB | 无 |
-| `codedb_module_atlas`<br>module/file atlas JSON 导出 | Rust export 8.548s，319.8 / 323.5 MB<br>完整 skill 10.870s wall，采样峰值 371.8 / 369.9 MB | 无 |
-| `codedb_analyze`<br>图统计和建议问题 | warm graph analysis 830.637ms<br>one-shot 2.936s，392.2 / 397.5 MB | 无 |
-| `codedb_export`<br>导出 JSON/GraphML/Cypher | warm after graph load 10.313ms<br>one-shot 1.963s，390.0 / 397.0 MB | 无 |
+| `codedb_index`<br>构建/重建本地索引 | cold rebuild 30.258s | 无 |
+| `codedb_status`<br>健康状态、数量、扫描状态 | 0.761ms | 无 |
+| `codedb_tree`<br>索引树，含语言、行数、符号数 | 11.028ms | 只能部分列文件 |
+| `codedb_outline`<br>单文件符号大纲 | 0.402ms | 无 |
+| `codedb_symbol`<br>按符号名找定义 | 2.368ms | regex 只能近似文本 |
+| `codedb_text_search`<br>trigram 全文和 regex 搜索 | `PoolManager` 1.041ms<br>`Joystick` 1.790ms<br>`class\\s+Joystick` regex 25.767ms | 同 root 且排除 Editor：`rg` 分别 1238.513ms、451.176ms、3312.850ms |
+| `codedb_search`<br>BM25/symbol/vector 混合搜索 | `PoolManager` 18.162ms | 没有等价 `rg`；regex fallback 走 `codedb_text_search` |
+| `codedb_word`<br>精确 identifier 倒排索引 | 0.299ms after load | 只能部分 word grep |
+| `codedb_callers`<br>定义锚定引用 | 8.383ms | 无语义锚定 |
+| `codedb_hot`<br>最近修改的索引文件 | 2.887ms | 无 |
+| `codedb_deps`<br>正向/反向/传递文件依赖 | 0.279ms after deps sidecar load | 无 |
+| `codedb_read`<br>读索引文件或行范围 | 0.565ms | 只能部分打印文件 |
+| `codedb_edit`<br>只读兼容 stub | trivial error response | 无 |
+| `codedb_changes`<br>按 sequence 查变更文件 | 6.366ms | 无 |
+| `codedb_snapshot`<br>files/symbols/deps JSON 快照 | 1.069s | 无 |
+| `codedb_bundle`<br>一次 MCP 请求内最多 100 个工具调用 | 本矩阵通过它采样；用于减少 MCP 往返 | 无 MCP batching |
+| `codedb_remote`<br>remote 兼容 stub | trivial error response | 无 |
+| `codedb_projects`<br>当前 server process 的项目列表 | in-memory list | 无 |
+| `codedb_find`<br>模糊文件名/路径查找 | 16.021ms | 无 fuzzy ranking |
+| `codedb_query`<br>find/search/filter/limit/outline pipeline | 19.586ms | 无等价单工具 |
+| `codedb_glob`<br>索引路径 glob 匹配 | 3.721ms | 同树 `rg --files -g` 约 45ms |
+| `codedb_ls`<br>索引目录直接子项 | 0.662ms | 只能部分列文件 |
+| `codedb_graph`<br>图摘要/导出 | graph loaded 后 54.687ms；首次 lazy graph build 1.816s | 无 |
+| `codedb_explain`<br>解释图节点和出入边 | graph loaded 后 19.805ms | 无 |
+| `codedb_path`<br>图最短路径 | graph loaded 后 55.508ms | 无 |
+| `codedb_communities`<br>lazy Louvain communities | cached communities 8.282ms | 无 |
+| `codedb_module_map`<br>DeepWiki 模块规划 | 7.512s | 无 |
+| `codedb_module_atlas`<br>module/file atlas JSON 导出 | 8.715s | 无 |
+| `codedb_analyze`<br>图统计和建议问题 | graph loaded 后 47.249ms | 无 |
+| `codedb_export`<br>导出 JSON/GraphML/Cypher | graph loaded 后 5.513ms | 无 |
 
 Java 工程 `gameserver`：
 
@@ -176,7 +184,7 @@ MCP 命令形态：
 - 使用 Minish 生态的 `model2vec-rs` 和显式路径配置的 `minishlab/potion-code-16M` 生成本地文件级向量。
 - 使用 BM25、精确 identifier 倒排索引；符号形态 query 不加载向量，自然语言 query 才懒加载 Model2Vec 并做 flat cosine 向量检索。
 - 构建 graphify 风格代码图，并对 `codedb_communities` 懒计算 Louvain community；`codedb_module_map` 和 `codedb_module_atlas` 是 Rust 原生模块视图，先按依赖连通文件图划分，再在连通块内做 dependency-weighted label propagation，并输出依赖内聚度、跨目录证据、语义近邻、入口点、关键符号和 c-TF-IDF-like 标签。
-- MCP 模式下监听配置内的源码扩展，文件改动后 debounce 并后台重建索引。
+- MCP 模式默认用文件系统事件队列收集变更，并每 5 秒把队列内的文件作为一个批次应用，避免大工程每轮全量扫描。
 
 ## 技术架构
 
@@ -186,7 +194,7 @@ MCP 命令形态：
 4. **语言解析层**：所有语言统一走 tree-sitter grammar，输出同一套 `FileEntry` 和 `Symbol` 结构。当前支持 C#、Java、Rust、Python、Lua、JavaScript、TypeScript/TSX、C、C++，解析时只遍历声明层，避免大型方法体拖慢索引。
 5. **代码语义增强层**：C#/Java 上继续做 namespace/package import、别名、静态 using、注解、属性后缀、限定名引用等轻量语义推断；Lua 会抽取 `require()` 并生成轻量文件依赖。
 6. **搜索索引层**：cold index 阶段构建 chunk 元数据、symbol definition chunks、dependency references 和 spill-to-disk BM25。identifier word hits 与 Model2Vec file embeddings 改为 callers 或自然语言搜索首次需要时懒生成。
-7. **内存友好缓存层**：cache v20 吸收 `justrach/codedb` 的 bounded content cache 思路：完整文件正文、chunk 预览正文、重复 chunk 文件路径、重复 language/kind 字符串、BM25 postings、word-index hits、caller 结果、embeddings、正向/反向依赖、graph 对象和 Louvain 结果都不再默认常驻。工具需要时再按需读取精确行、postings、word hits、caller sidecar、embedding、依赖或图数据。
+7. **内存友好的增量缓存层**：cache v23 吸收 `justrach/codedb` 的 bounded content cache 思路：完整文件正文、chunk 预览正文、重复 chunk 文件路径、重复 language/kind 字符串、BM25 postings、word-index hits、caller 结果、embeddings、正向/反向依赖、graph 对象和 Louvain 结果都不再默认常驻。工具需要时再按需读取精确行、offset-addressed outlines、postings、word hits、caller sidecar、embedding、依赖或图数据。watcher refresh 走事件队列，只解析变更文件，复用旧依赖 sidecar，并把 BM25 变化保存在 live overlay，不再重写完整 postings。
 8. **依赖与图层**：graphify 风格代码图懒构建。小仓库保留 file、namespace/package、symbol、dependency、reference 等节点和边；大仓库只有 graph/community/module 工具会触发 graph 构建，symbol 数据仍保留在 outline/search/callers 专用索引；Louvain community 懒加载并缓存。
 9. **模块 atlas 层**：`codedb_module_map` 和 `codedb_module_atlas` 在 Rust 里运行。它们先按依赖图弱连通分量切开文件，再在每个连通块内部做依赖加权 label propagation。路径和 token 只用于命名、证据展示和过大连通块拆分，不作为主要聚类依据。`codedb_module_atlas` 导出 Embedding Atlas 可视化数据。
 10. **MCP 工具层**：基于 Rust `rmcp` SDK 的 stdio server 实现；工具运行在 warm in-process index 上，支持 batch 和 bundle，减少 MCP 往返成本。
@@ -240,13 +248,14 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml i
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
 
-MCP 模式会先完成协议握手，再在后台构建默认项目索引；如果索引还没完成，早期工具调用会等待首次构建结束。文件监听默认开启，源码变更后会 debounce 并后台重建索引。
+MCP 模式会先完成协议握手，再在后台构建默认项目索引；如果索引还没完成，早期工具调用会等待首次构建结束。`[watch] enabled = true` 默认开启，`poll_interval_seconds = 5` 表示文件系统事件会先进入队列，并在每个 tick 合并成一个批次应用。重建由进程内单一锁串行化，新一轮 tick 会等待当前更新结束，不会打断正在写入的 index。cache 提交采用 manifest-last 和 generation sidecar：如果 index 过程中进程被强杀，旧 manifest 仍指向旧可用 cache，新一代半成品会被忽略。
 
 ## 工具简介
 
 | Tool | 用途 |
 |---|---|
-| `codedb_search` | 混合搜索或 regex 行搜索；支持 `queries` batch |
+| `codedb_text_search` | trigram 加速全文/regex 搜索；支持 `queries` batch、`path_glob` 和 scope |
+| `codedb_search` | BM25/symbol/vector 混合搜索；regex fallback 走 `codedb_text_search`；支持 `queries` batch |
 | `codedb_callers` | LSP-like 引用查找；支持 definition path/line 锚定和 `targets` batch |
 | `codedb_deps` | 文件依赖和反向依赖；支持 transitive |
 | `codedb_outline` | 返回预计算符号大纲，不在请求时重新 parse |
@@ -282,3 +291,4 @@ MCP 模式会先完成协议握手，再在后台构建默认项目索引；如�
 
 - [meet-blog.buyixiao.xyz](https://meet-blog.buyixiao.xyz/) 启发了 Code Module Atlas 的视觉风格和 viewer 体验。
 - [justrach/codedb](https://github.com/justrach/codedb) 启发了最初的 MCP 工具接口方向。
+

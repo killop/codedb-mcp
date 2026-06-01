@@ -23,13 +23,14 @@ When MCP is already configured, the server command shape is:
 <skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
 ```
 
-MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first, and builds the default project index in the background; early tool calls may wait until that initial index is ready. Keep the server alive for editor/agent workflows because warm tool latency is the representative number.
+MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first, and builds the default project index in the background; early tool calls may wait until that initial index is ready. Keep the server alive for editor/agent workflows because warm tool latency is the representative number. File freshness is config-driven: `[watch] enabled = true` and `poll_interval_seconds = 5` make the server queue filesystem events and apply them as one serialized batch every 5 seconds. Normal source edits should return `cache: live-incremental`: only new/modified files are parsed, dependency refresh is narrowed to changed-file symbols, and BM25 updates use a live overlay over the base postings file. Cache commits are manifest-last generation writes, so an interrupted index should leave the previous cache usable.
 
 ## Tool Use
 
 Load `references/tools.md` when deciding which `codedb_*` tool to call. The common choices are:
 
-- `codedb_search`: regex line search, BM25/symbol search, or natural-language vector search; supports `queries` batch.
+- `codedb_text_search`: trigram-accelerated exact/regex full-text search; supports `queries` batch, `path_glob`, compact output, and scopes.
+- `codedb_search`: BM25/symbol search or natural-language vector search; regex fallback delegates to `codedb_text_search`; supports `queries` batch.
 - `codedb_callers`: LSP-like references anchored to a definition; supports `targets` batch. Accuracy is strongest for C#/Java.
 - `codedb_deps`: direct or transitive file dependencies and reverse dependencies. C#/Java namespace/package imports are the most precise path.
 - `codedb_outline`: precomputed file symbols.
@@ -54,5 +55,6 @@ Then call `codedb_status` through MCP. Confirm:
 - `root_paths`, `include_paths`, `exclude_paths`, and `skip_dirs` match the intended scan scope. For Unity runtime-only scans, prefer `root_paths = ["Assets", "Packages", "Library/PackageCache"]` plus `exclude_paths = ["**/Editor", "**/Editor/**"]`.
 - `storage_dir` points inside `<repo-root>\.codedb-mcp`.
 - `cache` is `hit` on repeated opens when files and config are unchanged.
+- `[watch] enabled = true` and `poll_interval_seconds = 5` are present unless the human explicitly wants static benchmark behavior.
 
 For correctness checks, compare exact MCP regex search with `rg --no-ignore` on the same include/skip baseline, then use `codedb_callers` or `codedb_deps` for code-aware results that `rg` cannot reproduce directly.

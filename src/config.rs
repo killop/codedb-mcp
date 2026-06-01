@@ -60,6 +60,8 @@ pub struct DiagnosticsConfig {
 pub struct WatchConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_watch_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,7 +158,10 @@ impl Default for DiagnosticsConfig {
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            poll_interval_seconds: default_watch_poll_interval_seconds(),
+        }
     }
 }
 
@@ -231,6 +236,10 @@ fn normalize_config_paths(paths: &[String]) -> Vec<String> {
 
 fn default_max_file_bytes() -> u64 {
     50_000_000
+}
+
+fn default_watch_poll_interval_seconds() -> u64 {
+    5
 }
 
 fn default_embedding_model() -> String {

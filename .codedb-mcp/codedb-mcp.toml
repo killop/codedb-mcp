@@ -61,8 +61,9 @@ timing = false
 slow_file_ms = 0
 
 [watch]
-# MCP mode watches configured extensions and rebuilds after a short debounce.
+# MCP mode queues filesystem events and applies one live-incremental batch per tick.
 enabled = true
+poll_interval_seconds = 5
 
 [storage]
 # Store generated data under the target project. Deleting this directory removes

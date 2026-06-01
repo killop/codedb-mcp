@@ -1,8 +1,9 @@
-use crate::cache::{CachedCallerEntry, CachedCallerHit, CachedDepsSnapshot, ProjectCache};
+use crate::cache::{
+    CachedCallerEntry, CachedCallerHit, CachedDepsSnapshot, CachedFileEntry, ProjectCache,
+};
 use crate::graph::GraphCommunity;
 use crate::indexer::{
-    ChangedFile, Codebase, IndexOptions, build_globset, fingerprint_project, hash_content,
-    normalize_rel_path,
+    ChangedFile, Codebase, IndexOptions, build_globset, hash_content, normalize_rel_path,
 };
 use crate::language::{is_comment_or_blank, scope_for_line};
 use crate::search::hybrid_search;
@@ -33,6 +34,11 @@ pub struct ProjectManager {
     options: IndexOptions,
     cache: RwLock<HashMap<String, Arc<Codebase>>>,
     build_lock: Mutex<()>,
+}
+
+pub enum ReindexCheck {
+    Unchanged,
+    Reindexed(Arc<Codebase>),
 }
 
 impl ProjectManager {
@@ -92,6 +98,31 @@ impl ProjectManager {
         self.reindex(&self.default_root)
     }
 
+    pub fn apply_default_changes(
+        &self,
+        changed_paths: Vec<String>,
+        deleted_paths: Vec<String>,
+    ) -> Result<ReindexCheck> {
+        if changed_paths.is_empty() && deleted_paths.is_empty() {
+            return Ok(ReindexCheck::Unchanged);
+        }
+        let root = self.default_root.canonicalize()?;
+        let key = root.display().to_string();
+        let _guard = self.build_lock.lock();
+        let Some(old) = self.cache.read().get(&key).cloned() else {
+            let mut index = Codebase::index(&root, self.options.clone())?;
+            index.changed_files = initial_changes(&index);
+            let index = Arc::new(index);
+            self.cache.write().insert(key, index.clone());
+            return Ok(ReindexCheck::Reindexed(index));
+        };
+        let mut index = old.update_known_paths(&changed_paths, &deleted_paths)?;
+        index.changed_files = changed_files_from_paths(&root, &changed_paths, &deleted_paths);
+        let index = Arc::new(index);
+        self.cache.write().insert(key, index.clone());
+        Ok(ReindexCheck::Reindexed(index))
+    }
+
     pub fn default_root(&self) -> PathBuf {
         self.default_root.clone()
     }
@@ -100,32 +131,51 @@ impl ProjectManager {
         self.options.extensions.clone()
     }
 
+    pub fn options(&self) -> IndexOptions {
+        self.options.clone()
+    }
+
     pub fn projects(&self) -> Vec<String> {
         let mut projects = self.cache.read().keys().cloned().collect::<Vec<_>>();
         projects.sort();
         projects
     }
+}
 
-    pub fn default_has_content_changes(&self) -> Result<bool> {
-        let root = self.default_root.canonicalize()?;
-        let key = root.display().to_string();
-        let Some(current) = self.cache.read().get(&key).cloned() else {
-            return Ok(true);
-        };
-        let next = fingerprint_project(&root, &self.options)?;
-        if next.len() != current.files.len() {
-            return Ok(true);
+fn changed_files_from_paths(
+    root: &Path,
+    changed_paths: &[String],
+    deleted_paths: &[String],
+) -> Vec<ChangedFile> {
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    for path in changed_paths {
+        let path = normalize_rel_path(path);
+        if !seen.insert(path.clone()) {
+            continue;
         }
-        for (path, hash) in next {
-            let Some(file) = current.files.get(&path) else {
-                return Ok(true);
-            };
-            if file.content_hash != hash {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let size = fs::metadata(root.join(&path))
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or_default();
+        changes.push(ChangedFile {
+            path,
+            op: "modified",
+            size,
+        });
     }
+    for path in deleted_paths {
+        let path = normalize_rel_path(path);
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        changes.push(ChangedFile {
+            path,
+            op: "deleted",
+            size: 0,
+        });
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
 }
 
 pub fn dispatch_cached_cli_tool(
@@ -136,7 +186,7 @@ pub fn dispatch_cached_cli_tool(
 ) -> Result<Option<String>> {
     if !matches!(
         name,
-        "codedb_status" | "codedb_find" | "codedb_deps" | "codedb_callers"
+        "codedb_status" | "codedb_find" | "codedb_deps" | "codedb_callers" | "codedb_outline"
     ) {
         return Ok(None);
     }
@@ -153,6 +203,7 @@ pub fn dispatch_cached_cli_tool(
             .load_file_list(options)?
             .map(|files| handle_cached_find(&files, args))
             .transpose()?),
+        "codedb_outline" => handle_cached_outline(&cache, options, args),
         "codedb_deps" => Ok(cache
             .load_deps_snapshot(options)?
             .map(|snapshot| handle_cached_deps(&snapshot, args))
@@ -210,6 +261,41 @@ fn handle_cached_find(files: &[String], args: &Value) -> Result<String> {
         out.push_str(&format!("{}. {} (score: {:.2})\n", idx + 1, path, score));
     }
     Ok(out)
+}
+
+fn handle_cached_outline(
+    cache: &ProjectCache,
+    options: &IndexOptions,
+    args: &Value,
+) -> Result<Option<String>> {
+    let path = required_str(args, "path")?;
+    let compact = get_bool(args, "compact");
+    let Some(file) = cache.load_outline_file(options, &path)? else {
+        return Ok(None);
+    };
+    Ok(Some(format_cached_outline(&file, compact)))
+}
+
+fn format_cached_outline(file: &CachedFileEntry, compact: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} ({}, {} lines, {} bytes)\n",
+        file.path, file.language, file.line_count, file.byte_size
+    ));
+    for symbol in &file.symbols {
+        if compact {
+            out.push_str(&format!(
+                "  L{}: {} {}\n",
+                symbol.line_start, symbol.kind, symbol.name
+            ));
+        } else {
+            out.push_str(&format!(
+                "  L{}: {} {}  // {}\n",
+                symbol.line_start, symbol.kind, symbol.name, symbol.detail
+            ));
+        }
+    }
+    out
 }
 
 fn handle_cached_deps(snapshot: &CachedDepsSnapshot, args: &Value) -> Result<String> {
@@ -428,6 +514,7 @@ fn dispatch_index_tool(index: &Codebase, name: &str, args: &Value) -> Result<Str
         "codedb_outline" => handle_outline(index, args),
         "codedb_symbol" => handle_symbol(index, args),
         "codedb_search" => handle_search(index, args),
+        "codedb_text_search" => handle_text_search(index, args),
         "codedb_word" => handle_word(index, args),
         "codedb_callers" => handle_callers(index, args),
         "codedb_hot" => Ok(handle_hot(index, args)),
@@ -573,7 +660,7 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
     let path_glob = get_str(args, "path_glob");
 
     if regex {
-        let hits = index.line_hits(
+        let hits = index.text_line_hits(
             &query,
             max_results,
             regex,
@@ -590,7 +677,7 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
     let selector_ref = selector.as_deref();
     let hits = hybrid_search(index, &query, max_results, selector_ref)?;
     if hits.is_empty() {
-        let fallback = index.line_hits(
+        let fallback = index.text_line_hits(
             &query,
             max_results,
             regex,
@@ -601,6 +688,65 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
         return Ok(format_line_hits(&query, fallback));
     }
     format_chunk_hits(index, &query, hits)
+}
+
+fn handle_text_search(index: &Codebase, args: &Value) -> Result<String> {
+    if args.get("queries").is_some() {
+        let Some(items) = args.get("queries").and_then(Value::as_array) else {
+            return Ok("error: 'queries' must be an array".to_string());
+        };
+        return handle_text_search_batch(index, args, items);
+    }
+    handle_text_search_one(index, args)
+}
+
+fn handle_text_search_batch(index: &Codebase, base_args: &Value, items: &[Value]) -> Result<String> {
+    if items.is_empty() {
+        return Ok("error: 'queries' must not be empty".to_string());
+    }
+    let mut out = format!(
+        "{} codedb_text_search batch items:\n",
+        items.len().min(MAX_BATCH_ITEMS)
+    );
+    for (idx, item) in items.iter().take(MAX_BATCH_ITEMS).enumerate() {
+        let args = batch_item_args(base_args, "queries", item, "query")?;
+        let query = get_str(&args, "query").unwrap_or_default();
+        out.push_str(&format!("--- [{idx}] codedb_text_search: {query} ---\n"));
+        out.push_str(&handle_text_search_one(index, &args)?);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if items.len() > MAX_BATCH_ITEMS {
+        out.push_str(&format!(
+            "(truncated: {} more batch items not executed)\n",
+            items.len() - MAX_BATCH_ITEMS
+        ));
+    }
+    Ok(out)
+}
+
+fn handle_text_search_one(index: &Codebase, args: &Value) -> Result<String> {
+    let query = required_str(args, "query")?;
+    if query.trim().is_empty() {
+        return Ok("error: empty query - pass a non-empty 'query' string".to_string());
+    }
+    let max_results = get_usize(args, "max_results")
+        .unwrap_or(50)
+        .clamp(1, 10_000);
+    let scope = get_bool(args, "scope");
+    let compact = get_bool(args, "compact");
+    let regex = get_bool(args, "regex");
+    let path_glob = get_str(args, "path_glob");
+    let hits = index.text_line_hits(
+        &query,
+        max_results,
+        regex,
+        path_glob.as_deref(),
+        compact,
+        scope,
+    )?;
+    Ok(format_line_hits(&query, hits))
 }
 
 fn handle_word(index: &Codebase, args: &Value) -> Result<String> {

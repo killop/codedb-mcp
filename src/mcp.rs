@@ -15,14 +15,19 @@ use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-pub fn serve(manager: Arc<ProjectManager>, watch_enabled: bool) -> Result<()> {
+pub fn serve(
+    manager: Arc<ProjectManager>,
+    watch_enabled: bool,
+    watch_poll_interval: Duration,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create MCP async runtime")?;
     runtime.block_on(async move {
-        let server = CodedbServer::new(manager, watch_enabled);
+        let server = CodedbServer::new(manager, watch_enabled, watch_poll_interval);
         let running = rmcp::serve_server(server, transport::stdio()).await?;
         let _ = running.waiting().await?;
         Ok(())
@@ -32,11 +37,15 @@ pub fn serve(manager: Arc<ProjectManager>, watch_enabled: bool) -> Result<()> {
 fn start_background_services(
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
+    watch_poll_interval: Duration,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
     handles.push(start_initial_index(manager.clone())?);
     if watch_enabled {
-        handles.push(watcher::start_project_watcher(manager)?);
+        handles.push(watcher::start_project_watcher(
+            manager,
+            watch_poll_interval,
+        )?);
     }
     Ok(handles)
 }
@@ -55,14 +64,20 @@ fn start_initial_index(manager: Arc<ProjectManager>) -> Result<JoinHandle<()>> {
 struct CodedbServer {
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
+    watch_poll_interval: Duration,
     startup_started: AtomicBool,
 }
 
 impl CodedbServer {
-    fn new(manager: Arc<ProjectManager>, watch_enabled: bool) -> Self {
+    fn new(
+        manager: Arc<ProjectManager>,
+        watch_enabled: bool,
+        watch_poll_interval: Duration,
+    ) -> Self {
         Self {
             manager,
             watch_enabled,
+            watch_poll_interval,
             startup_started: AtomicBool::new(false),
         }
     }
@@ -75,7 +90,11 @@ impl CodedbServer {
         {
             return;
         }
-        if let Err(err) = start_background_services(self.manager.clone(), self.watch_enabled) {
+        if let Err(err) = start_background_services(
+            self.manager.clone(),
+            self.watch_enabled,
+            self.watch_poll_interval,
+        ) {
             eprintln!("codebase-mcp background startup failed: {err:#}");
         }
     }
@@ -163,7 +182,12 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_search",
-                "description": "Search indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use BM25 plus exact symbol boosts; natural-language queries add lazy Model2Vec flat-cosine vector search. Set regex=true for regex line matching.",
+                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use BM25 plus exact symbol boosts; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
+            },
+            {
+                "name": "codedb_text_search",
+                "description": "Trigram-accelerated full-text search over indexed source files. Supports regex, path_glob scoped results, compact filtering, scopes, and batch queries.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             },
             {

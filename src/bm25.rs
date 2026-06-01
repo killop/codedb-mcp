@@ -31,8 +31,17 @@ pub struct Bm25Index {
     postings: Vec<Posting>,
     #[serde(skip)]
     postings_path: Option<PathBuf>,
+    #[serde(skip)]
+    overlay: Option<Bm25Overlay>,
     avg_doc_len: f32,
     doc_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Bm25Overlay {
+    base_to_current_doc: Vec<Option<usize>>,
+    ranges: HashMap<String, PostingRange>,
+    postings: Vec<Posting>,
 }
 
 impl Bm25Index {
@@ -60,11 +69,31 @@ impl Bm25Index {
         let mut touched = Vec::new();
         for token in query_tokens {
             let Some(range) = self.ranges.get(&token) else {
+                if let Some(overlay) = &self.overlay {
+                    self.score_overlay_only_token(
+                        &token,
+                        overlay,
+                        selector,
+                        &mut scores,
+                        &mut touched,
+                    );
+                }
                 continue;
             };
             let start = range.start as usize;
             let end = start + range.len as usize;
             let postings = self.read_postings(start, end)?;
+            if let Some(overlay) = &self.overlay {
+                self.score_overlay_token(
+                    &token,
+                    overlay,
+                    &postings,
+                    selector,
+                    &mut scores,
+                    &mut touched,
+                );
+                continue;
+            }
             let df = postings.len() as f32;
             let idf = ((self.doc_count as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
             for posting in &postings {
@@ -91,6 +120,101 @@ impl Bm25Index {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(top_k.min(ranked.len()));
         Ok(ranked)
+    }
+
+    fn score_overlay_token(
+        &self,
+        token: &str,
+        overlay: &Bm25Overlay,
+        base_postings: &[Posting],
+        selector: Option<&[usize]>,
+        scores: &mut [f32],
+        touched: &mut Vec<usize>,
+    ) {
+        let overlay_postings = overlay.postings_for(token);
+        let base_alive = base_postings
+            .iter()
+            .filter(|posting| {
+                overlay
+                    .base_to_current_doc
+                    .get(posting.doc_id as usize)
+                    .is_some_and(Option::is_some)
+            })
+            .count();
+        let df = base_alive + overlay_postings.len();
+        if df == 0 {
+            return;
+        }
+        let df = df as f32;
+        let idf = ((self.doc_count as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
+        for posting in base_postings {
+            let Some(Some(doc_id)) = overlay.base_to_current_doc.get(posting.doc_id as usize)
+            else {
+                continue;
+            };
+            self.add_score(*doc_id, posting.term_freq, idf, selector, scores, touched);
+        }
+        for posting in overlay_postings {
+            self.add_score(
+                posting.doc_id as usize,
+                posting.term_freq,
+                idf,
+                selector,
+                scores,
+                touched,
+            );
+        }
+    }
+
+    fn score_overlay_only_token(
+        &self,
+        token: &str,
+        overlay: &Bm25Overlay,
+        selector: Option<&[usize]>,
+        scores: &mut [f32],
+        touched: &mut Vec<usize>,
+    ) {
+        let overlay_postings = overlay.postings_for(token);
+        if overlay_postings.is_empty() {
+            return;
+        }
+        let df = overlay_postings.len() as f32;
+        let idf = ((self.doc_count as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
+        for posting in overlay_postings {
+            self.add_score(
+                posting.doc_id as usize,
+                posting.term_freq,
+                idf,
+                selector,
+                scores,
+                touched,
+            );
+        }
+    }
+
+    fn add_score(
+        &self,
+        doc_id: usize,
+        term_freq: u32,
+        idf: f32,
+        selector: Option<&[usize]>,
+        scores: &mut [f32],
+        touched: &mut Vec<usize>,
+    ) {
+        if doc_id >= self.doc_count {
+            return;
+        }
+        if selector.is_some_and(|indices| indices.binary_search(&doc_id).is_err()) {
+            return;
+        }
+        let score = self.term_score(doc_id, term_freq, idf);
+        if score <= 0.0 {
+            return;
+        }
+        if scores[doc_id] == 0.0 {
+            touched.push(doc_id);
+        }
+        scores[doc_id] += score;
     }
 
     fn term_score(&self, doc_id: usize, term_freq: u32, idf: f32) -> f32 {
@@ -128,6 +252,205 @@ impl Bm25Index {
         self.postings_path = Some(path);
     }
 
+    pub fn write_remapped_postings(
+        &self,
+        path: &Path,
+        new_doc_count: usize,
+        old_to_new_doc: &[Option<usize>],
+        replacement_documents: Vec<(usize, Vec<String>)>,
+    ) -> Result<Bm25Index> {
+        let mut replacement_by_term = HashMap::<String, Vec<Posting>>::new();
+        let mut doc_lens = vec![0u32; new_doc_count];
+        for (old_doc, new_doc) in old_to_new_doc.iter().enumerate() {
+            let Some(new_doc) = *new_doc else {
+                continue;
+            };
+            if new_doc < new_doc_count {
+                doc_lens[new_doc] = self.doc_lens.get(old_doc).copied().unwrap_or_default();
+            }
+        }
+        for (doc_id, tokens) in replacement_documents {
+            if doc_id >= new_doc_count {
+                continue;
+            }
+            doc_lens[doc_id] = tokens.len() as u32;
+            let mut term_freqs = HashMap::<String, u32>::new();
+            for token in tokens {
+                *term_freqs.entry(token).or_default() += 1;
+            }
+            for (term, term_freq) in term_freqs {
+                replacement_by_term.entry(term).or_default().push(Posting {
+                    doc_id: doc_id as u32,
+                    term_freq,
+                });
+            }
+        }
+
+        let file = File::create(path)
+            .with_context(|| format!("failed to create BM25 postings {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let mut ranges = HashMap::with_capacity(self.ranges.len() + replacement_by_term.len());
+        let mut postings_written = 0u32;
+        let mut old_terms = self.ranges.iter().collect::<Vec<_>>();
+        old_terms.sort_by_key(|(_, range)| range.start);
+        let old_postings = if self.postings.is_empty() {
+            self.postings_path
+                .as_ref()
+                .map(|path| read_all_postings(path))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "failed to read BM25 postings {}",
+                        self.postings_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    )
+                })?
+        } else {
+            None
+        };
+
+        for (term, range) in old_terms {
+            let start = postings_written;
+            let range_start = range.start as usize;
+            let range_end = (range.start + range.len) as usize;
+            let postings = old_postings
+                .as_ref()
+                .and_then(|postings| postings.get(range_start..range_end))
+                .or_else(|| self.postings.get(range_start..range_end))
+                .unwrap_or(&[]);
+            for posting in postings {
+                let Some(Some(new_doc)) = old_to_new_doc.get(posting.doc_id as usize) else {
+                    continue;
+                };
+                writer.write_all(&(*new_doc as u32).to_le_bytes())?;
+                writer.write_all(&posting.term_freq.to_le_bytes())?;
+                postings_written = postings_written.saturating_add(1);
+            }
+            if let Some(mut replacement_postings) = replacement_by_term.remove(term.as_str()) {
+                replacement_postings.sort_by_key(|posting| posting.doc_id);
+                for posting in replacement_postings {
+                    writer.write_all(&posting.doc_id.to_le_bytes())?;
+                    writer.write_all(&posting.term_freq.to_le_bytes())?;
+                    postings_written = postings_written.saturating_add(1);
+                }
+            }
+            let len = postings_written.saturating_sub(start);
+            if len > 0 {
+                ranges.insert(term.clone(), PostingRange { start, len });
+            }
+        }
+
+        let mut new_terms = replacement_by_term.into_iter().collect::<Vec<_>>();
+        new_terms.sort_by(|a, b| a.0.cmp(&b.0));
+        for (term, mut replacement_postings) in new_terms {
+            let start = postings_written;
+            replacement_postings.sort_by_key(|posting| posting.doc_id);
+            for posting in replacement_postings {
+                writer.write_all(&posting.doc_id.to_le_bytes())?;
+                writer.write_all(&posting.term_freq.to_le_bytes())?;
+                postings_written = postings_written.saturating_add(1);
+            }
+            let len = postings_written.saturating_sub(start);
+            if len > 0 {
+                ranges.insert(term, PostingRange { start, len });
+            }
+        }
+        writer.flush()?;
+        let total_len = doc_lens.iter().map(|len| *len as usize).sum::<usize>();
+        Ok(Bm25Index {
+            doc_lens,
+            ranges,
+            postings: Vec::new(),
+            postings_path: Some(path.to_path_buf()),
+            overlay: None,
+            avg_doc_len: avg_doc_len(total_len, new_doc_count),
+            doc_count: new_doc_count,
+        })
+    }
+
+    pub fn remap_with_overlay(
+        &self,
+        new_doc_count: usize,
+        old_to_new_doc: &[Option<usize>],
+        replacement_documents: Vec<(usize, Vec<String>)>,
+    ) -> Bm25Index {
+        let mut doc_lens = vec![0u32; new_doc_count];
+        for (old_doc, new_doc) in old_to_new_doc.iter().enumerate() {
+            let Some(new_doc) = *new_doc else {
+                continue;
+            };
+            if new_doc < new_doc_count {
+                doc_lens[new_doc] = self.doc_lens.get(old_doc).copied().unwrap_or_default();
+            }
+        }
+
+        let mut overlay_by_term = HashMap::<String, Vec<Posting>>::new();
+        if let Some(existing) = &self.overlay {
+            for (term, range) in &existing.ranges {
+                let start = range.start as usize;
+                let end = start + range.len as usize;
+                for posting in existing.postings.get(start..end).unwrap_or(&[]) {
+                    let Some(Some(new_doc)) = old_to_new_doc.get(posting.doc_id as usize) else {
+                        continue;
+                    };
+                    overlay_by_term
+                        .entry(term.clone())
+                        .or_default()
+                        .push(Posting {
+                            doc_id: *new_doc as u32,
+                            term_freq: posting.term_freq,
+                        });
+                }
+            }
+        }
+
+        for (doc_id, tokens) in replacement_documents {
+            if doc_id >= new_doc_count {
+                continue;
+            }
+            doc_lens[doc_id] = tokens.len() as u32;
+            let mut term_freqs = HashMap::<String, u32>::new();
+            for token in tokens {
+                *term_freqs.entry(token).or_default() += 1;
+            }
+            for (term, term_freq) in term_freqs {
+                overlay_by_term.entry(term).or_default().push(Posting {
+                    doc_id: doc_id as u32,
+                    term_freq,
+                });
+            }
+        }
+
+        let total_len = doc_lens.iter().map(|len| *len as usize).sum::<usize>();
+        Bm25Index {
+            doc_lens,
+            ranges: self.ranges.clone(),
+            postings: self.postings.clone(),
+            postings_path: self.postings_path.clone(),
+            overlay: Some(Bm25Overlay::new(
+                self.base_to_current_doc(old_to_new_doc),
+                overlay_by_term,
+            )),
+            avg_doc_len: avg_doc_len(total_len, new_doc_count),
+            doc_count: new_doc_count,
+        }
+    }
+
+    fn base_to_current_doc(&self, old_to_new_doc: &[Option<usize>]) -> Vec<Option<usize>> {
+        if let Some(existing) = &self.overlay {
+            return existing
+                .base_to_current_doc
+                .iter()
+                .map(|current_doc| {
+                    current_doc.and_then(|doc| old_to_new_doc.get(doc).copied().flatten())
+                })
+                .collect();
+        }
+        old_to_new_doc.to_vec()
+    }
+
     fn read_postings(&self, start: usize, end: usize) -> Result<Vec<Posting>> {
         if let Some(postings) = self.postings.get(start..end) {
             return Ok(postings.to_vec());
@@ -135,26 +458,88 @@ impl Bm25Index {
         let Some(path) = &self.postings_path else {
             return Ok(Vec::new());
         };
-        let count = end.saturating_sub(start);
-        if count == 0 {
-            return Ok(Vec::new());
-        }
         let mut file = File::open(path)
             .with_context(|| format!("failed to open BM25 postings {}", path.display()))?;
-        file.seek(SeekFrom::Start((start * POSTING_BYTES) as u64))?;
-        let mut bytes = vec![0u8; count * POSTING_BYTES];
-        file.read_exact(&mut bytes)?;
-        let mut postings = Vec::with_capacity(count);
-        for item in bytes.chunks_exact(POSTING_BYTES) {
-            postings.push(Posting {
-                doc_id: u32::from_le_bytes(item[0..4].try_into().expect("posting doc id bytes")),
-                term_freq: u32::from_le_bytes(
-                    item[4..8].try_into().expect("posting term frequency bytes"),
-                ),
-            });
-        }
-        Ok(postings)
+        read_postings_from_reader(&mut file, start, end)
     }
+}
+
+impl Bm25Overlay {
+    fn new(
+        base_to_current_doc: Vec<Option<usize>>,
+        mut postings_by_term: HashMap<String, Vec<Posting>>,
+    ) -> Self {
+        let posting_count = postings_by_term.values().map(Vec::len).sum();
+        let mut terms = postings_by_term.keys().cloned().collect::<Vec<_>>();
+        terms.sort();
+        let mut ranges = HashMap::with_capacity(postings_by_term.len());
+        let mut postings = Vec::with_capacity(posting_count);
+        for term in terms {
+            let Some(mut values) = postings_by_term.remove(&term) else {
+                continue;
+            };
+            values.sort_by_key(|posting| posting.doc_id);
+            let start = postings.len() as u32;
+            let len = values.len() as u32;
+            postings.append(&mut values);
+            if len > 0 {
+                ranges.insert(term, PostingRange { start, len });
+            }
+        }
+        Self {
+            base_to_current_doc,
+            ranges,
+            postings,
+        }
+    }
+
+    fn postings_for(&self, token: &str) -> &[Posting] {
+        let Some(range) = self.ranges.get(token) else {
+            return &[];
+        };
+        let start = range.start as usize;
+        let end = start + range.len as usize;
+        self.postings.get(start..end).unwrap_or(&[])
+    }
+}
+
+fn read_postings_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Posting>> {
+    let count = end.saturating_sub(start);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    reader.seek(SeekFrom::Start((start * POSTING_BYTES) as u64))?;
+    let mut bytes = vec![0u8; count * POSTING_BYTES];
+    reader.read_exact(&mut bytes)?;
+    let mut postings = Vec::with_capacity(count);
+    for item in bytes.chunks_exact(POSTING_BYTES) {
+        postings.push(Posting {
+            doc_id: u32::from_le_bytes(item[0..4].try_into().expect("posting doc id bytes")),
+            term_freq: u32::from_le_bytes(
+                item[4..8].try_into().expect("posting term frequency bytes"),
+            ),
+        });
+    }
+    Ok(postings)
+}
+
+fn read_all_postings(path: &Path) -> Result<Vec<Posting>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read BM25 postings {}", path.display()))?;
+    let mut postings = Vec::with_capacity(bytes.len() / POSTING_BYTES);
+    for item in bytes.chunks_exact(POSTING_BYTES) {
+        postings.push(Posting {
+            doc_id: u32::from_le_bytes(item[0..4].try_into().expect("posting doc id bytes")),
+            term_freq: u32::from_le_bytes(
+                item[4..8].try_into().expect("posting term frequency bytes"),
+            ),
+        });
+    }
+    Ok(postings)
 }
 
 #[derive(Debug, Default)]
@@ -219,6 +604,7 @@ impl Bm25Builder {
             ranges,
             postings,
             postings_path: None,
+            overlay: None,
             avg_doc_len,
             doc_count,
         }
@@ -376,6 +762,7 @@ impl SpillingBm25Builder {
             ranges,
             postings: Vec::new(),
             postings_path: Some(path.to_path_buf()),
+            overlay: None,
             avg_doc_len,
             doc_count,
         })
@@ -496,5 +883,28 @@ mod tests {
 
         let filtered = index.query("alpha", 10, Some(&[0])).unwrap();
         assert_eq!(filtered, vec![(0, filtered[0].1)]);
+    }
+
+    #[test]
+    fn overlay_remaps_base_docs_and_adds_replacements() {
+        let index = Bm25Index::new(vec![
+            vec!["alpha".to_string()],
+            vec!["beta".to_string()],
+            vec!["gamma".to_string()],
+        ]);
+        let overlay = index.remap_with_overlay(
+            3,
+            &[Some(1), None, Some(0)],
+            vec![(2, vec!["beta".to_string(), "delta".to_string()])],
+        );
+
+        let alpha = overlay.query("alpha", 10, None).unwrap();
+        assert_eq!(alpha[0].0, 1);
+        let gamma = overlay.query("gamma", 10, None).unwrap();
+        assert_eq!(gamma[0].0, 0);
+        let beta = overlay.query("beta", 10, None).unwrap();
+        assert_eq!(beta[0].0, 2);
+        let delta = overlay.query("delta", 10, None).unwrap();
+        assert_eq!(delta[0].0, 2);
     }
 }

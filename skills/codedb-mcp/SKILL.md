@@ -36,7 +36,7 @@ When MCP is already configured, the server command shape is:
 <skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
 ```
 
-MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first, and builds the default project index in the background; early tool calls may wait until that initial index is ready. Keep the server alive for editor/agent workflows because warm tool latency is the representative number. File freshness is config-driven: `[watch] enabled = true` and `poll_interval_seconds = 5` make the server queue filesystem events and apply them as one serialized batch every 5 seconds. Normal source edits should return `cache: live-incremental`: only new/modified files are parsed, dependency refresh is narrowed to changed-file symbols, and BM25 updates use a live overlay over the base postings file. Cache commits are manifest-last generation writes, so an interrupted index should leave the previous cache usable.
+MCP mode uses the Rust `rmcp` stdio server, answers the protocol handshake first, and builds the default project index in the background; early tool calls may wait until that initial index is ready. Keep the server alive for editor/agent workflows because warm tool latency is the representative number. File freshness is config-driven: `[watch] enabled = true` and `poll_interval_seconds = 5` make the server queue filesystem events and apply them as one serialized batch every 5 seconds. Normal source edits should return `cache: live-incremental`: only new/modified files are parsed, dependency refresh is narrowed to changed-file symbols, and lazy text/search/caller sidecars are rebuilt on demand when their source fingerprint changes. Cache commits are manifest-last generation writes, so an interrupted index should leave the previous cache usable.
 
 ## Tool Use
 
@@ -50,7 +50,7 @@ Load `references/tools.md` when deciding which `codedb_*` tool to call. The comm
 - Dependencies and repeated lookups: use `codedb_deps`; use `codedb_bundle` as the default way to reduce MCP round trips and token usage, or `codedb_query` for compact pipeline-style exploration.
 
 - `codedb_text_search`: trigram-accelerated exact/regex full-text search; supports `queries` batch, `path_glob`, compact output, and scopes.
-- `codedb_search`: BM25/symbol search or natural-language vector search; `regex=true` delegates to `codedb_text_search`; supports `queries` batch.
+- `codedb_search`: symbol/word-trigram search fused with natural-language vector search; `regex=true` delegates to `codedb_text_search`; supports `queries` batch.
 - `codedb_callers`: LSP-like references anchored to a definition; supports `targets` batch. Accuracy is strongest for C#/Java.
 - `codedb_deps`: direct or transitive file dependencies and reverse dependencies. C#/Java namespace/package imports are the most precise path.
 - `codedb_outline`: precomputed file symbols.

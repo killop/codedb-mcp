@@ -1,6 +1,7 @@
 use crate::cache::{
     CachedCallerEntry, CachedCallerHit, CachedDepsSnapshot, CachedFileEntry, ProjectCache,
 };
+use crate::event_log::{self, ToolLogContext};
 use crate::graph::GraphCommunity;
 use crate::indexer::{
     ChangedFile, Codebase, IndexOptions, build_globset, hash_content, normalize_rel_path,
@@ -20,6 +21,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -31,12 +33,18 @@ const MODULE_LABEL_ITERATIONS: usize = 8;
 
 pub struct ProjectManager {
     default_root: PathBuf,
-    options: IndexOptions,
+    options: RwLock<IndexOptions>,
+    options_revision: AtomicU64,
     cache: RwLock<HashMap<String, Arc<Codebase>>>,
     build_lock: Mutex<()>,
 }
 
 pub enum ReindexCheck {
+    Unchanged,
+    Reindexed(Arc<Codebase>),
+}
+
+pub enum ReloadCheck {
     Unchanged,
     Reindexed(Arc<Codebase>),
 }
@@ -52,13 +60,15 @@ impl ProjectManager {
     pub fn new_lazy(default_root: PathBuf, options: IndexOptions) -> Self {
         Self {
             default_root,
-            options,
+            options: RwLock::new(options),
+            options_revision: AtomicU64::new(0),
             cache: RwLock::new(HashMap::new()),
             build_lock: Mutex::new(()),
         }
     }
 
     pub fn get(&self, project: Option<&str>) -> Result<Arc<Codebase>> {
+        let started = Instant::now();
         let root = match project {
             Some(project) if !project.trim().is_empty() => PathBuf::from(project),
             _ => self.default_root.clone(),
@@ -66,31 +76,73 @@ impl ProjectManager {
         .canonicalize()?;
         let key = root.display().to_string();
         if let Some(index) = self.cache.read().get(&key) {
+            event_log::emit(|| {
+                format!(
+                    "event=project_get root={key} cache=memory elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                )
+            });
             return Ok(index.clone());
         }
         let _guard = self.build_lock.lock();
         if let Some(index) = self.cache.read().get(&key) {
+            event_log::emit(|| {
+                format!(
+                    "event=project_get root={key} cache=memory_after_lock elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                )
+            });
             return Ok(index.clone());
         }
-        let mut index = Codebase::index(&root, self.options.clone())?;
+        event_log::emit(|| format!("event=project_index_start root={key} reason=get"));
+        let options = self.options();
+        let mut index = Codebase::index(&root, options)?;
         index.changed_files = initial_changes(&index);
         let index = Arc::new(index);
         self.cache.write().insert(key, index.clone());
+        let stats = index.stats();
+        event_log::emit(|| {
+            format!(
+                "event=project_get root={} cache={} elapsed_ms={:.3} files={} chunks={} symbols={}",
+                stats.root,
+                stats.cache,
+                started.elapsed().as_secs_f64() * 1000.0,
+                stats.files,
+                stats.chunks,
+                stats.symbols
+            )
+        });
         Ok(index)
     }
 
     pub fn reindex(&self, path: &Path) -> Result<Arc<Codebase>> {
+        let started = Instant::now();
         let root = path.canonicalize()?;
         let key = root.display().to_string();
+        event_log::emit(|| format!("event=project_index_start root={key} reason=reindex"));
         let _guard = self.build_lock.lock();
         let old = self.cache.read().get(&key).cloned();
-        let mut index = Codebase::index(&root, self.options.clone())?;
+        let options = self.options();
+        let mut index = Codebase::index(&root, options)?;
         index.changed_files = match old.as_deref() {
             Some(old) => diff_changes(old, &index),
             None => initial_changes(&index),
         };
         let index = Arc::new(index);
         self.cache.write().insert(key, index.clone());
+        let stats = index.stats();
+        event_log::emit(|| {
+            format!(
+                "event=project_index_finish root={} cache={} elapsed_ms={:.3} files={} chunks={} symbols={} changed_files={}",
+                stats.root,
+                stats.cache,
+                started.elapsed().as_secs_f64() * 1000.0,
+                stats.files,
+                stats.chunks,
+                stats.symbols,
+                index.changed_files.len()
+            )
+        });
         Ok(index)
     }
 
@@ -103,36 +155,106 @@ impl ProjectManager {
         changed_paths: Vec<String>,
         deleted_paths: Vec<String>,
     ) -> Result<ReindexCheck> {
+        let started = Instant::now();
+        let changed_count = changed_paths.len();
+        let deleted_count = deleted_paths.len();
         if changed_paths.is_empty() && deleted_paths.is_empty() {
+            event_log::emit(|| "event=live_update_skip reason=no_changes".to_string());
             return Ok(ReindexCheck::Unchanged);
         }
         let root = self.default_root.canonicalize()?;
         let key = root.display().to_string();
+        event_log::emit(|| {
+            format!(
+                "event=live_update_start root={key} changed={changed_count} deleted={deleted_count}"
+            )
+        });
         let _guard = self.build_lock.lock();
         let Some(old) = self.cache.read().get(&key).cloned() else {
-            let mut index = Codebase::index(&root, self.options.clone())?;
+            event_log::emit(|| format!("event=live_update_no_cache root={key} action=full_index"));
+            let options = self.options();
+            let mut index = Codebase::index(&root, options)?;
             index.changed_files = initial_changes(&index);
             let index = Arc::new(index);
             self.cache.write().insert(key, index.clone());
+            let stats = index.stats();
+            event_log::emit(|| {
+                format!(
+                    "event=live_update_finish root={} mode=full_index elapsed_ms={:.3} changed={} deleted={} files={} chunks={} symbols={} cache={}",
+                    stats.root,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    changed_count,
+                    deleted_count,
+                    stats.files,
+                    stats.chunks,
+                    stats.symbols,
+                    stats.cache
+                )
+            });
             return Ok(ReindexCheck::Reindexed(index));
         };
         let mut index = old.update_known_paths(&changed_paths, &deleted_paths)?;
         index.changed_files = changed_files_from_paths(&root, &changed_paths, &deleted_paths);
         let index = Arc::new(index);
         self.cache.write().insert(key, index.clone());
+        let stats = index.stats();
+        event_log::emit(|| {
+            format!(
+                "event=live_update_finish root={} mode=incremental elapsed_ms={:.3} changed={} deleted={} files={} chunks={} symbols={} cache={}",
+                stats.root,
+                started.elapsed().as_secs_f64() * 1000.0,
+                changed_count,
+                deleted_count,
+                stats.files,
+                stats.chunks,
+                stats.symbols,
+                stats.cache
+            )
+        });
         Ok(ReindexCheck::Reindexed(index))
+    }
+
+    pub fn reload_options(&self, new_options: IndexOptions) -> Result<ReloadCheck> {
+        let root = self.default_root.canonicalize()?;
+        let key = root.display().to_string();
+        if self.options().cache_identity_eq(&new_options) {
+            *self.options.write() = new_options;
+            return Ok(ReloadCheck::Unchanged);
+        }
+
+        let _guard = self.build_lock.lock();
+        if self.options().cache_identity_eq(&new_options) {
+            *self.options.write() = new_options;
+            return Ok(ReloadCheck::Unchanged);
+        }
+
+        let old = self.cache.read().get(&key).cloned();
+        let mut index = Codebase::index(&root, new_options.clone())?;
+        index.changed_files = match old.as_deref() {
+            Some(old) => diff_changes(old, &index),
+            None => initial_changes(&index),
+        };
+        let index = Arc::new(index);
+        {
+            let mut cache = self.cache.write();
+            cache.clear();
+            cache.insert(key, index.clone());
+        }
+        *self.options.write() = new_options;
+        self.options_revision.fetch_add(1, Ordering::AcqRel);
+        Ok(ReloadCheck::Reindexed(index))
     }
 
     pub fn default_root(&self) -> PathBuf {
         self.default_root.clone()
     }
 
-    pub fn extensions(&self) -> Vec<String> {
-        self.options.extensions.clone()
+    pub fn options(&self) -> IndexOptions {
+        self.options.read().clone()
     }
 
-    pub fn options(&self) -> IndexOptions {
-        self.options.clone()
+    pub fn options_revision(&self) -> u64 {
+        self.options_revision.load(Ordering::Acquire)
     }
 
     pub fn projects(&self) -> Vec<String> {
@@ -489,6 +611,28 @@ fn diff_changes(old: &Codebase, new: &Codebase) -> Vec<ChangedFile> {
 }
 
 pub fn dispatch_tool(manager: &ProjectManager, name: &str, args: &Value) -> String {
+    dispatch_tool_with_context(manager, name, args, ToolLogContext::direct())
+}
+
+fn dispatch_tool_with_context(
+    manager: &ProjectManager,
+    name: &str,
+    args: &Value,
+    context: ToolLogContext,
+) -> String {
+    if name == "codedb_bundle" {
+        return dispatch_tool_inner(manager, name, args);
+    }
+    if !event_log::enabled() {
+        return dispatch_tool_inner(manager, name, args);
+    }
+    let started = Instant::now();
+    let output = dispatch_tool_inner(manager, name, args);
+    event_log::log_tool_result(name, context, started, &output);
+    output
+}
+
+fn dispatch_tool_inner(manager: &ProjectManager, name: &str, args: &Value) -> String {
     let result = match name {
         "codedb_index" => handle_index(manager, args),
         "codedb_projects" => Ok(handle_projects(manager)),
@@ -700,7 +844,11 @@ fn handle_text_search(index: &Codebase, args: &Value) -> Result<String> {
     handle_text_search_one(index, args)
 }
 
-fn handle_text_search_batch(index: &Codebase, base_args: &Value, items: &[Value]) -> Result<String> {
+fn handle_text_search_batch(
+    index: &Codebase,
+    base_args: &Value,
+    items: &[Value],
+) -> Result<String> {
     if items.is_empty() {
         return Ok("error: 'queries' must not be empty".to_string());
     }
@@ -1306,7 +1454,10 @@ fn handle_read_batch(index: &Codebase, base_args: &Value, items: &[Value]) -> Re
     if items.is_empty() {
         return Ok("error: 'paths' must not be empty".to_string());
     }
-    let mut out = format!("{} codedb_read batch items:\n", items.len().min(MAX_BATCH_ITEMS));
+    let mut out = format!(
+        "{} codedb_read batch items:\n",
+        items.len().min(MAX_BATCH_ITEMS)
+    );
     for (idx, item) in items.iter().take(MAX_BATCH_ITEMS).enumerate() {
         let args = batch_item_args(base_args, "paths", item, "path")?;
         let path = get_str(&args, "path").unwrap_or_default();
@@ -4003,12 +4154,26 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
     for (idx, op) in ops.iter().take(MAX_BATCH_ITEMS).enumerate() {
         let tool = get_str(op, "tool").unwrap_or_default();
         if tool.is_empty() {
+            let start = Instant::now();
+            event_log::log_tool_failure(
+                "<missing>",
+                ToolLogContext::bundle(idx),
+                start,
+                "missing 'tool' field",
+            );
             out.push_str(&format!(
                 "--- [{idx}] <missing> ---\nerror: missing 'tool' field\n"
             ));
             continue;
         }
         if tool == "codedb_bundle" {
+            let start = Instant::now();
+            event_log::log_tool_failure(
+                &tool,
+                ToolLogContext::bundle(idx),
+                start,
+                "codedb_bundle not allowed in bundle",
+            );
             out.push_str(&format!(
                 "--- [{idx}] {tool} ---\nerror: codedb_bundle not allowed in bundle\n"
             ));
@@ -4016,7 +4181,8 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
         }
         let arguments = op.get("arguments").unwrap_or(op);
         let start = Instant::now();
-        let result = dispatch_tool(manager, &tool, arguments);
+        let result =
+            dispatch_tool_with_context(manager, &tool, arguments, ToolLogContext::bundle(idx));
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         out.push_str(&format!("--- [{}] {} ---\n", idx, tool));
         if timing {

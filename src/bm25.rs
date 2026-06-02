@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::tokens::tokenize;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

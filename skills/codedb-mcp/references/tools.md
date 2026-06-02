@@ -5,7 +5,7 @@
 | Tool | Use | Notes |
 |---|---|---|
 | `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. Stays inside the indexed source corpus. |
-| `codedb_search` | BM25/symbol or natural-language vector search | Use `query` for one lookup or `queries` for batch. Symbol-shaped default queries stay on the indexed lexical/symbol path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
+| `codedb_search` | Symbol/word-trigram plus natural-language vector search | Use `query` for one lookup or `queries` for batch. Symbol-shaped default queries stay on the indexed lexical/symbol/text path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
 | `codedb_callers` | LSP-like symbol references | Pass `definition_path` and `definition_line` for same-name symbols. Use `targets` for batch. Strongest on C#/Java. |
 | `codedb_symbol` | Find definitions by symbol name | Add `body=true` only when the body is needed. |
 | `codedb_word` | Exact identifier inverted-index lookup | Fast primitive for debugging reference results. |
@@ -52,6 +52,6 @@
 
 ## Codedb-Only Retrieval Policy
 
-Use the codedb tool surface for repository lookup and stay inside codedb. Use `codedb_text_search` for exact or regex text search inside the indexed tree-sitter corpus. Use `codedb_search` for hybrid lexical/symbol/vector ranking. Use `codedb_outline` across configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior, with the highest confidence on C#/Java symbols. If results look incomplete, inspect `codedb_status`, scan roots, include/exclude rules, watch freshness, and reindex through codedb.
+Use the codedb tool surface for repository lookup and stay inside codedb. Use `codedb_text_search` for exact or regex text search inside the indexed tree-sitter corpus. Use `codedb_search` for hybrid word-trigram/symbol/vector ranking. Use `codedb_outline` across configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior, with the highest confidence on C#/Java symbols. If results look incomplete, inspect `codedb_status`, scan roots, include/exclude rules, watch freshness, and reindex through codedb.
 
 Default to `codedb_bundle` for multi-step investigation. A typical bundle should combine the health check, search, outline/read, and dependency or caller follow-up calls that would otherwise be separate MCP round trips.

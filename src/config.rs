@@ -1,3 +1,4 @@
+use crate::event_log::EventLogConfig;
 use crate::indexer::{DiagnosticsOptions, IndexOptions, StorageOptions};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -18,6 +19,8 @@ pub struct AppConfig {
     pub watch: WatchConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +73,18 @@ pub struct StorageConfig {
     pub enabled: bool,
     #[serde(default = "default_storage_dir")]
     pub dir: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_log_file")]
+    pub file: String,
+    #[serde(default = "default_log_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_log_flush_interval_ms")]
+    pub flush_interval_ms: u64,
 }
 
 impl AppConfig {
@@ -125,6 +140,17 @@ impl AppConfig {
     }
 }
 
+impl LoggingConfig {
+    pub fn event_log_config(&self) -> EventLogConfig {
+        EventLogConfig {
+            enabled: self.enabled,
+            file: self.file.replace('\\', "/"),
+            queue_capacity: self.queue_capacity,
+            flush_interval_ms: self.flush_interval_ms,
+        }
+    }
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -170,6 +196,17 @@ impl Default for StorageConfig {
         Self {
             enabled: true,
             dir: default_storage_dir(),
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file: default_log_file(),
+            queue_capacity: default_log_queue_capacity(),
+            flush_interval_ms: default_log_flush_interval_ms(),
         }
     }
 }
@@ -330,6 +367,18 @@ fn default_embedding_model_path() -> String {
 
 fn default_storage_dir() -> String {
     ".codedb-mcp".to_string()
+}
+
+fn default_log_file() -> String {
+    ".codedb-mcp/codedb-mcp.log".to_string()
+}
+
+fn default_log_queue_capacity() -> usize {
+    8192
+}
+
+fn default_log_flush_interval_ms() -> u64 {
+    500
 }
 
 fn default_true() -> bool {

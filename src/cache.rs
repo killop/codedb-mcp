@@ -288,6 +288,7 @@ impl ProjectCache {
             dir,
         };
         cache.recover_interrupted_manifest_replace()?;
+        cache.cleanup_unreferenced_generation_files();
         Ok(cache)
     }
 
@@ -395,10 +396,9 @@ impl ProjectCache {
             return Ok(None);
         }
         let postings_path = self.manifest_file_path(&manifest.bm25_postings_file);
-        if !postings_path.is_file() {
-            return Ok(None);
+        if postings_path.is_file() {
+            payload.bm25.use_postings_file(postings_path);
         }
-        payload.bm25.use_postings_file(postings_path);
         Ok(Some(payload))
     }
 
@@ -435,10 +435,9 @@ impl ProjectCache {
             return Ok(None);
         }
         let postings_path = self.manifest_file_path(&manifest.bm25_postings_file);
-        if !postings_path.is_file() {
-            return Ok(None);
+        if postings_path.is_file() {
+            payload.bm25.use_postings_file(postings_path);
         }
-        payload.bm25.use_postings_file(postings_path);
         Ok(Some(payload))
     }
 
@@ -652,7 +651,6 @@ impl ProjectCache {
             manifest.payload_file.as_str(),
             manifest.outlines_file.as_str(),
             manifest.outlines_index_file.as_str(),
-            manifest.bm25_postings_file.as_str(),
             manifest.deps_file.as_str(),
         ]
         .into_iter()
@@ -724,18 +722,24 @@ impl ProjectCache {
             bm25,
         };
         write_bin_atomic(&transaction.payload_path, &payload)?;
-        self.remove_lazy_sidecars();
+        self.remove_unsafe_lazy_sidecars();
         write_json_atomic(&self.manifest_path(), &manifest)?;
         self.cleanup_old_generation_files(&manifest);
         Ok(())
     }
 
-    pub fn save_word_index(&self, word_index: &mut WordIndex) -> Result<()> {
+    pub fn save_word_index(
+        &self,
+        word_index: &mut WordIndex,
+        source_hash: String,
+        file_count: usize,
+    ) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("failed to create cache dir {}", self.dir.display()))?;
+        word_index.set_source_info(source_hash, file_count);
         let hits_path = self.word_hits_path();
         word_index.write_hits(&hits_path)?;
         word_index.use_hits_file(hits_path);
@@ -755,42 +759,65 @@ impl ProjectCache {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
-        let keep = [
-            keep.payload_file.as_str(),
-            keep.outlines_file.as_str(),
-            keep.outlines_index_file.as_str(),
-            keep.fingerprints_file.as_str(),
-            keep.bm25_postings_file.as_str(),
-            keep.deps_file.as_str(),
-        ];
+        let keep = manifest_generation_files(keep);
         for entry in entries.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
                 continue;
             };
-            let generated = (name.starts_with("index.") && name.ends_with(".bin"))
-                || (name.starts_with("outlines.") && name.ends_with(".bin"))
-                || (name.starts_with("outlines_index.") && name.ends_with(".bin"))
-                || (name.starts_with("fingerprints.") && name.ends_with(".bin"))
-                || (name.starts_with("deps.") && name.ends_with(".bin"))
-                || (name.starts_with("bm25.") && name.ends_with(".postings"));
-            if generated && !keep.contains(&name) {
+            if is_generated_cache_file(name) && !keep.iter().any(|item| *item == name) {
                 let _ = fs::remove_file(path);
             }
         }
     }
 
-    fn remove_lazy_sidecars(&self) {
-        for file_name in [
-            WORD_INDEX_FILE,
-            WORD_HITS_FILE,
-            TEXT_SEARCH_INDEX_FILE,
-            EMBEDDINGS_FILE,
-            CALLERS_FILE,
-        ] {
+    fn cleanup_unreferenced_generation_files(&self) {
+        if !self.enabled || !self.dir.is_dir() {
+            return;
+        }
+        let keep = read_json::<CacheManifest>(&self.manifest_path())
+            .ok()
+            .map(|manifest| manifest_generation_files(&manifest))
+            .unwrap_or_default();
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
+                continue;
+            };
+            if is_generated_cache_file(name) && !keep.iter().any(|item| *item == name) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn remove_unsafe_lazy_sidecars(&self) {
+        for file_name in [EMBEDDINGS_FILE] {
             let _ = fs::remove_file(self.dir.join(file_name));
         }
     }
+}
+
+fn manifest_generation_files(keep: &CacheManifest) -> Vec<String> {
+    vec![
+        keep.payload_file.clone(),
+        keep.outlines_file.clone(),
+        keep.outlines_index_file.clone(),
+        keep.fingerprints_file.clone(),
+        keep.bm25_postings_file.clone(),
+        keep.deps_file.clone(),
+    ]
+}
+
+fn is_generated_cache_file(name: &str) -> bool {
+    (name.starts_with("index.") && name.ends_with(".bin"))
+        || (name.starts_with("outlines.") && name.ends_with(".bin"))
+        || (name.starts_with("outlines_index.") && name.ends_with(".bin"))
+        || (name.starts_with("fingerprints.") && name.ends_with(".bin"))
+        || (name.starts_with("deps.") && name.ends_with(".bin"))
+        || (name.starts_with("bm25.") && name.ends_with(".postings"))
 }
 
 pub fn read_embeddings(path: &Path) -> Result<Vec<Vec<f32>>> {
@@ -801,10 +828,18 @@ pub fn read_deps_forward(path: &Path) -> Result<std::collections::HashMap<String
     read_bin(path)
 }
 
-pub fn read_word_index(path: &Path, hits_path: &Path) -> Result<WordIndex> {
+pub fn read_word_index(
+    path: &Path,
+    hits_path: &Path,
+    source_hash: &str,
+    file_count: usize,
+) -> Result<Option<WordIndex>> {
     let mut index: WordIndex = read_bin(path)?;
+    if !index.validate_source(source_hash, file_count) {
+        return Ok(None);
+    }
     index.use_hits_file(hits_path.to_path_buf());
-    Ok(index)
+    Ok(Some(index))
 }
 
 impl SourceFingerprint {

@@ -1,3 +1,5 @@
+use crate::config_watcher;
+use crate::event_log;
 use crate::tools::{ProjectManager, dispatch_tool};
 use crate::watcher;
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use std::future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -21,13 +24,21 @@ pub fn serve(
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
     watch_poll_interval: Duration,
+    config_path: PathBuf,
 ) -> Result<()> {
+    event_log::emit(|| {
+        format!(
+            "event=mcp_serve_start watch_enabled={} watch_poll_interval_ms={}",
+            watch_enabled,
+            watch_poll_interval.as_millis()
+        )
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create MCP async runtime")?;
     runtime.block_on(async move {
-        let server = CodedbServer::new(manager, watch_enabled, watch_poll_interval);
+        let server = CodedbServer::new(manager, watch_enabled, watch_poll_interval, config_path);
         let running = rmcp::serve_server(server, transport::stdio()).await?;
         let _ = running.waiting().await?;
         Ok(())
@@ -38,10 +49,23 @@ fn start_background_services(
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
     watch_poll_interval: Duration,
+    config_path: PathBuf,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
+    event_log::emit(|| "event=background_services_start initial_index=true".to_string());
     handles.push(start_initial_index(manager.clone())?);
+    handles.push(config_watcher::start_config_watcher(
+        manager.clone(),
+        config_path,
+        watch_poll_interval,
+    )?);
     if watch_enabled {
+        event_log::emit(|| {
+            format!(
+                "event=background_services_start watcher=true poll_interval_ms={}",
+                watch_poll_interval.as_millis()
+            )
+        });
         handles.push(watcher::start_project_watcher(
             manager,
             watch_poll_interval,
@@ -54,17 +78,45 @@ fn start_initial_index(manager: Arc<ProjectManager>) -> Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("codebase-mcp-initial-index".to_string())
         .spawn(move || {
+            let started = std::time::Instant::now();
+            event_log::emit(|| "event=initial_index_start".to_string());
             if let Err(err) = manager.reindex_default() {
+                event_log::emit(|| {
+                    format!(
+                        "event=initial_index_failed elapsed_ms={:.3} error={}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        sanitize_log_value(&err.to_string())
+                    )
+                });
                 eprintln!("codebase-mcp initial index failed: {err:#}");
+            } else {
+                event_log::emit(|| {
+                    format!(
+                        "event=initial_index_finish elapsed_ms={:.3}",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    )
+                });
             }
         })
         .context("failed to spawn initial index thread")
+}
+
+fn sanitize_log_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' | ' ' => '_',
+            '\\' => '/',
+            _ => ch,
+        })
+        .collect()
 }
 
 struct CodedbServer {
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
     watch_poll_interval: Duration,
+    config_path: PathBuf,
     startup_started: AtomicBool,
 }
 
@@ -73,11 +125,13 @@ impl CodedbServer {
         manager: Arc<ProjectManager>,
         watch_enabled: bool,
         watch_poll_interval: Duration,
+        config_path: PathBuf,
     ) -> Self {
         Self {
             manager,
             watch_enabled,
             watch_poll_interval,
+            config_path,
             startup_started: AtomicBool::new(false),
         }
     }
@@ -94,6 +148,7 @@ impl CodedbServer {
             self.manager.clone(),
             self.watch_enabled,
             self.watch_poll_interval,
+            self.config_path.clone(),
         ) {
             eprintln!("codebase-mcp background startup failed: {err:#}");
         }
@@ -182,7 +237,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_search",
-                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use BM25 plus exact symbol boosts; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
+                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use symbol and word/trigram text hits; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             },
             {

@@ -1,13 +1,18 @@
 use crate::types::FileEntry;
 use anyhow::{Context, Result};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const TEXT_INDEX_VERSION: u32 = 1;
 const MAX_TRIGRAM_FILE_BYTES: usize = 1024 * 1024;
+const TEXT_LOOKUP_ENTRY_BYTES: usize = 12;
+const TEXT_POSTING_BYTES: usize = 6;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TextPosting {
@@ -23,14 +28,31 @@ pub struct TextLookupEntry {
     pub len: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TextSearchIndex {
     pub version: u32,
     pub source_hash: String,
     pub file_count: usize,
     pub lookup: Vec<TextLookupEntry>,
-    pub postings: Vec<TextPosting>,
+    postings: TextPostings,
     pub skipped_file_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+enum TextPostings {
+    Owned(Vec<TextPosting>),
+    Mapped {
+        mmap: Arc<Mmap>,
+        byte_offset: usize,
+        len: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPostingRange<'a> {
+    postings: &'a TextPostings,
+    start: usize,
+    len: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,15 +94,12 @@ impl TextSearchIndex {
                     local_index
                 },
             )
-            .reduce(
-                HashMap::<u32, Vec<TextPosting>>::new,
-                |mut left, right| {
-                    for (trigram, mut postings) in right {
-                        left.entry(trigram).or_default().append(&mut postings);
-                    }
-                    left
-                },
-            );
+            .reduce(HashMap::<u32, Vec<TextPosting>>::new, |mut left, right| {
+                for (trigram, mut postings) in right {
+                    left.entry(trigram).or_default().append(&mut postings);
+                }
+                left
+            });
 
         let mut keys = maps.keys().copied().collect::<Vec<_>>();
         keys.sort_unstable();
@@ -127,9 +146,20 @@ impl TextSearchIndex {
             source_hash,
             file_count: file_paths.len(),
             lookup,
-            postings,
+            postings: TextPostings::Owned(postings),
             skipped_file_ids,
         })
+    }
+
+    pub fn empty(file_count: usize) -> Self {
+        Self {
+            version: TEXT_INDEX_VERSION,
+            source_hash: String::new(),
+            file_count,
+            lookup: Vec::new(),
+            postings: TextPostings::Owned(Vec::new()),
+            skipped_file_ids: Vec::new(),
+        }
     }
 
     pub fn validate(&self, source_hash: &str, file_count: usize) -> bool {
@@ -162,11 +192,7 @@ impl TextSearchIndex {
         }
         posting_lists.sort_unstable_by_key(|(_, postings)| postings.len());
 
-        let mut result = posting_lists[0]
-            .1
-            .iter()
-            .map(|posting| posting.file_id)
-            .collect::<Vec<_>>();
+        let mut result = posting_lists[0].1.file_ids();
         for (_, postings) in posting_lists.iter().skip(1) {
             intersect_sorted_ids(&mut result, postings);
             if result.is_empty() {
@@ -177,17 +203,99 @@ impl TextSearchIndex {
         Some(result)
     }
 
-    fn postings_for(&self, trigram: u32) -> Option<&[TextPosting]> {
+    fn postings_for(&self, trigram: u32) -> Option<TextPostingRange<'_>> {
         let idx = self
             .lookup
             .binary_search_by_key(&trigram, |entry| entry.trigram)
             .ok()?;
         let entry = self.lookup[idx];
-        let start = entry.offset as usize;
-        let end = start + entry.len as usize;
-        self.postings.get(start..end)
+        Some(TextPostingRange {
+            postings: &self.postings,
+            start: entry.offset as usize,
+            len: entry.len as usize,
+        })
+    }
+}
+
+impl TextPostings {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(items) => items.len(),
+            Self::Mapped { len, .. } => *len,
+        }
     }
 
+    fn get(&self, idx: usize) -> Option<TextPosting> {
+        match self {
+            Self::Owned(items) => items.get(idx).copied(),
+            Self::Mapped {
+                mmap,
+                byte_offset,
+                len,
+            } => {
+                if idx >= *len {
+                    return None;
+                }
+                let start = byte_offset.checked_add(idx.checked_mul(TEXT_POSTING_BYTES)?)?;
+                let end = start.checked_add(TEXT_POSTING_BYTES)?;
+                let raw = mmap.get(start..end)?;
+                Some(TextPosting {
+                    file_id: u32::from_le_bytes(raw[0..4].try_into().ok()?),
+                    next_mask: raw[4],
+                    loc_mask: raw[5],
+                })
+            }
+        }
+    }
+
+    fn write_raw_bytes<W: Write>(&self, writer: &mut W) -> Result<()> {
+        match self {
+            Self::Owned(items) => {
+                for posting in items {
+                    write_posting(writer, *posting)?;
+                }
+            }
+            Self::Mapped {
+                mmap,
+                byte_offset,
+                len,
+            } => {
+                let byte_len = len
+                    .checked_mul(TEXT_POSTING_BYTES)
+                    .context("text postings byte length overflow")?;
+                let end = byte_offset
+                    .checked_add(byte_len)
+                    .context("text postings byte range overflow")?;
+                writer.write_all(mmap.get(*byte_offset..end).unwrap_or(&[]))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> TextPostingRange<'a> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn posting(&self, idx: usize) -> Option<TextPosting> {
+        if idx >= self.len {
+            return None;
+        }
+        self.postings.get(self.start + idx)
+    }
+
+    fn file_id(&self, idx: usize) -> Option<u32> {
+        self.posting(idx).map(|posting| posting.file_id)
+    }
+
+    fn file_ids(&self) -> Vec<u32> {
+        (0..self.len).filter_map(|idx| self.file_id(idx)).collect()
+    }
 }
 
 pub fn source_hash(file_paths: &[String], files: &BTreeMap<String, FileEntry>) -> String {
@@ -212,9 +320,11 @@ pub fn read_text_search_index(
     if !path.is_file() {
         return Ok(None);
     }
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read text search index {}", path.display()))?;
-    let index: TextSearchIndex = bincode::deserialize(&bytes)
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open text search index {}", path.display()))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .with_context(|| format!("failed to map text search index {}", path.display()))?;
+    let index = decode_text_search_index(mmap)
         .with_context(|| format!("failed to decode text search index {}", path.display()))?;
     if index.validate(source_hash, file_count) {
         Ok(Some(index))
@@ -224,15 +334,132 @@ pub fn read_text_search_index(
 }
 
 pub fn write_text_search_index(path: &Path, index: &TextSearchIndex) -> Result<()> {
-    let bytes = bincode::serialize(index).context("failed to encode text search index")?;
     let tmp_path = path.with_extension("bin.tmp");
-    fs::write(&tmp_path, bytes)
+    let file = fs::File::create(&tmp_path)
         .with_context(|| format!("failed to write text search index {}", tmp_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    write_u32(&mut writer, index.version)?;
+    write_u64(&mut writer, index.source_hash.len() as u64)?;
+    writer.write_all(index.source_hash.as_bytes())?;
+    write_u64(&mut writer, index.file_count as u64)?;
+    write_u64(&mut writer, index.lookup.len() as u64)?;
+    for entry in &index.lookup {
+        write_u32(&mut writer, entry.trigram)?;
+        write_u32(&mut writer, entry.offset)?;
+        write_u32(&mut writer, entry.len)?;
+    }
+    write_u64(&mut writer, index.postings.len() as u64)?;
+    index.postings.write_raw_bytes(&mut writer)?;
+    write_u64(&mut writer, index.skipped_file_ids.len() as u64)?;
+    for id in &index.skipped_file_ids {
+        write_u32(&mut writer, *id)?;
+    }
+    writer.flush()?;
     if path.exists() {
         let _ = fs::remove_file(path);
     }
     fs::rename(&tmp_path, path)
         .with_context(|| format!("failed to install text search index {}", path.display()))?;
+    Ok(())
+}
+
+fn decode_text_search_index(mmap: Mmap) -> Result<TextSearchIndex> {
+    let mmap = Arc::new(mmap);
+    let mut pos = 0usize;
+    let bytes = mmap.as_ref();
+    let version = read_u32(bytes, &mut pos)?;
+    let hash_len = read_u64(bytes, &mut pos)? as usize;
+    let source_hash = read_string(bytes, &mut pos, hash_len)?;
+    let file_count = read_u64(bytes, &mut pos)? as usize;
+    let lookup_len = read_u64(bytes, &mut pos)? as usize;
+    let lookup_bytes = lookup_len
+        .checked_mul(TEXT_LOOKUP_ENTRY_BYTES)
+        .context("text lookup byte length overflow")?;
+    ensure_available(bytes, pos, lookup_bytes)?;
+    let mut lookup = Vec::with_capacity(lookup_len);
+    for _ in 0..lookup_len {
+        lookup.push(TextLookupEntry {
+            trigram: read_u32(bytes, &mut pos)?,
+            offset: read_u32(bytes, &mut pos)?,
+            len: read_u32(bytes, &mut pos)?,
+        });
+    }
+    let postings_len = read_u64(bytes, &mut pos)? as usize;
+    let postings_byte_offset = pos;
+    let postings_bytes = postings_len
+        .checked_mul(TEXT_POSTING_BYTES)
+        .context("text postings byte length overflow")?;
+    ensure_available(bytes, pos, postings_bytes)?;
+    pos += postings_bytes;
+    let skipped_len = read_u64(bytes, &mut pos)? as usize;
+    let skipped_bytes = skipped_len
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("text skipped ids byte length overflow")?;
+    ensure_available(bytes, pos, skipped_bytes)?;
+    let mut skipped_file_ids = Vec::with_capacity(skipped_len);
+    for _ in 0..skipped_len {
+        skipped_file_ids.push(read_u32(bytes, &mut pos)?);
+    }
+    Ok(TextSearchIndex {
+        version,
+        source_hash,
+        file_count,
+        lookup,
+        postings: TextPostings::Mapped {
+            mmap,
+            byte_offset: postings_byte_offset,
+            len: postings_len,
+        },
+        skipped_file_ids,
+    })
+}
+
+fn ensure_available(bytes: &[u8], pos: usize, len: usize) -> Result<()> {
+    let end = pos
+        .checked_add(len)
+        .context("text index byte range overflow")?;
+    if end > bytes.len() {
+        anyhow::bail!("text index is truncated");
+    }
+    Ok(())
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    ensure_available(bytes, *pos, 4)?;
+    let value = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into()?);
+    *pos += 4;
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    ensure_available(bytes, *pos, 8)?;
+    let value = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into()?);
+    *pos += 8;
+    Ok(value)
+}
+
+fn read_string(bytes: &[u8], pos: &mut usize, len: usize) -> Result<String> {
+    ensure_available(bytes, *pos, len)?;
+    let value = std::str::from_utf8(&bytes[*pos..*pos + len])
+        .context("text index source hash is not utf8")?
+        .to_string();
+    *pos += len;
+    Ok(value)
+}
+
+fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u64<W: Write>(writer: &mut W, value: u64) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_posting<W: Write>(writer: &mut W, posting: TextPosting) -> Result<()> {
+    write_u32(writer, posting.file_id)?;
+    writer.write_all(&[posting.next_mask, posting.loc_mask])?;
     Ok(())
 }
 
@@ -333,16 +560,17 @@ fn push_current_literal(literals: &mut Vec<Vec<u8>>, current: &mut Vec<u8>) {
     }
 }
 
-fn intersect_sorted_ids(result: &mut Vec<u32>, postings: &[TextPosting]) {
+fn intersect_sorted_ids(result: &mut Vec<u32>, postings: &TextPostingRange<'_>) {
     let mut write = 0usize;
     let mut posting_idx = 0usize;
     let original_len = result.len();
     for read in 0..original_len {
         let id = result[read];
-        while posting_idx < postings.len() && postings[posting_idx].file_id < id {
+        while posting_idx < postings.len() && postings.file_id(posting_idx).unwrap_or(u32::MAX) < id
+        {
             posting_idx += 1;
         }
-        if posting_idx < postings.len() && postings[posting_idx].file_id == id {
+        if posting_idx < postings.len() && postings.file_id(posting_idx) == Some(id) {
             result[write] = id;
             write += 1;
             posting_idx += 1;
@@ -370,25 +598,15 @@ fn is_ascii_whitespace(byte: u8) -> bool {
 fn is_regex_meta(byte: u8) -> bool {
     matches!(
         byte,
-        b'.' | b'*'
-            | b'+'
-            | b'?'
-            | b'('
-            | b')'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'^'
-            | b'$'
-            | b'|'
+        b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'^' | b'$' | b'|'
     )
 }
 
 fn is_regex_literal_escape(byte: u8) -> bool {
     matches!(
         byte,
-        b'\\' | b'.'
+        b'\\'
+            | b'.'
             | b'*'
             | b'+'
             | b'?'

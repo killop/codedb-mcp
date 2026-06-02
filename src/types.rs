@@ -244,6 +244,10 @@ pub struct WordHitRange {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WordIndex {
+    #[serde(default)]
+    source_hash: String,
+    #[serde(default)]
+    file_count: usize,
     ranges: HashMap<String, WordHitRange>,
     #[serde(skip)]
     hits: Vec<WordHit>,
@@ -268,10 +272,21 @@ impl WordIndex {
             }
         }
         Self {
+            source_hash: String::new(),
+            file_count: 0,
             ranges,
             hits,
             hits_path: None,
         }
+    }
+
+    pub fn set_source_info(&mut self, source_hash: String, file_count: usize) {
+        self.source_hash = source_hash;
+        self.file_count = file_count;
+    }
+
+    pub fn validate_source(&self, source_hash: &str, file_count: usize) -> bool {
+        self.source_hash == source_hash && self.file_count == file_count
     }
 
     pub fn hits(&self, word: &str) -> Result<Vec<WordHit>> {

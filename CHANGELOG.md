@@ -2,6 +2,22 @@
 
 [中文版本](CHANGELOG.zh-CN.md)
 
+## Unreleased - 2026-06-02
+
+### Changed
+
+- Replaced the current `codedb_search` lexical path with fixed symbol/word-trigram text hits plus lazy Model2Vec vector fusion. Cold indexing no longer builds the old lexical ranker, while regex and exact text search continue to use the codedb-style trigram sidecar.
+- Added a bounded in-process result cache for `codedb_text_search` / regex-routed `codedb_search` line hits, matching the README warm-tool benchmark contract without keeping full source files resident.
+- Updated the MCP tool description and `skills/codedb-mcp` guidance to describe the new search path and keep multi-step lookups batched through `codedb_bundle`.
+
+### Benchmark And Validation
+
+- Re-ran the README benchmark suite on `u3dclient`: 18,852 indexed files, 31,428 chunks, 274,606 symbols, 19,746 graph nodes, 162,823 graph edges, and 1,356 cached communities.
+- Re-ran cold/index/cache benchmarks: `u3dclient` cold rebuild 13.818s at 226.9 MB WS / 220.2 MB private, cache-hit index open 0.741s at 107.8 MB WS / 106.1 MB private, and status open 0.454s at 14.4 MB WS / 8.1 MB private.
+- Re-ran focused warm text-search and `rg` comparisons after the result-cache fix: same-query warm `PoolManager` 0.202ms vs `rg` 5.007s, `Joystick` 0.442ms vs 5.859s, scoped `NetworkListenerManager` 0.103ms vs 77.011ms, and Alliance regex 0.148ms vs 103.702ms. First unseen full-result text queries still pay the candidate-file line scan, usually around 15-30ms on `u3dclient`.
+- Re-ran 1,000-file incremental maintenance on `u3dclient`: add 1.508s, modify 1.544s, delete 0.504s, all through the `live-incremental` path.
+- Re-ran language and atlas smoke checks: `gameserver` Java cold rebuild 3.939s at 212.7 MB WS / 212.4 MB private, current-repo Rust index 0.372s, multi-language smoke 0.069s, and module atlas full sampled export 7.960s at 286.2 MB WS / 289.1 MB private.
+
 ## Unreleased - 2026-05-28
 
 ### Added

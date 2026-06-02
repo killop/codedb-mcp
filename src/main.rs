@@ -1,7 +1,9 @@
 mod bm25;
 mod cache;
 mod config;
+mod config_watcher;
 mod embedding;
+mod event_log;
 mod graph;
 mod indexer;
 mod language;
@@ -82,20 +84,38 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load(&cli.config)?;
+    let config_path = cli.config.clone();
+    let config = AppConfig::load(&config_path)?;
+    let log_root = command_root(&cli);
+    event_log::init(&log_root, &config.logging.event_log_config())?;
     let options = config.index_options();
     let watch_enabled = config.watch.enabled && !cli.no_watch;
     let watch_poll_interval = Duration::from_secs(config.watch.poll_interval_seconds.max(1));
 
-    match cli.command {
+    let result = match cli.command {
         Some(Command::Mcp { path }) => {
+            event_log::emit(|| format!("event=command_start command=mcp root={}", path.display()));
             let manager = Arc::new(ProjectManager::new_lazy(path, options));
-            mcp::serve(manager, watch_enabled, watch_poll_interval)
+            mcp::serve(manager, watch_enabled, watch_poll_interval, config_path)
         }
         Some(Command::Index { path }) => {
+            let started = Instant::now();
+            event_log::emit(|| {
+                format!("event=command_start command=index root={}", path.display())
+            });
             let manager = ProjectManager::new(path, options)?;
             let index = manager.get(None)?;
             let stats = index.stats();
+            event_log::emit(|| {
+                format!(
+                    "event=command_finish command=index elapsed_ms={:.3} files={} chunks={} symbols={} cache={}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    stats.files,
+                    stats.chunks,
+                    stats.symbols,
+                    stats.cache
+                )
+            });
             println!(
                 "indexed {}: {} files, {} chunks, {} symbols",
                 stats.root, stats.files, stats.chunks, stats.symbols
@@ -107,6 +127,14 @@ fn main() -> Result<()> {
             path,
             max_results,
         }) => {
+            let started = Instant::now();
+            event_log::emit(|| {
+                format!(
+                    "event=command_start command=search root={} max_results={}",
+                    path.display(),
+                    max_results
+                )
+            });
             let manager = ProjectManager::new(path, options)?;
             let text = dispatch_tool(
                 &manager,
@@ -117,18 +145,48 @@ fn main() -> Result<()> {
                 }),
             );
             print!("{text}");
+            event_log::emit(|| {
+                format!(
+                    "event=command_finish command=search elapsed_ms={:.3} output_bytes={}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    text.len()
+                )
+            });
             Ok(())
         }
         Some(Command::Tool { name, arguments }) => {
+            let started = Instant::now();
+            event_log::emit(|| format!("event=command_start command=tool tool={name}"));
             let args: serde_json::Value = serde_json::from_str(&arguments)?;
             if let Some(text) = dispatch_cached_cli_tool(&cli.root, &options, &name, &args)? {
+                event_log::log_tool_result(
+                    &name,
+                    event_log::ToolLogContext::direct(),
+                    started,
+                    &text,
+                );
                 print!("{text}");
-                return Ok(());
+                event_log::emit(|| {
+                    format!(
+                        "event=command_finish command=tool tool={name} cached=true elapsed_ms={:.3} output_bytes={}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        text.len()
+                    )
+                });
+                Ok(())
+            } else {
+                let manager = ProjectManager::new_lazy(cli.root, options);
+                let text = dispatch_tool(&manager, &name, &args);
+                print!("{text}");
+                event_log::emit(|| {
+                    format!(
+                        "event=command_finish command=tool tool={name} cached=false elapsed_ms={:.3} output_bytes={}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        text.len()
+                    )
+                });
+                Ok(())
             }
-            let manager = ProjectManager::new_lazy(cli.root, options);
-            let text = dispatch_tool(&manager, &name, &args);
-            print!("{text}");
-            Ok(())
         }
         Some(Command::BenchIncremental {
             path,
@@ -136,9 +194,27 @@ fn main() -> Result<()> {
             bench_dir,
         }) => bench_incremental(path, options, count, &bench_dir),
         None => {
+            event_log::emit(|| {
+                format!(
+                    "event=command_start command=mcp root={}",
+                    cli.root.display()
+                )
+            });
             let manager = Arc::new(ProjectManager::new_lazy(cli.root, options));
-            mcp::serve(manager, watch_enabled, watch_poll_interval)
+            mcp::serve(manager, watch_enabled, watch_poll_interval, config_path)
         }
+    };
+    let _ = event_log::flush(Duration::from_secs(2));
+    result
+}
+
+fn command_root(cli: &Cli) -> PathBuf {
+    match &cli.command {
+        Some(Command::Mcp { path })
+        | Some(Command::Index { path })
+        | Some(Command::Search { path, .. })
+        | Some(Command::BenchIncremental { path, .. }) => path.clone(),
+        Some(Command::Tool { .. }) | None => cli.root.clone(),
     }
 }
 

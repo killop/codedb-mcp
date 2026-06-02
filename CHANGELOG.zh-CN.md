@@ -2,6 +2,22 @@
 
 [English version](CHANGELOG.md)
 
+## Unreleased - 2026-06-02
+
+### 变更
+
+- 将当前 `codedb_search` 的 lexical 路径替换为固定的 symbol/word-trigram 文本命中 + lazy Model2Vec 向量融合。cold index 不再构建旧的 lexical ranker，regex 和 exact text search 继续使用 codedb-style trigram sidecar。
+- 为 `codedb_text_search` 和 regex route 的 `codedb_search` 行命中增加有上限的进程内结果缓存，对齐 README warm-tool benchmark 口径，同时不让完整源码常驻内存。
+- 更新 MCP tool description 和 `skills/codedb-mcp` 使用说明，写清楚新的搜索路径，并继续要求多步查询优先通过 `codedb_bundle` 合并。
+
+### Benchmark 与验证
+
+- 重新跑完 README benchmark suite，目标 `u3dclient`：18,852 个 indexed files、31,428 chunks、274,606 symbols、19,746 graph nodes、162,823 graph edges、1,356 cached communities。
+- 重新测量 cold/index/cache：`u3dclient` cold rebuild 13.818s，峰值 226.9 MB WS / 220.2 MB private；cache-hit index open 0.741s，峰值 107.8 MB WS / 106.1 MB private；status open 0.454s，峰值 14.4 MB WS / 8.1 MB private。
+- result-cache 修复后重新测量 focused warm text-search 和 `rg` 对比：同 query warm `PoolManager` 0.202ms vs `rg` 5.007s，`Joystick` 0.442ms vs 5.859s，scoped `NetworkListenerManager` 0.103ms vs 77.011ms，Alliance regex 0.148ms vs 103.702ms。第一次未见过的 full-result text query 仍需要扫描候选文件取行文本，在 `u3dclient` 上通常是 15-30ms。
+- 重新测量 `u3dclient` 的 1,000 文件增量维护：新增 1.508s，修改 1.544s，删除 0.504s，均走 `live-incremental` path。
+- 重新测量语言和 atlas smoke：`gameserver` Java cold rebuild 3.939s，峰值 212.7 MB WS / 212.4 MB private；当前仓库 Rust index 0.372s；多语言 smoke 0.069s；module atlas full sampled export 7.960s，峰值 286.2 MB WS / 289.1 MB private。
+
 ## Unreleased - 2026-05-28
 
 ### 新增

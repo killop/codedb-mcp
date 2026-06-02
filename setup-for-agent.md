@@ -196,9 +196,21 @@ timing = false
 # Emit a slow-file parse log for files at or above this many ms. 0 disables it.
 slow_file_ms = 0
 
+[logging]
+# Disabled by default. When enabled, MCP tool calls and file-watch digest
+# batches are written through a bounded non-blocking queue and a background
+# writer. codedb_bundle logs only its child tools with mode=bundle. Queue
+# overflow drops log lines instead of slowing indexing or MCP.
+enabled = false
+file = ".codedb-mcp/codedb-mcp.log"
+queue_capacity = 8192
+flush_interval_ms = 500
+
 [watch]
 # MCP mode is enabled by default. Filesystem events are queued and applied as
 # one live-incremental batch every poll_interval_seconds.
+# The same tick checks this config file. Scan-scope config changes trigger one
+# background full reindex; the old index keeps serving until the new one commits.
 enabled = true
 poll_interval_seconds = 5
 

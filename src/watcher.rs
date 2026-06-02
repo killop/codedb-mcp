@@ -1,4 +1,7 @@
-use crate::indexer::{is_indexed_source_file, normalize_rel_path, source_watch_roots};
+use crate::event_log;
+use crate::indexer::{
+    IndexOptions, is_indexed_source_file, normalize_rel_path, source_watch_roots,
+};
 use crate::tools::{ProjectManager, ReindexCheck};
 use anyhow::{Context, Result};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,17 +21,13 @@ pub fn start_project_watcher(
         .default_root()
         .canonicalize()
         .context("failed to resolve watcher root")?;
-    let extensions = manager
-        .extensions()
-        .into_iter()
-        .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
-        .collect::<HashSet<_>>();
     let poll_interval = poll_interval.max(Duration::from_secs(1));
 
     let handle = thread::Builder::new()
         .name("codebase-mcp-watch".to_string())
         .spawn(move || {
-            if let Err(err) = watch_loop(manager, root, extensions, poll_interval) {
+            if let Err(err) = watch_loop(manager, root, poll_interval) {
+                event_log::log_file_watch_error("watcher_stop", &err.to_string());
                 eprintln!("codebase-mcp watcher stopped: {err:#}");
             }
         })
@@ -36,14 +35,27 @@ pub fn start_project_watcher(
     Ok(handle)
 }
 
-fn watch_loop(
-    manager: Arc<ProjectManager>,
-    root: PathBuf,
-    extensions: HashSet<String>,
+fn watch_loop(manager: Arc<ProjectManager>, root: PathBuf, poll_interval: Duration) -> Result<()> {
+    loop {
+        let options = manager.options();
+        let revision = manager.options_revision();
+        run_watch_generation(&manager, &root, options, revision, poll_interval)?;
+    }
+}
+
+fn run_watch_generation(
+    manager: &Arc<ProjectManager>,
+    root: &Path,
+    options: IndexOptions,
+    revision: u64,
     poll_interval: Duration,
 ) -> Result<()> {
-    let options = manager.options();
-    let watch_roots = source_watch_roots(&root, &options);
+    let extensions = options
+        .extensions
+        .iter()
+        .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let watch_roots = source_watch_roots(root, &options);
     let (tx, rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(
         move |event| {
@@ -65,10 +77,18 @@ fn watch_loop(
         poll_interval.as_secs_f32(),
         display_extensions(&extensions)
     );
+    if event_log::enabled() {
+        event_log::log_file_watch_start(
+            &display_watch_roots(&watch_roots),
+            poll_interval.as_millis(),
+            &display_extensions(&extensions),
+        );
+    }
 
     let mut known = match manager.get(None) {
         Ok(index) => known_from_index(index.as_ref()),
         Err(err) => {
+            event_log::log_file_watch_error("initial_state_failed", &err.to_string());
             eprintln!("codebase-mcp watcher initial state failed: {err:#}");
             BTreeSet::new()
         }
@@ -78,14 +98,25 @@ fn watch_loop(
 
     loop {
         thread::sleep(poll_interval);
-        drain_events(
+        if manager.options_revision() != revision {
+            event_log::log_file_watch_reconfigure("index_scope_changed");
+            return Ok(());
+        }
+        let raw_events = drain_events(
             &rx,
-            &root,
+            root,
             &options,
             &known,
             &mut pending_changed,
             &mut pending_deleted,
         );
+        if raw_events > 0 {
+            event_log::log_file_watch_digest_queued(
+                raw_events,
+                pending_changed.len(),
+                pending_deleted.len(),
+            );
+        }
         if pending_changed.is_empty() && pending_deleted.is_empty() {
             continue;
         }
@@ -96,11 +127,23 @@ fn watch_loop(
         pending_deleted.clear();
 
         let started = Instant::now();
+        event_log::log_file_watch_digest_start(changed.len(), deleted.len());
         match manager.apply_default_changes(changed.clone(), deleted.clone()) {
-            Ok(ReindexCheck::Unchanged) => {}
+            Ok(ReindexCheck::Unchanged) => {
+                event_log::log_file_watch_digest_unchanged(started, changed.len(), deleted.len());
+            }
             Ok(ReindexCheck::Reindexed(index)) => {
-                apply_known_delta(&root, &mut known, &changed, &deleted);
+                apply_known_delta(root, &mut known, &changed, &deleted);
                 let stats = index.stats();
+                event_log::log_file_watch_digest_finish(
+                    started,
+                    changed.len(),
+                    deleted.len(),
+                    stats.files,
+                    stats.chunks,
+                    stats.symbols,
+                    &stats.cache,
+                );
                 eprintln!(
                     "codebase-mcp live update ready in {:.3}s: {} changed, {} deleted, {} files, {} chunks, {} symbols",
                     started.elapsed().as_secs_f32(),
@@ -112,6 +155,12 @@ fn watch_loop(
                 );
             }
             Err(err) => {
+                event_log::log_file_watch_digest_failure(
+                    started,
+                    changed.len(),
+                    deleted.len(),
+                    &err.to_string(),
+                );
                 eprintln!("codebase-mcp polling reindex failed: {err:#}");
                 pending_changed.extend(changed);
                 pending_deleted.extend(deleted);
@@ -148,8 +197,10 @@ fn drain_events(
     known: &BTreeSet<String>,
     pending_changed: &mut BTreeSet<String>,
     pending_deleted: &mut BTreeSet<String>,
-) {
+) -> usize {
+    let mut count = 0;
     while let Ok(event) = rx.try_recv() {
+        count += 1;
         match event {
             Ok(event) => collect_event_paths(
                 root,
@@ -159,9 +210,13 @@ fn drain_events(
                 pending_changed,
                 pending_deleted,
             ),
-            Err(err) => eprintln!("codebase-mcp watcher event error: {err:#}"),
+            Err(err) => {
+                event_log::log_file_watch_error("watcher_event", &err.to_string());
+                eprintln!("codebase-mcp watcher event error: {err:#}");
+            }
         }
     }
+    count
 }
 
 fn collect_event_paths(

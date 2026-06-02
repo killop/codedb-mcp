@@ -4,6 +4,7 @@ use crate::cache::{
     read_embeddings, read_word_index,
 };
 use crate::embedding::MinishEmbeddingModel;
+use crate::event_log;
 use crate::graph::CodeGraph;
 use crate::language::{analyze_source, chunk_source_metadata, language_for_extension};
 use crate::text_search::{
@@ -18,7 +19,7 @@ use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -28,6 +29,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::language::{analyze_symbols, chunk_source, parse_imports, parse_namespace};
 
 const DEFAULT_MAX_FILE_BYTES: u64 = 50_000_000;
+const TEXT_LINE_CACHE_LIMIT: usize = 64;
+const TEXT_LINE_CACHE_MAX_HITS_PER_ENTRY: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -41,6 +44,21 @@ pub struct IndexOptions {
     pub skip_dirs: Vec<String>,
     pub diagnostics: DiagnosticsOptions,
     pub storage: StorageOptions,
+}
+
+impl IndexOptions {
+    pub fn cache_identity_eq(&self, other: &Self) -> bool {
+        self.extensions == other.extensions
+            && self.max_file_bytes == other.max_file_bytes
+            && self.embedding_model == other.embedding_model
+            && self.respect_gitignore == other.respect_gitignore
+            && self.root_paths == other.root_paths
+            && self.include_paths == other.include_paths
+            && self.exclude_paths == other.exclude_paths
+            && self.skip_dirs == other.skip_dirs
+            && self.storage.enabled == other.storage.enabled
+            && self.storage.dir == other.storage.dir
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -235,11 +253,13 @@ pub struct Codebase {
     pub word_hits_path: Option<PathBuf>,
     pub text_search_index: parking_lot::RwLock<Option<TextSearchIndex>>,
     pub text_search_index_path: Option<PathBuf>,
+    text_line_cache: parking_lot::Mutex<TextLineCache>,
     pub deps_forward: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
     pub deps_path: Option<PathBuf>,
     pub deps_reverse: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
     pub graph_stats: LightweightGraphStats,
     pub graph: parking_lot::RwLock<Option<Arc<CodeGraph>>>,
+    #[allow(dead_code)]
     pub bm25: Bm25Index,
     pub embeddings: parking_lot::RwLock<Option<Vec<Vec<f32>>>>,
     pub embeddings_path: Option<PathBuf>,
@@ -254,6 +274,65 @@ pub struct Codebase {
     pub louvain_communities: parking_lot::RwLock<Option<Vec<crate::graph::GraphCommunity>>>,
     pub louvain_subcommunities:
         parking_lot::RwLock<HashMap<usize, Vec<crate::graph::GraphCommunity>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TextLineCacheKey {
+    query: String,
+    max_results: usize,
+    regex: bool,
+    path_glob: Option<String>,
+    compact: bool,
+    include_scope: bool,
+}
+
+#[derive(Default)]
+struct TextLineCache {
+    order: VecDeque<TextLineCacheKey>,
+    entries: HashMap<TextLineCacheKey, Arc<Vec<SearchHit>>>,
+}
+
+impl TextLineCache {
+    fn get(&mut self, key: &TextLineCacheKey) -> Option<Vec<SearchHit>> {
+        let hits = self.entries.get(key)?.clone();
+        self.order.retain(|current| current != key);
+        self.order.push_back(key.clone());
+        Some((*hits).clone())
+    }
+
+    fn insert(&mut self, key: TextLineCacheKey, hits: Vec<SearchHit>) {
+        if hits.len() > TEXT_LINE_CACHE_MAX_HITS_PER_ENTRY {
+            return;
+        }
+        self.order.retain(|current| current != &key);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, Arc::new(hits));
+        while self.order.len() > TEXT_LINE_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+impl TextLineCacheKey {
+    fn new(
+        query: &str,
+        max_results: usize,
+        regex: bool,
+        path_glob: Option<&str>,
+        compact: bool,
+        include_scope: bool,
+    ) -> Self {
+        Self {
+            query: query.to_string(),
+            max_results,
+            regex,
+            path_glob: path_glob.map(str::to_string),
+            compact,
+            include_scope,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -426,34 +505,7 @@ impl Codebase {
                 )
             })?;
         }
-        let mut bm25 = if project_cache.enabled() {
-            let postings_path = cache_write
-                .as_ref()
-                .map(|transaction| transaction.bm25_postings_path().to_path_buf())
-                .unwrap_or_else(|| project_cache.bm25_postings_path());
-            let mut builder = SpillingBm25Builder::new(project_cache.dir().join("bm25-build"))?;
-            add_bm25_documents_from_sources(
-                &root,
-                &chunks,
-                &file_paths,
-                &chunk_indices_by_file,
-                |document| builder.add_document(document),
-            )?;
-            builder.finish_to_postings_file(&postings_path)?
-        } else {
-            let mut bm25_builder = Bm25Builder::new();
-            add_bm25_documents_from_sources(
-                &root,
-                &chunks,
-                &file_paths,
-                &chunk_indices_by_file,
-                |document| {
-                    bm25_builder.add_document(document);
-                    Ok(())
-                },
-            )?;
-            bm25_builder.finish()
-        };
+        let mut bm25 = Bm25Index::default();
         if project_cache.enabled() {
             if let Some(transaction) = cache_write.as_ref() {
                 bm25.use_postings_file(transaction.bm25_postings_path().to_path_buf());
@@ -462,7 +514,7 @@ impl Codebase {
             }
         }
         strip_chunk_contents(&mut chunks);
-        log_timing(timing, "bm25", stage);
+        log_timing(timing, "bm25_skipped", stage);
 
         let stage = Instant::now();
         let mut semantic_units = files
@@ -539,6 +591,7 @@ impl Codebase {
             text_search_index_path: project_cache
                 .enabled()
                 .then(|| project_cache.text_search_index_path()),
+            text_line_cache: parking_lot::Mutex::new(TextLineCache::default()),
             deps_forward: parking_lot::RwLock::new(if deps_path.is_some() {
                 None
             } else {
@@ -632,6 +685,7 @@ impl Codebase {
             word_hits_path,
             text_search_index: parking_lot::RwLock::new(None),
             text_search_index_path,
+            text_line_cache: parking_lot::Mutex::new(TextLineCache::default()),
             deps_forward: parking_lot::RwLock::new(None),
             deps_path,
             deps_reverse: parking_lot::RwLock::new(None),
@@ -687,7 +741,7 @@ impl Codebase {
                 .or_default()
                 .push((old_idx, chunk));
         }
-        let old_bm25 = payload.bm25;
+        let _old_bm25 = payload.bm25;
         log_timing(timing, "incremental_restore_old_cache", stage);
 
         let stage = Instant::now();
@@ -826,38 +880,11 @@ impl Codebase {
         }
 
         let stage = Instant::now();
-        let mut bm25 = if let Some(transaction) = cache_write.as_ref() {
-            let replacement_documents = bm25_replacement_documents_from_sources(
-                &root,
-                &chunks,
-                &changed_path_set,
-                &chunk_indices_by_file,
-            )?;
-            match old_bm25.write_remapped_postings(
-                transaction.bm25_postings_path(),
-                chunks.len(),
-                &old_to_new_doc,
-                replacement_documents,
-            ) {
-                Ok(index) => index,
-                Err(err) => {
-                    eprintln!("codebase-mcp incremental BM25 failed, rebuilding BM25: {err:#}");
-                    build_full_bm25_to_cache(
-                        &root,
-                        &chunks,
-                        &file_paths,
-                        &chunk_indices_by_file,
-                        transaction.bm25_postings_path(),
-                    )?
-                }
-            }
-        } else {
-            build_full_bm25_in_memory(&root, &chunks, &file_paths, &chunk_indices_by_file)?
-        };
+        let mut bm25 = Bm25Index::default();
         if let Some(transaction) = cache_write.as_ref() {
             bm25.use_postings_file(transaction.bm25_postings_path().to_path_buf());
         }
-        log_timing(timing, "incremental_bm25", stage);
+        log_timing(timing, "incremental_bm25_skipped", stage);
 
         let stage = Instant::now();
         let mut semantic_units = files
@@ -931,6 +958,7 @@ impl Codebase {
             word_hits_path,
             text_search_index: parking_lot::RwLock::new(None),
             text_search_index_path,
+            text_line_cache: parking_lot::Mutex::new(TextLineCache::default()),
             deps_forward: parking_lot::RwLock::new(if deps_path.is_some() {
                 None
             } else {
@@ -1037,7 +1065,7 @@ impl Codebase {
 
         let file_paths = files_by_path.keys().cloned().collect::<Vec<_>>();
         let mut files = files_by_path.into_values().collect::<Vec<_>>();
-        let mut old_to_new_doc = vec![None; old_chunk_count];
+        let mut _old_to_new_doc = vec![None; old_chunk_count];
         let mut chunks = Vec::<Chunk>::new();
         for file in &files {
             if let Some(indexed) = parsed_changed.get(&file.path) {
@@ -1048,7 +1076,7 @@ impl Codebase {
             } else if let Some(old_chunks) = old_chunks_by_file.remove(&file.path) {
                 for (old_idx, mut chunk) in old_chunks {
                     let new_idx = chunks.len();
-                    if let Some(slot) = old_to_new_doc.get_mut(old_idx) {
+                    if let Some(slot) = _old_to_new_doc.get_mut(old_idx) {
                         *slot = Some(new_idx);
                     }
                     chunk.id = new_idx;
@@ -1077,16 +1105,8 @@ impl Codebase {
         log_timing(timing, "live_incremental_dependencies", stage);
 
         let stage = Instant::now();
-        let replacement_documents = bm25_replacement_documents_from_indexed_sources(
-            &chunks,
-            &changed_existing,
-            &chunk_indices_by_file,
-            &parsed_changed,
-        );
-        let bm25 =
-            self.bm25
-                .remap_with_overlay(chunks.len(), &old_to_new_doc, replacement_documents);
-        log_timing(timing, "live_incremental_bm25", stage);
+        let bm25 = Bm25Index::default();
+        log_timing(timing, "live_incremental_bm25_skipped", stage);
 
         let stage = Instant::now();
         let mut semantic_units = files
@@ -1125,6 +1145,7 @@ impl Codebase {
             word_hits_path: None,
             text_search_index: parking_lot::RwLock::new(None),
             text_search_index_path: None,
+            text_line_cache: parking_lot::Mutex::new(TextLineCache::default()),
             deps_forward: parking_lot::RwLock::new(Some(deps_forward)),
             deps_path: None,
             deps_reverse: parking_lot::RwLock::new(None),
@@ -1339,6 +1360,14 @@ impl Codebase {
         index.hits(word)
     }
 
+    fn loaded_word_hits(&self, word: &str) -> Result<Option<Vec<WordHit>>> {
+        let guard = self.word_index.read();
+        let Some(index) = guard.as_ref() else {
+            return Ok(None);
+        };
+        index.hits(word).map(Some)
+    }
+
     fn ensure_word_index(&self) {
         if self.word_index.read().is_some() {
             return;
@@ -1347,23 +1376,35 @@ impl Codebase {
         if guard.is_some() {
             return;
         }
+        let hash = text_search_source_hash(&self.file_paths, &self.files);
         let index = match (&self.word_index_path, &self.word_hits_path) {
             (Some(index_path), Some(hits_path)) if index_path.is_file() && hits_path.is_file() => {
-                read_word_index(index_path, hits_path).unwrap_or_else(|err| {
-                    eprintln!(
-                        "codebase-mcp word index cache load failed at {}: {err:#}",
-                        index_path.display()
-                    );
-                    build_word_index_from_sources(&self.root, &self.file_paths).unwrap_or_default()
-                })
+                match read_word_index(index_path, hits_path, &hash, self.file_paths.len()) {
+                    Ok(Some(index)) => index,
+                    Ok(None) => build_word_index_from_sources(&self.root, &self.file_paths)
+                        .unwrap_or_default(),
+                    Err(err) => {
+                        eprintln!(
+                            "codebase-mcp word index cache load failed at {}: {err:#}",
+                            index_path.display()
+                        );
+                        build_word_index_from_sources(&self.root, &self.file_paths)
+                            .unwrap_or_default()
+                    }
+                }
             }
             _ => build_word_index_from_sources(&self.root, &self.file_paths).unwrap_or_default(),
         };
         let mut index = index;
         if let (Some(index_path), Some(hits_path)) = (&self.word_index_path, &self.word_hits_path) {
-            if !index_path.is_file() || !hits_path.is_file() {
+            if !index.validate_source(&hash, self.file_paths.len())
+                || !index_path.is_file()
+                || !hits_path.is_file()
+            {
                 if let Ok(cache) = ProjectCache::new(&self.root, &self.options.storage) {
-                    if let Err(err) = cache.save_word_index(&mut index) {
+                    if let Err(err) =
+                        cache.save_word_index(&mut index, hash.clone(), self.file_paths.len())
+                    {
                         eprintln!("codebase-mcp word index cache save failed: {err:#}");
                     }
                 }
@@ -1398,14 +1439,7 @@ impl Codebase {
             TextSearchIndex::build(&self.root, &self.files, &self.file_paths, hash.clone())
                 .unwrap_or_else(|err| {
                     eprintln!("codebase-mcp text search index build failed: {err:#}");
-                    TextSearchIndex {
-                        version: crate::text_search::TEXT_INDEX_VERSION,
-                        source_hash: String::new(),
-                        file_count: self.file_paths.len(),
-                        lookup: Vec::new(),
-                        postings: Vec::new(),
-                        skipped_file_ids: Vec::new(),
-                    }
+                    TextSearchIndex::empty(self.file_paths.len())
                 })
         });
         if let Ok(cache) = ProjectCache::new(&self.root, &self.options.storage) {
@@ -1419,6 +1453,32 @@ impl Codebase {
     }
 
     pub fn text_line_hits(
+        &self,
+        query: &str,
+        max_results: usize,
+        regex: bool,
+        path_glob: Option<&str>,
+        compact: bool,
+        include_scope: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let cache_key =
+            TextLineCacheKey::new(query, max_results, regex, path_glob, compact, include_scope);
+        if let Some(hits) = self.text_line_cache.lock().get(&cache_key) {
+            return Ok(hits);
+        }
+        let hits = self.text_line_hits_uncached(
+            query,
+            max_results,
+            regex,
+            path_glob,
+            compact,
+            include_scope,
+        )?;
+        self.text_line_cache.lock().insert(cache_key, hits.clone());
+        Ok(hits)
+    }
+
+    fn text_line_hits_uncached(
         &self,
         query: &str,
         max_results: usize,
@@ -1441,8 +1501,9 @@ impl Codebase {
         let mut seen = HashSet::<(u32, usize)>::new();
 
         if !regex && is_single_identifier_query(query) {
-            let word_hits = self.word_hits(query)?;
-            if !word_hits.is_empty() {
+            if let Some(word_hits) = self.loaded_word_hits(query)?
+                && !word_hits.is_empty()
+            {
                 let mut lines_by_file = HashMap::<u32, Vec<u32>>::new();
                 for hit in word_hits {
                     lines_by_file.entry(hit.file_id).or_default().push(hit.line);
@@ -1450,8 +1511,14 @@ impl Codebase {
                 let mut groups = lines_by_file.into_iter().collect::<Vec<_>>();
                 groups.sort_by(|(a_id, a_lines), (b_id, b_lines)| {
                     b_lines.len().cmp(&a_lines.len()).then_with(|| {
-                        let a_size = self.file_by_id(*a_id).map(|file| file.byte_size).unwrap_or(0);
-                        let b_size = self.file_by_id(*b_id).map(|file| file.byte_size).unwrap_or(0);
+                        let a_size = self
+                            .file_by_id(*a_id)
+                            .map(|file| file.byte_size)
+                            .unwrap_or(0);
+                        let b_size = self
+                            .file_by_id(*b_id)
+                            .map(|file| file.byte_size)
+                            .unwrap_or(0);
                         a_size.cmp(&b_size)
                     })
                 });
@@ -1770,6 +1837,7 @@ impl Codebase {
 }
 
 fn log_timing(enabled: bool, stage: &str, start: Instant) {
+    event_log::timing("indexer", stage, start);
     if enabled {
         eprintln!(
             "codebase-mcp timing {stage}: {:.3}s",
@@ -3504,6 +3572,7 @@ pub fn now_ms() -> i128 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn add_bm25_documents_from_sources(
     root: &Path,
     chunks: &[Chunk],
@@ -3540,6 +3609,7 @@ fn add_bm25_documents_from_sources(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn bm25_replacement_documents_from_sources(
     root: &Path,
     chunks: &[Chunk],
@@ -3568,6 +3638,7 @@ fn bm25_replacement_documents_from_sources(
     Ok(documents)
 }
 
+#[allow(dead_code)]
 fn bm25_replacement_documents_from_indexed_sources(
     chunks: &[Chunk],
     changed_path_set: &HashSet<String>,
@@ -3598,6 +3669,7 @@ fn bm25_replacement_documents_from_indexed_sources(
     documents
 }
 
+#[allow(dead_code)]
 fn build_full_bm25_to_cache(
     root: &Path,
     chunks: &[Chunk],
@@ -3617,6 +3689,7 @@ fn build_full_bm25_to_cache(
     builder.finish_to_postings_file(postings_path)
 }
 
+#[allow(dead_code)]
 fn build_full_bm25_in_memory(
     root: &Path,
     chunks: &[Chunk],
@@ -3644,6 +3717,7 @@ fn read_source_content(root: &Path, rel_path: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+#[allow(dead_code)]
 fn bm25_tokens_for_chunk(chunk: &Chunk, file_path: &str, lines: &[&str]) -> Vec<String> {
     let mut tokens = Vec::new();
     append_path_tokens(&mut tokens, file_path);
@@ -3658,6 +3732,7 @@ fn bm25_tokens_for_chunk(chunk: &Chunk, file_path: &str, lines: &[&str]) -> Vec<
     tokens
 }
 
+#[allow(dead_code)]
 fn append_path_tokens(tokens: &mut Vec<String>, file_path: &str) {
     let path = Path::new(file_path);
     let stem = path
@@ -3674,12 +3749,14 @@ fn append_path_tokens(tokens: &mut Vec<String>, file_path: &str) {
     append_identifier_tokens(tokens, parent, false);
 }
 
+#[allow(dead_code)]
 fn append_text_tokens(tokens: &mut Vec<String>, text: &str) {
     for raw in raw_identifiers(text) {
         append_identifier_tokens(tokens, &raw, true);
     }
 }
 
+#[allow(dead_code)]
 fn append_identifier_tokens(tokens: &mut Vec<String>, identifier: &str, filter_stopwords: bool) {
     tokens.extend(
         split_identifier(identifier)
@@ -3688,10 +3765,12 @@ fn append_identifier_tokens(tokens: &mut Vec<String>, identifier: &str, filter_s
     );
 }
 
+#[allow(dead_code)]
 fn is_bm25_token(token: &str, filter_stopwords: bool) -> bool {
     token.len() > 1 && (!filter_stopwords || !is_bm25_code_stopword(token))
 }
 
+#[allow(dead_code)]
 fn is_bm25_code_stopword(token: &str) -> bool {
     matches!(
         token,

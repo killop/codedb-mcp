@@ -1,5 +1,5 @@
 use crate::indexer::Codebase;
-use crate::tokens::{split_identifier, tokenize};
+use crate::tokens::{has_whole_word, split_identifier, tokenize};
 use crate::types::ChunkSearchHit;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -17,32 +17,112 @@ pub fn hybrid_search(
         return Ok(Vec::new());
     }
 
-    let symbol_query = is_symbol_query(query);
-    let candidate_count = (top_k.max(1) * if symbol_query { 12 } else { 5 })
-        .min(index.chunks.len())
+    let text = text_chunk_scores(index, query, top_k, selector)?;
+    let semantic = if should_run_semantic(query, top_k, text.len()) {
+        semantic_search(index, query, top_k, selector).unwrap_or_else(|err| {
+            eprintln!("codebase-mcp semantic search skipped: {err:#}");
+            HashMap::new()
+        })
+    } else {
+        HashMap::new()
+    };
+
+    let text_rrf = rrf_scores(&text);
+    let semantic_rrf = rrf_scores(&semantic);
+    let mut candidates = HashSet::new();
+    candidates.extend(text_rrf.keys().copied());
+    candidates.extend(semantic_rrf.keys().copied());
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let natural = is_natural_language_query(query);
+    let text_weight = if semantic_rrf.is_empty() {
+        1.0
+    } else if text_rrf.is_empty() {
+        0.0
+    } else if natural {
+        0.45
+    } else {
+        0.75
+    };
+    let semantic_weight = 1.0 - text_weight;
+
+    let mut scores = HashMap::new();
+    let mut sources = HashMap::new();
+    for idx in candidates {
+        let has_text = text_rrf.contains_key(&idx);
+        let has_semantic = semantic_rrf.contains_key(&idx);
+        let score = text_weight * text_rrf.get(&idx).copied().unwrap_or(0.0)
+            + semantic_weight * semantic_rrf.get(&idx).copied().unwrap_or(0.0);
+        scores.insert(idx, score);
+        sources.insert(
+            idx,
+            match (has_text, has_semantic) {
+                (true, true) => "text+semantic",
+                (true, false) => {
+                    if is_symbol_query(query) {
+                        "symbol"
+                    } else {
+                        "text"
+                    }
+                }
+                (false, true) => "semantic",
+                (false, false) => "search",
+            },
+        );
+    }
+
+    boost_multi_chunk_files(index, &mut scores);
+    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+    apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
+    ranked_hits(index, scores, top_k, &sources)
+}
+
+fn text_chunk_scores(
+    index: &Codebase,
+    query: &str,
+    top_k: usize,
+    selector: Option<&[usize]>,
+) -> Result<HashMap<usize, f32>> {
+    let text_limit = (top_k.max(1) * 12).clamp(24, 400);
+    let hits = index.text_line_hits(query, text_limit, false, None, true, false)?;
+    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
+    let mut scores = HashMap::<usize, f32>::new();
+    for (rank, hit) in hits.iter().enumerate() {
+        let Some(chunk_idx) = chunk_for_line(index, &hit.path, hit.line) else {
+            continue;
+        };
+        if allowed
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&chunk_idx))
+        {
+            continue;
+        }
+        let rank_score = 1.0 / (rank as f32 + 1.0);
+        let exact_bonus = if is_symbol_query(query) && has_whole_word(&hit.text, query) {
+            0.35
+        } else {
+            0.0
+        };
+        *scores.entry(chunk_idx).or_default() += rank_score + exact_bonus;
+    }
+    Ok(scores)
+}
+
+fn semantic_search(
+    index: &Codebase,
+    query: &str,
+    top_k: usize,
+    selector: Option<&[usize]>,
+) -> Result<HashMap<usize, f32>> {
+    let candidate_count = (top_k.max(1) * 8)
+        .min(index.semantic_units.len())
         .max(top_k);
-    let bm25 = index
-        .bm25
-        .query(query, candidate_count, selector)?
-        .into_iter()
-        .collect::<HashMap<usize, f32>>();
-
-    if symbol_query {
-        let mut scores = rrf_scores(&bm25);
-        boost_multi_chunk_files(index, &mut scores);
-        let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-        apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
-        return ranked_hits(index, scores, top_k, "symbol");
+    if candidate_count == 0 {
+        return Ok(HashMap::new());
     }
-
-    if lexical_candidates_are_enough(query, top_k, bm25.len()) {
-        let mut scores = rrf_scores(&bm25);
-        boost_multi_chunk_files(index, &mut scores);
-        let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-        apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
-        return ranked_hits(index, scores, top_k, "lexical");
-    }
-
     let model = index.embedding_model()?;
     let query_vec = model.encode_one(query);
     let semantic_files = index
@@ -50,32 +130,40 @@ pub fn hybrid_search(
         .query(&query_vec, candidate_count, None)?
         .into_iter()
         .collect::<HashMap<usize, f32>>();
-    let semantic = semantic_chunk_scores(index, query, &semantic_files, top_k, selector)?;
+    semantic_chunk_scores(index, query, &semantic_files, top_k, selector)
+}
 
-    let semantic_rrf = rrf_scores(&semantic);
-    let bm25_rrf = rrf_scores(&bm25);
-    let mut candidates = HashSet::new();
-    candidates.extend(semantic_rrf.keys().copied());
-    candidates.extend(bm25_rrf.keys().copied());
+fn chunk_for_line(index: &Codebase, path: &str, line: usize) -> Option<usize> {
+    let indices = index.chunk_indices_by_file.get(path)?;
+    indices.iter().copied().find(|idx| {
+        let chunk = &index.chunks[*idx];
+        chunk.start_line <= line && line <= chunk.end_line
+    })
+}
 
-    let mut scores = HashMap::new();
-    for idx in candidates {
-        let score = 0.5 * semantic_rrf.get(&idx).copied().unwrap_or(0.0)
-            + 0.5 * bm25_rrf.get(&idx).copied().unwrap_or(0.0);
-        scores.insert(idx, score);
+fn should_run_semantic(query: &str, top_k: usize, text_candidate_count: usize) -> bool {
+    let trimmed = query.trim();
+    if trimmed.len() < 3 {
+        return false;
     }
+    if text_candidate_count < top_k {
+        return true;
+    }
+    is_natural_language_query(trimmed)
+}
 
-    boost_multi_chunk_files(index, &mut scores);
-    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-    apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
-    ranked_hits(index, scores, top_k, "hybrid")
+fn is_natural_language_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    trimmed.split_whitespace().nth(1).is_some()
+        || trimmed.chars().any(|c| !c.is_ascii())
+        || (!is_symbol_query(trimmed) && tokenize(trimmed).len() >= 3)
 }
 
 fn ranked_hits(
     index: &Codebase,
     scores: HashMap<usize, f32>,
     top_k: usize,
-    source: &'static str,
+    sources: &HashMap<usize, &'static str>,
 ) -> Result<Vec<ChunkSearchHit>> {
     let mut ranked = scores.into_iter().collect::<Vec<_>>();
     ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
@@ -98,7 +186,7 @@ fn ranked_hits(
         .map(|(idx, score)| ChunkSearchHit {
             chunk: index.chunks[idx].clone(),
             score,
-            source,
+            source: sources.get(&idx).copied().unwrap_or("search"),
         })
         .collect())
 }
@@ -125,17 +213,6 @@ fn rrf_scores(scores: &HashMap<usize, f32>) -> HashMap<usize, f32> {
         .enumerate()
         .map(|(rank, (&idx, _))| (idx, 1.0 / (RRF_K + rank as f32 + 1.0)))
         .collect()
-}
-
-fn lexical_candidates_are_enough(query: &str, top_k: usize, candidate_len: usize) -> bool {
-    if candidate_len < top_k.clamp(5, 40) {
-        return false;
-    }
-    let meaningful_tokens = tokenize(query)
-        .into_iter()
-        .filter(|token| token.len() > 2 && !STOPWORDS.contains(&token.as_str()))
-        .count();
-    meaningful_tokens >= 2
 }
 
 fn semantic_chunk_scores(

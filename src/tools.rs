@@ -8,7 +8,7 @@ use crate::indexer::{
 };
 use crate::language::{is_comment_or_blank, scope_for_line};
 use crate::search::hybrid_search;
-use crate::tokens::{has_whole_word, split_identifier};
+use crate::tokens::{has_whole_word, raw_identifiers, split_identifier};
 use crate::types::{FileEntry, SearchHit, Symbol};
 use anyhow::{Result, anyhow};
 use parking_lot::{Mutex, RwLock};
@@ -30,6 +30,12 @@ const MODULE_HUB_INCOMING_LIMIT: usize = 220;
 const MODULE_MAX_DEPENDENCY_EDGES_PER_FILE: usize = 72;
 const MODULE_MAX_FILES_PER_GROUP: usize = 450;
 const MODULE_LABEL_ITERATIONS: usize = 8;
+const CONTEXT_DEFAULT_MAX_FILES: usize = 8;
+const CONTEXT_MAX_FILES: usize = 40;
+const EXPLORE_DEFAULT_MAX_FILES: usize = 5;
+const EXPLORE_DEFAULT_MAX_CHARS: usize = 12_000;
+const EXPLORE_MAX_CHARS: usize = 80_000;
+const EXPLORE_DEFAULT_CONTEXT_LINES: usize = 8;
 
 pub struct ProjectManager {
     default_root: PathBuf,
@@ -668,6 +674,8 @@ fn dispatch_index_tool(index: &Codebase, name: &str, args: &Value) -> Result<Str
         "codedb_status" => Ok(handle_status(index)),
         "codedb_snapshot" => Ok(handle_snapshot(index)),
         "codedb_find" => handle_find(index, args),
+        "codedb_context" => handle_context(index, args),
+        "codedb_explore" => handle_explore(index, args),
         "codedb_glob" => handle_glob(index, args),
         "codedb_ls" => handle_ls(index, args),
         "codedb_query" => handle_query(index, args),
@@ -1594,6 +1602,631 @@ fn handle_find(index: &Codebase, args: &Value) -> Result<String> {
         out.push_str(&format!("{}. {} (score: {:.2})\n", idx + 1, path, score));
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContextRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ContextCandidate {
+    path: String,
+    score: f32,
+    reasons: BTreeSet<String>,
+    ranges: Vec<ContextRange>,
+    hit_lines: BTreeSet<usize>,
+}
+
+impl ContextCandidate {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            score: 0.0,
+            reasons: BTreeSet::new(),
+            ranges: Vec::new(),
+            hit_lines: BTreeSet::new(),
+        }
+    }
+}
+
+fn handle_context(index: &Codebase, args: &Value) -> Result<String> {
+    let query = required_str(args, "query")?;
+    if query.trim().is_empty() {
+        return Ok("error: empty query - pass a non-empty 'query' string".to_string());
+    }
+    let max_files = get_usize(args, "max_files")
+        .or_else(|| get_usize(args, "max_results"))
+        .unwrap_or(CONTEXT_DEFAULT_MAX_FILES)
+        .clamp(1, CONTEXT_MAX_FILES);
+    let path_glob = get_str(args, "path_glob");
+    let include_deps = get_bool_default(args, "include_deps", true);
+    let candidates = collect_context_candidates(index, &query, path_glob.as_deref(), max_files)?;
+    if candidates.is_empty() {
+        return Ok(format!("no context candidates for: {query}"));
+    }
+
+    let mut out = format!(
+        "codedb_context for '{}': {} candidate files\n",
+        query,
+        candidates.len()
+    );
+    out.push_str("Use codedb_explore with the same query when source snippets are needed.\n");
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let Some(file) = index.file(&candidate.path) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "\n{}. {} ({}, {} lines, {} symbols) score={:.3}\n",
+            idx + 1,
+            file.path,
+            file.language,
+            file.line_count,
+            file.symbols.len(),
+            candidate.score
+        ));
+        out.push_str(&format!(
+            "   why: {}\n",
+            candidate
+                .reasons
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if !candidate.hit_lines.is_empty() {
+            out.push_str(&format!(
+                "   hit lines: {}\n",
+                candidate
+                    .hit_lines
+                    .iter()
+                    .take(8)
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let symbols = selected_symbols(file, &candidate.ranges, &query, 6);
+        if !symbols.is_empty() {
+            out.push_str("   symbols:\n");
+            for symbol in symbols {
+                out.push_str(&format!(
+                    "     L{}-L{} {} {} // {}\n",
+                    symbol.line_start, symbol.line_end, symbol.kind, symbol.name, symbol.detail
+                ));
+            }
+        }
+        if include_deps {
+            append_compact_deps(index, &candidate.path, &mut out, "   ");
+        }
+    }
+    Ok(out)
+}
+
+fn handle_explore(index: &Codebase, args: &Value) -> Result<String> {
+    let query = get_str(args, "query").unwrap_or_default();
+    let explicit_paths = explicit_explore_paths(args);
+    if query.trim().is_empty() && explicit_paths.is_empty() {
+        return Ok("error: pass 'query', 'path', or 'paths'".to_string());
+    }
+    let max_files = get_usize(args, "max_files")
+        .unwrap_or(EXPLORE_DEFAULT_MAX_FILES)
+        .clamp(1, CONTEXT_MAX_FILES);
+    let max_chars = get_usize(args, "max_chars")
+        .unwrap_or(EXPLORE_DEFAULT_MAX_CHARS)
+        .clamp(2_000, EXPLORE_MAX_CHARS);
+    let context_lines = get_usize(args, "context_lines")
+        .unwrap_or(EXPLORE_DEFAULT_CONTEXT_LINES)
+        .clamp(1, 80);
+    let max_lines_per_file = get_usize(args, "max_lines_per_file")
+        .unwrap_or(160)
+        .clamp(20, 1000);
+    let compact = get_bool_default(args, "compact", true);
+    let include_deps = get_bool_default(args, "include_deps", true);
+    let path_glob = get_str(args, "path_glob");
+
+    let mut candidates = if query.trim().is_empty() {
+        Vec::new()
+    } else {
+        collect_context_candidates(index, &query, path_glob.as_deref(), max_files)?
+    };
+    merge_explicit_paths(index, &mut candidates, explicit_paths);
+    candidates.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    candidates.truncate(max_files);
+    if candidates.is_empty() {
+        return Ok(format!("no explore candidates for: {query}"));
+    }
+
+    let title = if query.trim().is_empty() {
+        "explicit paths".to_string()
+    } else {
+        format!("'{query}'")
+    };
+    let mut out = format!(
+        "codedb_explore for {title}: {} files, max_chars={max_chars}\n",
+        candidates.len()
+    );
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let Some(file) = index.file(&candidate.path) else {
+            continue;
+        };
+        let header = format!(
+            "\n## {}. {} ({}, {} lines)\nwhy: {}\n",
+            idx + 1,
+            file.path,
+            file.language,
+            file.line_count,
+            candidate
+                .reasons
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !append_with_budget(&mut out, &header, max_chars) {
+            break;
+        }
+        let symbols = selected_symbols(file, &candidate.ranges, &query, 8);
+        if !symbols.is_empty() {
+            let mut symbol_text = String::from("outline focus:\n");
+            for symbol in &symbols {
+                symbol_text.push_str(&format!(
+                    "  L{}-L{} {} {} // {}\n",
+                    symbol.line_start, symbol.line_end, symbol.kind, symbol.name, symbol.detail
+                ));
+            }
+            if !append_with_budget(&mut out, &symbol_text, max_chars) {
+                break;
+            }
+        }
+        if include_deps {
+            let mut deps_text = String::new();
+            append_compact_deps(index, &candidate.path, &mut deps_text, "");
+            if !deps_text.is_empty() && !append_with_budget(&mut out, &deps_text, max_chars) {
+                break;
+            }
+        }
+        let ranges = explore_ranges(file, candidate, &symbols, context_lines, max_lines_per_file);
+        let content = index.file_content(file)?;
+        let source = format_source_ranges(&content, &ranges, compact, max_lines_per_file);
+        if source.trim().is_empty() {
+            continue;
+        }
+        let block = format!("source excerpts:\n{source}");
+        if !append_with_budget(&mut out, &block, max_chars) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn collect_context_candidates(
+    index: &Codebase,
+    query: &str,
+    path_glob: Option<&str>,
+    max_files: usize,
+) -> Result<Vec<ContextCandidate>> {
+    let mut candidates = BTreeMap::<String, ContextCandidate>::new();
+    let selector = path_glob.map(|glob| index.path_selector(Some(glob)));
+    let selector_ref = selector.as_deref();
+    let search_limit = (max_files * 8).clamp(16, 160);
+    let chunk_hits = hybrid_search(index, query, search_limit, selector_ref)?;
+    for (rank, hit) in chunk_hits.iter().enumerate() {
+        let path = index.chunk_file_path(&hit.chunk).to_string();
+        let score = hit.score + 1.0 / (rank as f32 + 1.0);
+        add_candidate_hit(
+            &mut candidates,
+            path,
+            score,
+            format!(
+                "{} chunk L{}-L{}",
+                hit.source, hit.chunk.start_line, hit.chunk.end_line
+            ),
+            ContextRange {
+                start: hit.chunk.start_line,
+                end: hit.chunk.end_line,
+            },
+            None,
+        );
+    }
+
+    let line_hits = index.text_line_hits(query, search_limit, false, path_glob, true, true)?;
+    for (rank, hit) in line_hits.iter().enumerate() {
+        let whole_word = has_whole_word(&hit.text, query);
+        add_candidate_hit(
+            &mut candidates,
+            hit.path.clone(),
+            if whole_word {
+                0.75 + 1.0 / (rank as f32 + 1.0)
+            } else {
+                0.15 + 0.25 / (rank as f32 + 1.0)
+            },
+            if whole_word {
+                "exact text line".to_string()
+            } else {
+                "substring text line".to_string()
+            },
+            ContextRange {
+                start: hit.line,
+                end: hit.line,
+            },
+            Some(hit.line),
+        );
+    }
+
+    let globset = path_glob.map(build_globset).transpose()?;
+    for token in context_symbol_identifiers(query).into_iter().take(12) {
+        for (file, symbol) in index.symbols_named(&token) {
+            if globset
+                .as_ref()
+                .is_some_and(|glob| !glob.is_match(&file.path))
+            {
+                continue;
+            }
+            let exact_name = symbol.name.eq_ignore_ascii_case(&token);
+            add_candidate_hit(
+                &mut candidates,
+                file.path.clone(),
+                if exact_name { 8.0 } else { 3.0 },
+                format!("symbol {} {}", symbol.kind, symbol.name),
+                ContextRange {
+                    start: symbol.line_start,
+                    end: symbol.line_end,
+                },
+                Some(symbol.line_start),
+            );
+        }
+    }
+
+    let mut items = candidates.into_values().collect::<Vec<_>>();
+    for item in &mut items {
+        item.ranges = merged_ranges(item.ranges.clone(), 0, usize::MAX);
+        apply_name_boost(index, item, query);
+    }
+    items.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    items.truncate(max_files);
+    Ok(items)
+}
+
+fn add_candidate_hit(
+    candidates: &mut BTreeMap<String, ContextCandidate>,
+    path: String,
+    score: f32,
+    reason: String,
+    range: ContextRange,
+    hit_line: Option<usize>,
+) {
+    let candidate = candidates
+        .entry(path.clone())
+        .or_insert_with(|| ContextCandidate::new(path));
+    candidate.score += score;
+    candidate.reasons.insert(reason);
+    candidate.ranges.push(range);
+    if let Some(line) = hit_line {
+        candidate.hit_lines.insert(line);
+    }
+}
+
+fn context_query_identifiers(query: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for raw in raw_identifiers(query) {
+        let mut values = vec![raw.clone()];
+        values.extend(split_identifier(&raw));
+        for value in values {
+            if value.len() < 3 {
+                continue;
+            }
+            if seen.insert(value.to_ascii_lowercase()) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+fn context_symbol_identifiers(query: &str) -> Vec<String> {
+    let raw = raw_identifiers(query);
+    let single_token_query = raw.len() == 1;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for token in raw {
+        if token.len() < 3 {
+            continue;
+        }
+        let symbol_shaped = single_token_query
+            || token.contains('_')
+            || token.chars().any(|ch| ch.is_ascii_uppercase())
+            || token.chars().any(|ch| ch.is_ascii_digit());
+        if !symbol_shaped {
+            continue;
+        }
+        let mut values = vec![token.clone()];
+        if symbol_shaped {
+            values.extend(split_identifier(&token));
+        }
+        for value in values {
+            if value.len() < 3 {
+                continue;
+            }
+            if seen.insert(value.to_ascii_lowercase()) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+fn apply_name_boost(index: &Codebase, candidate: &mut ContextCandidate, query: &str) {
+    let Some(file) = index.file(&candidate.path) else {
+        return;
+    };
+    let normalized_query = query.trim().to_ascii_lowercase();
+    if normalized_query.is_empty() || normalized_query.split_whitespace().nth(1).is_some() {
+        return;
+    }
+    let stem = Path::new(&file.path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem == normalized_query {
+        candidate.score += 8.0;
+        candidate
+            .reasons
+            .insert("file stem exact match".to_string());
+    }
+    if file
+        .symbols
+        .iter()
+        .any(|symbol| symbol.name.eq_ignore_ascii_case(query.trim()))
+    {
+        candidate.score += 8.0;
+        candidate.reasons.insert("symbol exact match".to_string());
+    }
+}
+
+fn selected_symbols<'a>(
+    file: &'a FileEntry,
+    ranges: &[ContextRange],
+    query: &str,
+    limit: usize,
+) -> Vec<&'a Symbol> {
+    let identifiers = context_query_identifiers(query);
+    let mut selected = Vec::new();
+    for symbol in &file.symbols {
+        let name_match = identifiers.iter().any(|token| {
+            symbol.name.eq_ignore_ascii_case(token) || has_whole_word(&symbol.detail, token)
+        });
+        let range_match = ranges.iter().any(|range| {
+            ranges_overlap(symbol.line_start, symbol.line_end, range.start, range.end)
+        });
+        if name_match || range_match {
+            selected.push(symbol);
+        }
+        if selected.len() >= limit {
+            return selected;
+        }
+    }
+    if selected.is_empty() {
+        selected.extend(file.symbols.iter().take(limit));
+    }
+    selected
+}
+
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+fn append_compact_deps(index: &Codebase, path: &str, out: &mut String, indent: &str) {
+    let deps = index.deps_for(path);
+    let incoming = index.reverse_deps_for(path);
+    out.push_str(&format!(
+        "{indent}deps: depends_on={} imported_by={}\n",
+        deps.len(),
+        incoming.len()
+    ));
+    if !deps.is_empty() {
+        out.push_str(&format!(
+            "{indent}  depends_on: {}\n",
+            deps.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !incoming.is_empty() {
+        out.push_str(&format!(
+            "{indent}  imported_by: {}\n",
+            incoming
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+}
+
+fn explicit_explore_paths(args: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = get_str(args, "path") {
+        paths.push(normalize_rel_path(&path));
+    }
+    if let Some(items) = args.get("paths").and_then(Value::as_array) {
+        for item in items {
+            match item {
+                Value::String(path) => paths.push(normalize_rel_path(path)),
+                Value::Object(map) => {
+                    if let Some(path) = map.get("path").and_then(Value::as_str) {
+                        paths.push(normalize_rel_path(path));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn merge_explicit_paths(
+    index: &Codebase,
+    candidates: &mut Vec<ContextCandidate>,
+    paths: Vec<String>,
+) {
+    for path in paths {
+        if !index.files.contains_key(&path) {
+            continue;
+        }
+        if let Some(candidate) = candidates.iter_mut().find(|item| item.path == path) {
+            candidate.score += 10.0;
+            candidate.reasons.insert("explicit path".to_string());
+        } else {
+            let mut candidate = ContextCandidate::new(path);
+            candidate.score = 10.0;
+            candidate.reasons.insert("explicit path".to_string());
+            candidates.push(candidate);
+        }
+    }
+}
+
+fn explore_ranges(
+    file: &FileEntry,
+    candidate: &ContextCandidate,
+    symbols: &[&Symbol],
+    context_lines: usize,
+    max_lines_per_file: usize,
+) -> Vec<ContextRange> {
+    let mut ranges = candidate.ranges.clone();
+    if ranges.is_empty() {
+        ranges.extend(symbols.iter().take(4).map(|symbol| ContextRange {
+            start: symbol.line_start,
+            end: symbol.line_end,
+        }));
+    }
+    if ranges.is_empty() {
+        ranges.push(ContextRange {
+            start: 1,
+            end: file.line_count.min(max_lines_per_file),
+        });
+    }
+    let expanded = ranges
+        .into_iter()
+        .map(|range| ContextRange {
+            start: range.start.saturating_sub(context_lines).max(1),
+            end: range
+                .end
+                .saturating_add(context_lines)
+                .min(file.line_count.max(1)),
+        })
+        .collect::<Vec<_>>();
+    merged_ranges(expanded, 2, file.line_count.max(1))
+        .into_iter()
+        .scan(0usize, |shown, range| {
+            if *shown >= max_lines_per_file {
+                return None;
+            }
+            let remaining = max_lines_per_file - *shown;
+            let len = range.end.saturating_sub(range.start) + 1;
+            *shown += len.min(remaining);
+            Some(ContextRange {
+                start: range.start,
+                end: range.start + len.min(remaining) - 1,
+            })
+        })
+        .collect()
+}
+
+fn merged_ranges(mut ranges: Vec<ContextRange>, gap: usize, max_line: usize) -> Vec<ContextRange> {
+    ranges.retain(|range| range.start > 0 && range.end > 0);
+    ranges.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
+    let mut merged = Vec::<ContextRange>::new();
+    for mut range in ranges {
+        range.start = range.start.min(max_line);
+        range.end = range.end.min(max_line);
+        if range.start > range.end {
+            continue;
+        }
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end.saturating_add(gap + 1)
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn format_source_ranges(
+    content: &str,
+    ranges: &[ContextRange],
+    compact: bool,
+    max_lines: usize,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for range in ranges {
+        if shown >= max_lines {
+            break;
+        }
+        out.push_str(&format!("-- lines {}-{} --\n", range.start, range.end));
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            if line_no < range.start || line_no > range.end {
+                continue;
+            }
+            if compact && is_comment_or_blank(line) {
+                continue;
+            }
+            out.push_str(&format!("{line_no}: {line}\n"));
+            shown += 1;
+            if shown >= max_lines {
+                out.push_str("[source line budget reached]\n");
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn append_with_budget(out: &mut String, text: &str, max_chars: usize) -> bool {
+    if out.len() + text.len() <= max_chars {
+        out.push_str(text);
+        return true;
+    }
+    let remaining = max_chars.saturating_sub(out.len());
+    if remaining > 80 {
+        out.push_str(&text[..safe_prefix_len(text, remaining - 40)]);
+        out.push_str("\n(truncated by max_chars)\n");
+    } else if !out.ends_with("(truncated by max_chars)\n") {
+        out.push_str("\n(truncated by max_chars)\n");
+    }
+    false
+}
+
+fn safe_prefix_len(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return text.len();
+    }
+    let mut end = 0usize;
+    for (idx, _) in text.char_indices() {
+        if idx > max_bytes {
+            break;
+        }
+        end = idx;
+    }
+    end
 }
 
 fn handle_glob(index: &Codebase, args: &Value) -> Result<String> {
@@ -4208,33 +4841,74 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
 }
 
 fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
-    let mut out = format!("{} results for '{}':\n", hits.len(), query);
-    let mut per_file: HashMap<String, usize> = HashMap::new();
-    let mut shown = 0usize;
+    const MAX_PER_FILE: usize = 5;
+
+    struct FileHits {
+        total: usize,
+        shown: Vec<String>,
+    }
+
+    let total_hits = hits.len();
+    let mut file_order = Vec::<String>::new();
+    let mut grouped = BTreeMap::<String, FileHits>::new();
+
     for hit in hits {
-        let count = per_file.entry(hit.path.clone()).or_default();
-        *count += 1;
-        if *count > 5 {
-            if *count == 6 {
-                out.push_str(&format!("  {}: ... (more matches truncated)\n", hit.path));
-            }
+        if !grouped.contains_key(&hit.path) {
+            file_order.push(hit.path.clone());
+            grouped.insert(
+                hit.path.clone(),
+                FileHits {
+                    total: 0,
+                    shown: Vec::new(),
+                },
+            );
+        }
+        let Some(entry) = grouped.get_mut(&hit.path) else {
+            continue;
+        };
+        entry.total += 1;
+        if entry.shown.len() >= MAX_PER_FILE {
             continue;
         }
-        if let Some(scope) = hit.scope {
-            out.push_str(&format!(
-                "  {}:{}: {}  [in {} ({}, L{}-L{})]\n",
-                hit.path, hit.line, hit.text, scope.name, scope.kind, scope.start, scope.end
-            ));
+        let line = if let Some(scope) = hit.scope {
+            format!(
+                "    L{}: {} [in {} {}, L{}-L{}]",
+                hit.line, hit.text, scope.kind, scope.name, scope.start, scope.end
+            )
         } else {
-            out.push_str(&format!("  {}:{}: {}\n", hit.path, hit.line, hit.text));
-        }
-        shown += 1;
+            format!("    L{}: {}", hit.line, hit.text)
+        };
+        entry.shown.push(line);
     }
-    let total: usize = per_file.values().sum();
-    if shown < total {
+
+    let mut out = format!(
+        "{} results for '{}' in {} files:\n",
+        total_hits,
+        query,
+        file_order.len()
+    );
+    let mut shown = 0usize;
+    for path in file_order {
+        let Some(entry) = grouped.get(&path) else {
+            continue;
+        };
+        out.push_str(&format!("  {path}\n"));
+        for line in &entry.shown {
+            out.push_str(line);
+            out.push('\n');
+            shown += 1;
+        }
+        if entry.total > entry.shown.len() {
+            out.push_str(&format!(
+                "    [+{} more matches]\n",
+                entry.total - entry.shown.len()
+            ));
+        }
+    }
+    if shown < total_hits {
         out.push_str(&format!(
-            "({shown} shown, {} truncated by per-file cap)\n",
-            total - shown
+            "[{shown} shown, {} suppressed]\n",
+            total_hits - shown
         ));
     }
     out
@@ -4413,6 +5087,10 @@ fn get_str(args: &Value, key: &str) -> Option<String> {
 
 fn get_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn get_bool_default(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
 fn get_usize(args: &Value, key: &str) -> Option<usize> {

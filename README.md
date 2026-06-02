@@ -16,6 +16,7 @@
 <p>
   <a href="#project-overview">Overview</a> •
   <a href="#mcp-tools">MCP Tools</a> •
+  <a href="#codex-token-observation">Token Observer</a> •
   <a href="#code-module-atlas">Code Module Atlas</a> •
   <a href="#deepwiki">DeepWiki</a> •
   <a href="#benchmark-snapshot">Benchmarks</a> •
@@ -35,10 +36,11 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 
 | Area | What It Provides |
 |---|---|
-| Fast MCP tools | Indexed exact/regex search, symbol/word-trigram/vector search, outlines, definitions, callers, dependencies, fuzzy file lookup, query pipelines, and 100-call bundles. |
+| Fast MCP tools | Indexed exact/regex search, symbol/word-trigram/vector search, answer-oriented context/explore, outlines, definitions, callers, dependencies, fuzzy file lookup, query pipelines, and 100-call bundles. |
 | Module discovery | Dependency-connected file components plus dependency-weighted label propagation, with terms and paths used as explainable labels and evidence. |
 | Code Module Atlas | A packaged meet-blog-style 3D viewer with one star per source file, module/file lists, dependency edges, and file focus/details. |
 | DeepWiki | Local repository documentation generated from MCP evidence and the active agent's reasoning, with business-module-first pages and cited source files. |
+| Codex token observation | A bundled transcript observer that reads Codex JSONL sessions, measures codedb tool output tokens, and flags high-output lookup patterns. |
 | Local deployment | Explicit `.codedb-mcp/codedb-mcp.toml`, project-local storage, bundled skills, and no hidden environment-variable behavior. |
 
 ## MCP Tools
@@ -46,11 +48,22 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 The server keeps a tree-sitter indexed, project-local code database under `.codedb-mcp` and exposes tools for:
 
 - fast exact/regex search, symbol/word-trigram search, and lazy vector search;
+- answer-oriented `codedb_context` / `codedb_explore` for architecture, flow, and feature-area questions under explicit output budgets;
 - symbol outlines and definition lookup;
 - LSP-like callers anchored to a definition path and line;
 - direct and reverse file dependencies, including transitive walks;
 - fuzzy file lookup, path globbing, compact query pipelines, and 100-call bundles;
 - graph summaries, lazy Louvain communities, module planning, atlas export, and DeepWiki evidence gathering.
+
+## Codex Token Observation
+
+The `codedb-mcp` skill includes a lightweight Codex transcript observer:
+
+```powershell
+node skills\codedb-mcp\scripts\codex-observe.mjs --project u3dclient --since 24h --top 12
+```
+
+It scans `~/.codex/sessions` line by line, filters sessions by project `cwd`, and reports model token counts, tool-output token estimates, codedb call totals, bundle child breakdowns, high-output calls, broad reads/searches, non-codedb source lookups, and missed `codedb_bundle` / `codedb_context` opportunities. It is a diagnostic script only; it does not modify transcripts or the MCP runtime.
 
 ## Code Module Atlas
 
@@ -90,6 +103,17 @@ Current index status with the Unity C# benchmark config:
 - Storage: `u3dclient\.codedb-mcp`.
 - Cache v23 sidecars: generation-named compact `index.*.bin`, `fingerprints.*.bin`, offset-addressed `outlines.*.bin` / `outlines_index.*.bin`, lazy `word_index.bin`/`word_hits.bin`, lazy `text_search_index.bin`, lazy `callers.bin`, lazy `deps.*.bin`, optional legacy `embeddings.bin`, and manifest-last commits.
 
+Codex feature-analysis token benchmark:
+
+The runs below used the same custom Codex model, the same `u3dclient` repository, and the same Chinese prompts. `codedb-mcp enabled` used the default `codedb-mcp` skill workflow and MCP server. `codedb-mcp disabled` temporarily hid the project codedb MCP server and codedb skill directories, leaving Codex to inspect source through ordinary shell-based lookup. `contextplus` was disabled by prompt in both variants. Each row is one real `codex exec` run, measured from Codex self-reported tokens.
+
+| Prompt | codedb-mcp enabled | codedb-mcp disabled | Token savings | Runtime change |
+|---|---:|---:|---:|---:|
+| World-map marching logic | 92,639 tokens / 272.5s | 231,810 tokens / 617.8s | 139,171 tokens saved, 60.0% | 55.9% faster |
+| Hero attributes and power calculation | 114,436 tokens / 348.0s | 173,576 tokens / 379.9s | 59,140 tokens saved, 34.1% | 8.4% faster |
+| Alliance rally and join-rally logic | 133,363 tokens / 355.0s | 185,448 tokens / 485.2s | 52,085 tokens saved, 28.1% | 26.8% faster |
+| **Total** | **340,438 tokens / 1,025.5s** | **590,834 tokens / 1,482.9s** | **250,396 tokens saved, 42.4%** | **30.8% faster** |
+
 Index and cache baseline:
 
 | Scenario | Time | Peak WS / private | Notes |
@@ -120,6 +144,8 @@ The table is intentionally three columns so it fits GitHub README pages without 
 | `codedb_symbol`<br>Symbol definition lookup | 2.021ms | regex approximates text only |
 | `codedb_text_search`<br>Trigram full-text and regex search | same-query warm exact `PoolManager` 0.202ms, `Joystick` 0.442ms; scoped `NetworkListenerManager` 0.103ms; Alliance regex 0.148ms | equivalent `rg`: 5.007s, 5.859s, 77.011ms, and 103.702ms; codedb is about 24,840x / 13,250x / 748x / 701x faster on these warm text routes |
 | `codedb_search`<br>Fixed symbol/word-trigram/vector fusion | scoped exact `PoolManager` 1.328ms; symbol-aware `PoolManager` 22.255ms; business phrase search 36.226ms | no exact `rg` equivalent; regex route delegates to `codedb_text_search` |
+| `codedb_context`<br>Ranked answer context without source dump | `PoolManager` 6.573ms; business phrase 29.670ms after vector load; output about 1.5k-2.0k tokens in sampled runs | replaces broad search/outline/deps setup loops |
+| `codedb_explore`<br>Budgeted source-context excerpts | `PoolManager` 7.050ms with `max_chars=10000`; business phrase 29.037ms with `max_chars=12000`; sampled output about 2.5k-3.0k tokens | replaces repeated read calls; output is capped by `max_chars` |
 | `codedb_word`<br>Exact identifier inverted index | 101.526ms including lazy word sidecar access | partial word grep only |
 | `codedb_callers`<br>Definition-anchored references | `PoolManager` 12.722ms avg, 8ms steady samples; `Joystick` 17.968ms | no semantic anchor |
 | `codedb_hot`<br>Recently modified indexed files | 2.116ms | none |
@@ -336,7 +362,7 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml -
 The `skills/` directory is intended to be copied as a standalone package.
 
 - `setup-for-agent.md`: installation guide for agents. It reuses the default HuggingFace cache when present, falls back to the second Windows drive when absent, and writes project-local config with an absolute model path.
-- `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a config template, MCP registration reference, and tool guidance. It does not own setup.
+- `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a config template, MCP registration reference, tool guidance, and `scripts/codex-observe.mjs` for Codex transcript token diagnostics. It does not own setup.
 - `skills/deepwiki`: creates DeepWiki-style local documentation using local `codedb_*` tools plus the active agent's reasoning. It emphasizes business module boundaries over folder-only or community-only grouping.
 - `skills/code-module-atlas`: creates a local 3D module/file atlas webpage by calling `codedb_module_atlas`, then adapting the bundled meet-blog-style viewer. Generated repo-specific JSON stays ignored.
 

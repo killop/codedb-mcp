@@ -8,6 +8,8 @@
 
 - Replaced the current `codedb_search` lexical path with fixed symbol/word-trigram text hits plus lazy Model2Vec vector fusion. Cold indexing no longer builds the old lexical ranker, while regex and exact text search continue to use the codedb-style trigram sidecar.
 - Added a bounded in-process result cache for `codedb_text_search` / regex-routed `codedb_search` line hits, matching the README warm-tool benchmark contract without keeping full source files resident.
+- Added `codedb_context` and `codedb_explore` so agents can ask for ranked answer context and budgeted source excerpts instead of manually chaining search, outline, deps, and read calls.
+- Added `skills/codedb-mcp/scripts/codex-observe.mjs`, a Codex transcript observer that streams `~/.codex/sessions`, filters by project cwd, and reports codedb tool-output token usage, bundle child breakdowns, high-output lookup calls, broad reads/searches, non-codedb source lookups, and missed bundle/context opportunities.
 - Updated the MCP tool description and `skills/codedb-mcp` guidance to describe the new search path and keep multi-step lookups batched through `codedb_bundle`.
 
 ### Benchmark And Validation
@@ -15,8 +17,10 @@
 - Re-ran the README benchmark suite on `u3dclient`: 18,852 indexed files, 31,428 chunks, 274,606 symbols, 19,746 graph nodes, 162,823 graph edges, and 1,356 cached communities.
 - Re-ran cold/index/cache benchmarks: `u3dclient` cold rebuild 13.818s at 226.9 MB WS / 220.2 MB private, cache-hit index open 0.741s at 107.8 MB WS / 106.1 MB private, and status open 0.454s at 14.4 MB WS / 8.1 MB private.
 - Re-ran focused warm text-search and `rg` comparisons after the result-cache fix: same-query warm `PoolManager` 0.202ms vs `rg` 5.007s, `Joystick` 0.442ms vs 5.859s, scoped `NetworkListenerManager` 0.103ms vs 77.011ms, and Alliance regex 0.148ms vs 103.702ms. First unseen full-result text queries still pay the candidate-file line scan, usually around 15-30ms on `u3dclient`.
+- Benchmarked the new context tools on `u3dclient`: warm `codedb_context PoolManager` 6.573ms, warm business-phrase context 29.670ms after vector load, warm `codedb_explore PoolManager` 7.050ms at `max_chars=10000`, and warm business-phrase explore 29.037ms at `max_chars=12000`.
 - Re-ran 1,000-file incremental maintenance on `u3dclient`: add 1.508s, modify 1.544s, delete 0.504s, all through the `live-incremental` path.
 - Re-ran language and atlas smoke checks: `gameserver` Java cold rebuild 3.939s at 212.7 MB WS / 212.4 MB private, current-repo Rust index 0.372s, multi-language smoke 0.069s, and module atlas full sampled export 7.960s at 286.2 MB WS / 289.1 MB private.
+- Validated the Codex observer on 19 recent `u3dclient` sessions: 20 candidate JSONL files scanned in 185.1ms, 301 codedb calls found, 134 bundle calls split into 834 child tool sections, and high-output codedb/source lookup findings generated.
 
 ## Unreleased - 2026-05-28
 

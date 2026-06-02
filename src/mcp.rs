@@ -316,6 +316,16 @@ fn tools_list() -> Value {
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": ["query"]}
             },
             {
+                "name": "codedb_context",
+                "description": "Answer-oriented context builder. Given a natural-language or symbol query, returns ranked files, why they match, key symbols, hit lines, and compact dependency signals without dumping large source bodies.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path_glob": {"type": "string"}, "max_files": {"type": "integer"}, "max_results": {"type": "integer"}, "include_deps": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["query"]}
+            },
+            {
+                "name": "codedb_explore",
+                "description": "Budgeted source-context explorer. Given a query or explicit path(s), ranks files and returns focused outlines, dependency hints, and line-numbered source excerpts capped by max_chars.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "paths": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "path_glob": {"type": "string"}, "max_files": {"type": "integer"}, "max_chars": {"type": "integer"}, "context_lines": {"type": "integer"}, "max_lines_per_file": {"type": "integer"}, "compact": {"type": "boolean"}, "include_deps": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
+            },
+            {
                 "name": "codedb_query",
                 "description": "Small composable pipeline: find, search, filter, limit, outline.",
                 "inputSchema": {"type": "object", "properties": {"pipeline": {"type": "array", "items": {"type": "object"}}, "project": {"type": "string"}}, "required": ["pipeline"]}

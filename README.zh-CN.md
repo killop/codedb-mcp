@@ -16,6 +16,7 @@
 <p>
   <a href="#项目介绍">项目介绍</a> •
   <a href="#mcp-工具">MCP 工具</a> •
+  <a href="#codex-token-观察">Token 观察</a> •
   <a href="#code-module-atlas">Code Module Atlas</a> •
   <a href="#deepwiki">DeepWiki</a> •
   <a href="#benchmark-速览">Benchmark</a> •
@@ -35,10 +36,11 @@
 
 | 领域 | 能力 |
 |---|---|
-| 快速 MCP 工具 | 索引化 exact/regex 搜索、符号/word-trigram/向量搜索、outline、definition、callers、deps、模糊文件查找、query pipeline 和 100-call bundle。 |
+| 快速 MCP 工具 | 索引化 exact/regex 搜索、符号/word-trigram/向量搜索、面向答案的 context/explore、outline、definition、callers、deps、模糊文件查找、query pipeline 和 100-call bundle。 |
 | 模块发现 | 先按依赖连通文件组件划分，再做 dependency-weighted label propagation；路径和术语用于可解释标签和证据。 |
 | Code Module Atlas | 打包 meet-blog 风格 3D viewer：一个源码文件一个星点，支持模块/文件列表、依赖边、文件聚焦和详情。 |
 | DeepWiki | 基于 MCP 证据和当前 agent 推理生成本地仓库文档，强调业务模块优先、代码引用和源码证据。 |
+| Codex token 观察 | 内置 transcript 观察脚本，读取 Codex JSONL 会话，统计 codedb 工具输出 token，并标记高输出检索模式。 |
 | 本地部署 | 显式 `.codedb-mcp/codedb-mcp.toml`、项目本地存储、可复制 skills，不依赖隐藏环境变量行为。 |
 
 ## MCP 工具
@@ -46,11 +48,22 @@
 服务会把 tree-sitter 索引和项目本地数据放在 `.codedb-mcp` 下，并提供这些 MCP 能力：
 
 - 快速 exact/regex 搜索、符号/word-trigram 搜索，以及懒加载向量搜索；
+- 面向架构、流程和功能区问题的 `codedb_context` / `codedb_explore`，在显式输出预算内返回答案上下文；
 - 符号大纲和定义查找；
 - 基于 definition path/line 锚定的 LSP-like callers；
 - 文件正向依赖、反向依赖和 transitive 依赖查询；
 - 模糊文件查找、路径 glob、小型 query pipeline 和一次最多 100 个内部调用的 bundle；
 - 图摘要、懒计算 Louvain community、模块规划、atlas 导出和 DeepWiki 证据收集。
+
+## Codex Token 观察
+
+`codedb-mcp` skill 内置轻量 Codex transcript 观察脚本：
+
+```powershell
+node skills\codedb-mcp\scripts\codex-observe.mjs --project u3dclient --since 24h --top 12
+```
+
+它会逐行扫描 `~/.codex/sessions`，按 session `cwd` 过滤目标项目，并输出模型 token、工具输出 token 估算、codedb 调用数量、bundle 子工具分布、高输出调用、过宽 read/search、非 codedb 源码查找，以及遗漏的 `codedb_bundle` / `codedb_context` 使用机会。这个脚本只做诊断，不修改 transcript，也不影响 MCP runtime。
 
 ## Code Module Atlas
 
@@ -93,6 +106,17 @@ npm run dev -- --port 5174 --strictPort
 - 存储目录：`u3dclient\.codedb-mcp`
 - cache v23 sidecar：generation 命名的紧凑 `index.*.bin`、`fingerprints.*.bin`、offset-addressed `outlines.*.bin` / `outlines_index.*.bin`、懒加载 `word_index.bin`/`word_hits.bin`、懒加载 `text_search_index.bin`、懒加载 `callers.bin`、懒加载 `deps.*.bin`、可选旧版 `embeddings.bin`，并采用 manifest-last 提交。
 
+Codex 功能分析 token benchmark：
+
+下面几组使用同一个 custom Codex 模型、同一个 `u3dclient` 仓库、同一批中文提示词。`codedb-mcp enabled` 使用默认 `codedb-mcp` skill workflow 和 MCP server；`codedb-mcp disabled` 临时隐藏项目 codedb MCP server 和 codedb skill 目录，让 Codex 只能走普通 shell 风格源码查找。两组都在提示词里禁用了 `contextplus`。每一行都是一次真实 `codex exec`，token 使用 Codex 自报数据。
+
+| 提示词 | 启用 codedb-mcp | 禁用 codedb-mcp | Token 节省 | 耗时变化 |
+|---|---:|---:|---:|---:|
+| 大地图行军主逻辑 | 92,639 tokens / 272.5s | 231,810 tokens / 617.8s | 节省 139,171 tokens，60.0% | 快 55.9% |
+| 英雄属性和战力计算 | 114,436 tokens / 348.0s | 173,576 tokens / 379.9s | 节省 59,140 tokens，34.1% | 快 8.4% |
+| 联盟集结和加入集结 | 133,363 tokens / 355.0s | 185,448 tokens / 485.2s | 节省 52,085 tokens，28.1% | 快 26.8% |
+| **合计** | **340,438 tokens / 1,025.5s** | **590,834 tokens / 1,482.9s** | **节省 250,396 tokens，42.4%** | **快 30.8%** |
+
 索引和 cache 基线：
 
 | 场景 | 耗时 | 峰值 WS / private | 说明 |
@@ -123,6 +147,8 @@ npm run dev -- --port 5174 --strictPort
 | `codedb_symbol`<br>按符号名找定义 | 2.021ms | regex 只能近似文本 |
 | `codedb_text_search`<br>trigram 全文和 regex 搜索 | 同 query warm exact `PoolManager` 0.202ms，`Joystick` 0.442ms；scoped `NetworkListenerManager` 0.103ms；Alliance regex 0.148ms | 等价 `rg`：5.007s、5.859s、77.011ms、103.702ms；这些 warm text 路径 codedb 约快 24,840x / 13,250x / 748x / 701x |
 | `codedb_search`<br>固定符号/word-trigram/向量融合搜索 | scoped exact `PoolManager` 1.328ms；symbol-aware `PoolManager` 22.255ms；业务短语搜索 36.226ms | 没有等价 `rg`；regex route 委托 `codedb_text_search` |
+| `codedb_context`<br>不 dump 源码的答案上下文排序 | `PoolManager` 6.573ms；业务短语 vector load 后 29.670ms；抽样输出约 1.5k-2.0k tokens | 替代大范围 search/outline/deps 准备循环 |
+| `codedb_explore`<br>预算化源码上下文片段 | `PoolManager` 7.050ms，`max_chars=10000`；业务短语 29.037ms，`max_chars=12000`；抽样输出约 2.5k-3.0k tokens | 替代反复 read；输出由 `max_chars` 硬限制 |
 | `codedb_word`<br>精确 identifier 倒排索引 | 101.526ms，包含 lazy word sidecar 访问 | 只能部分 word grep |
 | `codedb_callers`<br>定义锚定引用 | `PoolManager` 平均 12.722ms、steady 样本约 8ms；`Joystick` 17.968ms | 无语义锚定 |
 | `codedb_hot`<br>最近修改的索引文件 | 2.116ms | 无 |
@@ -264,6 +290,8 @@ MCP 模式会先完成协议握手，再在后台构建默认项目索引；如�
 |---|---|
 | `codedb_text_search` | trigram 加速全文/regex 搜索；支持 `queries` batch、`path_glob` 和 scope |
 | `codedb_search` | 符号/word-trigram/向量融合搜索；regex fallback 走 `codedb_text_search`；支持 `queries` batch |
+| `codedb_context` | 面向答案的上下文构建；返回排序文件、命中原因、关键符号和依赖信号，不 dump 大段源码 |
+| `codedb_explore` | 预算化源码上下文；按 query 或显式 path 返回 outline、依赖和行号片段，受 `max_chars` 限制 |
 | `codedb_callers` | LSP-like 引用查找；支持 definition path/line 锚定和 `targets` batch |
 | `codedb_deps` | 文件依赖和反向依赖；支持 transitive |
 | `codedb_outline` | 返回预计算符号大纲，不在请求时重新 parse |
@@ -286,7 +314,7 @@ MCP 模式会先完成协议握手，再在后台构建默认项目索引；如�
 `skills/` 目录可以作为独立包复制。
 
 - `setup-for-agent.md`：给 agent 用的安装指导，Windows 上优先复用默认 HuggingFace cache，不存在时才选择第二个盘符，并写入带绝对模型路径的项目本地配置。
-- `skills/codedb-mcp`：包含 `assets/codebase-mcp.exe`、配置模板、MCP 注册参考和工具使用建议；不负责安装。
+- `skills/codedb-mcp`：包含 `assets/codebase-mcp.exe`、配置模板、MCP 注册参考、工具使用建议，以及用于 Codex transcript token 诊断的 `scripts/codex-observe.mjs`；不负责安装。
 - `skills/deepwiki`：使用本地 `codedb_*` 工具和当前 agent 的推理能力生成 DeepWiki-style 文档，强调业务模块边界，而不是只按文件夹或 community 分组。
 - `skills/code-module-atlas`：调用 `codedb_module_atlas` 生成本地 3D 模块/文件 atlas 网页；项目特定 JSON 是生成物，不提交。
 

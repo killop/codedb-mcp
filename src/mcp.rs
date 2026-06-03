@@ -79,23 +79,31 @@ fn start_initial_index(manager: Arc<ProjectManager>) -> Result<JoinHandle<()>> {
         .name("codebase-mcp-initial-index".to_string())
         .spawn(move || {
             let started = std::time::Instant::now();
-            event_log::emit(|| "event=initial_index_start".to_string());
-            if let Err(err) = manager.reindex_default() {
-                event_log::emit(|| {
-                    format!(
-                        "event=initial_index_failed elapsed_ms={:.3} error={}",
-                        started.elapsed().as_secs_f64() * 1000.0,
-                        sanitize_log_value(&err.to_string())
-                    )
-                });
-                eprintln!("codebase-mcp initial index failed: {err:#}");
-            } else {
-                event_log::emit(|| {
-                    format!(
-                        "event=initial_index_finish elapsed_ms={:.3}",
-                        started.elapsed().as_secs_f64() * 1000.0
-                    )
-                });
+            event_log::emit(|| "event=initial_index_start mode=cache_open".to_string());
+            match manager.get(None) {
+                Ok(index) => {
+                    let stats = index.stats();
+                    event_log::emit(|| {
+                        format!(
+                            "event=initial_index_finish mode=cache_open elapsed_ms={:.3} files={} chunks={} symbols={} cache={}",
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            stats.files,
+                            stats.chunks,
+                            stats.symbols,
+                            stats.cache
+                        )
+                    });
+                }
+                Err(err) => {
+                    event_log::emit(|| {
+                        format!(
+                            "event=initial_index_failed elapsed_ms={:.3} error={}",
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            sanitize_log_value(&err.to_string())
+                        )
+                    });
+                    eprintln!("codebase-mcp initial index failed: {err:#}");
+                }
             }
         })
         .context("failed to spawn initial index thread")
@@ -237,12 +245,12 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_search",
-                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Symbol-shaped queries use symbol and word/trigram text hits; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
+                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Use compact=true for discovery. Symbol-shaped queries use symbol and word/trigram text hits; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_text_search",
-                "description": "Trigram-accelerated full-text search over indexed source files. Supports regex, path_glob scoped results, compact filtering, scopes, and batch queries.",
+                "description": "Trigram-accelerated full-text search over indexed source files. Supports regex, path_glob scoped results, compact file/line output, scopes, and batch queries.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             },
             {
@@ -292,8 +300,8 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_bundle",
-                "description": "Run up to 100 codedb_* calls in one round trip. Extra ops are reported as truncated. Optional timing=true reports per-inner-call milliseconds; discard_output=true keeps benchmark output compact.",
-                "inputSchema": {"type": "object", "properties": {"ops": {"type": "array", "items": {"type": "object"}}, "timing": {"type": "boolean"}, "discard_output": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["ops"]}
+                "description": "Run up to 100 codedb_* calls in one round trip. Output is budgeted by default to prevent large context injection. Optional timing=true reports per-inner-call milliseconds; discard_output=true keeps benchmark output compact.",
+                "inputSchema": {"type": "object", "properties": {"ops": {"type": "array", "items": {"type": "object"}}, "timing": {"type": "boolean"}, "discard_output": {"type": "boolean"}, "max_output_chars": {"type": "integer"}, "max_child_chars": {"type": "integer"}, "project": {"type": "string"}}, "required": ["ops"]}
             },
             {
                 "name": "codedb_remote",

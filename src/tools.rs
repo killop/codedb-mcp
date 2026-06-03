@@ -26,16 +26,20 @@ use std::time::Instant;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_BATCH_ITEMS: usize = 100;
+const BUNDLE_DEFAULT_MAX_OUTPUT_CHARS: usize = 18_000;
+const BUNDLE_DEFAULT_MAX_CHILD_CHARS: usize = 6_000;
+const BUNDLE_MAX_OUTPUT_CHARS: usize = 240_000;
+const READ_COMPACT_MAX_LINES: usize = 55;
 const MODULE_HUB_INCOMING_LIMIT: usize = 220;
 const MODULE_MAX_DEPENDENCY_EDGES_PER_FILE: usize = 72;
 const MODULE_MAX_FILES_PER_GROUP: usize = 450;
 const MODULE_LABEL_ITERATIONS: usize = 8;
-const CONTEXT_DEFAULT_MAX_FILES: usize = 8;
+const CONTEXT_DEFAULT_MAX_FILES: usize = 5;
 const CONTEXT_MAX_FILES: usize = 40;
-const EXPLORE_DEFAULT_MAX_FILES: usize = 5;
-const EXPLORE_DEFAULT_MAX_CHARS: usize = 12_000;
+const EXPLORE_DEFAULT_MAX_FILES: usize = 3;
+const EXPLORE_DEFAULT_MAX_CHARS: usize = 6_000;
 const EXPLORE_MAX_CHARS: usize = 80_000;
-const EXPLORE_DEFAULT_CONTEXT_LINES: usize = 8;
+const EXPLORE_DEFAULT_CONTEXT_LINES: usize = 4;
 
 pub struct ProjectManager {
     default_root: PathBuf,
@@ -150,10 +154,6 @@ impl ProjectManager {
             )
         });
         Ok(index)
-    }
-
-    pub fn reindex_default(&self) -> Result<Arc<Codebase>> {
-        self.reindex(&self.default_root)
     }
 
     pub fn apply_default_changes(
@@ -820,7 +820,7 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
             compact,
             scope,
         )?;
-        return Ok(format_line_hits(&query, hits));
+        return Ok(format_line_hits(&query, hits, compact));
     }
 
     let selector = path_glob
@@ -837,9 +837,9 @@ fn handle_search_one(index: &Codebase, args: &Value) -> Result<String> {
             compact,
             scope,
         )?;
-        return Ok(format_line_hits(&query, fallback));
+        return Ok(format_line_hits(&query, fallback, compact));
     }
-    format_chunk_hits(index, &query, hits)
+    format_chunk_hits(index, &query, hits, compact)
 }
 
 fn handle_text_search(index: &Codebase, args: &Value) -> Result<String> {
@@ -902,7 +902,7 @@ fn handle_text_search_one(index: &Codebase, args: &Value) -> Result<String> {
         compact,
         scope,
     )?;
-    Ok(format_line_hits(&query, hits))
+    Ok(format_line_hits(&query, hits, compact))
 }
 
 fn handle_word(index: &Codebase, args: &Value) -> Result<String> {
@@ -1502,7 +1502,12 @@ fn handle_read_one(index: &Codebase, args: &Value) -> Result<String> {
     }
     let compact = get_bool(args, "compact");
     let start = get_usize(args, "line_start").unwrap_or(1);
-    let end = get_usize(args, "line_end").unwrap_or(file.line_count.max(1));
+    let requested_end = get_usize(args, "line_end").unwrap_or(file.line_count.max(1));
+    let end = if compact {
+        requested_end.min(start.saturating_add(READ_COMPACT_MAX_LINES - 1))
+    } else {
+        requested_end
+    };
     if start == 0 || end == 0 {
         return Ok("error: line_start and line_end must be >= 1".to_string());
     }
@@ -1510,6 +1515,11 @@ fn handle_read_one(index: &Codebase, args: &Value) -> Result<String> {
         return Ok(format!("error: line_start ({start}) > line_end ({end})"));
     }
     let mut out = format!("hash:{hash}\n");
+    if compact && end < requested_end {
+        out.push_str(&format!(
+            "[compact read capped at {READ_COMPACT_MAX_LINES} lines; requested L{start}-L{requested_end}]\n"
+        ));
+    }
     if start != 1 || end != file.line_count || compact {
         out.push_str(&extract_lines(&content, start, end, compact));
     } else {
@@ -2320,7 +2330,8 @@ fn handle_query(index: &Codebase, args: &Value) -> Result<String> {
                         .map(|hit| index.chunk_file_path(&hit.chunk).to_string())
                         .collect(),
                 );
-                out = format_chunk_hits(index, &query, hits)?;
+                let compact = get_bool_default(step, "compact", true);
+                out = format_chunk_hits(index, &query, hits, compact)?;
             }
             "filter" => {
                 let pattern = required_str(step, "path_glob")?;
@@ -4783,9 +4794,25 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
     };
     let timing = get_bool(args, "timing");
     let discard_output = get_bool(args, "discard_output");
+    let max_output_chars = get_usize(args, "max_output_chars")
+        .unwrap_or(BUNDLE_DEFAULT_MAX_OUTPUT_CHARS)
+        .max(1)
+        .min(BUNDLE_MAX_OUTPUT_CHARS);
+    let max_child_chars = get_usize(args, "max_child_chars")
+        .unwrap_or(BUNDLE_DEFAULT_MAX_CHILD_CHARS)
+        .max(1)
+        .min(max_output_chars);
     let mut out = String::new();
     for (idx, op) in ops.iter().take(MAX_BATCH_ITEMS).enumerate() {
+        if out.len() >= max_output_chars {
+            out.push_str(&format!(
+                "(bundle output budget reached at {max_output_chars} chars; {} ops not shown)\n",
+                ops.len().saturating_sub(idx)
+            ));
+            break;
+        }
         let tool = get_str(op, "tool").unwrap_or_default();
+        let mut section = String::new();
         if tool.is_empty() {
             let start = Instant::now();
             event_log::log_tool_failure(
@@ -4794,9 +4821,10 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
                 start,
                 "missing 'tool' field",
             );
-            out.push_str(&format!(
+            section.push_str(&format!(
                 "--- [{idx}] <missing> ---\nerror: missing 'tool' field\n"
             ));
+            append_bundle_section(&mut out, &section, max_output_chars);
             continue;
         }
         if tool == "codedb_bundle" {
@@ -4807,9 +4835,10 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
                 start,
                 "codedb_bundle not allowed in bundle",
             );
-            out.push_str(&format!(
+            section.push_str(&format!(
                 "--- [{idx}] {tool} ---\nerror: codedb_bundle not allowed in bundle\n"
             ));
+            append_bundle_section(&mut out, &section, max_output_chars);
             continue;
         }
         let arguments = op.get("arguments").unwrap_or(op);
@@ -4817,35 +4846,77 @@ fn handle_bundle(manager: &ProjectManager, args: &Value) -> Result<String> {
         let result =
             dispatch_tool_with_context(manager, &tool, arguments, ToolLogContext::bundle(idx));
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        out.push_str(&format!("--- [{}] {} ---\n", idx, tool));
+        section.push_str(&format!("--- [{}] {} ---\n", idx, tool));
         if timing {
-            out.push_str(&format!("time_ms: {:.3}\n", elapsed_ms));
+            section.push_str(&format!("time_ms: {:.3}\n", elapsed_ms));
         }
         if discard_output {
             let first_line = result.lines().next().unwrap_or_default();
-            out.push_str(&format!("summary: {first_line}\n"));
+            section.push_str(&format!("summary: {first_line}\n"));
         } else {
-            out.push_str(&result);
-            if !out.ends_with('\n') {
-                out.push('\n');
+            section.push_str(&result);
+            if !section.ends_with('\n') {
+                section.push('\n');
             }
         }
+        let child_truncated = truncate_string(&mut section, max_child_chars);
+        if child_truncated {
+            section.push_str(&format!(
+                "\n[child output truncated at {max_child_chars} chars]\n"
+            ));
+        }
+        append_bundle_section(&mut out, &section, max_output_chars);
     }
     if ops.len() > MAX_BATCH_ITEMS {
-        out.push_str(&format!(
+        let extra = format!(
             "(truncated: {} more bundle ops not executed)\n",
             ops.len() - MAX_BATCH_ITEMS
-        ));
+        );
+        append_bundle_section(&mut out, &extra, max_output_chars);
     }
     Ok(out)
 }
 
-fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
+fn append_bundle_section(out: &mut String, section: &str, max_output_chars: usize) {
+    let remaining = max_output_chars.saturating_sub(out.len());
+    if remaining == 0 {
+        return;
+    }
+    if section.len() <= remaining {
+        out.push_str(section);
+        return;
+    }
+    let mut clipped = section.to_string();
+    truncate_string(&mut clipped, remaining);
+    out.push_str(&clipped);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[bundle output truncated at {max_output_chars} chars]\n"
+    ));
+}
+
+fn truncate_string(value: &mut String, max_bytes: usize) -> bool {
+    if value.len() <= max_bytes {
+        return false;
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    true
+}
+
+fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>, compact: bool) -> String {
     const MAX_PER_FILE: usize = 5;
 
     struct FileHits {
         total: usize,
         shown: Vec<String>,
+        lines: Vec<usize>,
+        scopes: BTreeSet<String>,
     }
 
     let total_hits = hits.len();
@@ -4860,6 +4931,8 @@ fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
                 FileHits {
                     total: 0,
                     shown: Vec::new(),
+                    lines: Vec::new(),
+                    scopes: BTreeSet::new(),
                 },
             );
         }
@@ -4867,6 +4940,16 @@ fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
             continue;
         };
         entry.total += 1;
+        entry.lines.push(hit.line);
+        if let Some(scope) = &hit.scope {
+            entry.scopes.insert(format!(
+                "{} {} L{}-L{}",
+                scope.kind, scope.name, scope.start, scope.end
+            ));
+        }
+        if compact {
+            continue;
+        }
         if entry.shown.len() >= MAX_PER_FILE {
             continue;
         }
@@ -4879,6 +4962,39 @@ fn format_line_hits(query: &str, hits: Vec<crate::types::SearchHit>) -> String {
             format!("    L{}: {}", hit.line, hit.text)
         };
         entry.shown.push(line);
+    }
+
+    if compact {
+        let mut out = format!(
+            "{} compact results for '{}' in {} files:\n",
+            total_hits,
+            query,
+            file_order.len()
+        );
+        for path in file_order {
+            let Some(entry) = grouped.get(&path) else {
+                continue;
+            };
+            let lines = entry
+                .lines
+                .iter()
+                .take(12)
+                .map(|line| format!("L{line}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more_lines = entry.total.saturating_sub(entry.lines.len().min(12));
+            let suffix = if more_lines > 0 {
+                format!(" (+{more_lines})")
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("  {path}: {lines}{suffix}\n"));
+            let scopes = entry.scopes.iter().take(3).cloned().collect::<Vec<_>>();
+            if !scopes.is_empty() {
+                out.push_str(&format!("    scopes: {}\n", scopes.join("; ")));
+            }
+        }
+        return out;
     }
 
     let mut out = format!(
@@ -4918,10 +5034,22 @@ fn format_chunk_hits(
     index: &Codebase,
     query: &str,
     hits: Vec<crate::types::ChunkSearchHit>,
+    compact: bool,
 ) -> Result<String> {
     let mut out = format!("{} results for '{}':\n", hits.len(), query);
     let mut content_by_file = HashMap::new();
     for hit in hits {
+        if compact {
+            out.push_str(&format!(
+                "  {}:{}-{}  [score={:.3}, {}]\n",
+                index.chunk_file_path(&hit.chunk),
+                hit.chunk.start_line,
+                hit.chunk.end_line,
+                hit.score,
+                hit.source
+            ));
+            continue;
+        }
         let content = index.chunk_content_cached(&hit.chunk, &mut content_by_file)?;
         let preview = content
             .lines()

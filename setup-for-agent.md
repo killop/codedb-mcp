@@ -289,6 +289,44 @@ args = [
   "mcp",
   "<repo-root>",
 ]
+
+# Codex exec with approval=never cancels unapproved MCP tools.
+# Pre-approve the codedb tools the skill uses for repository analysis.
+[mcp_servers.codedb-mcp.tools.codedb_bundle]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_status]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_context]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_text_search]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_search]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_explore]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_read]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_outline]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_callers]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_deps]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_find]
+approval_mode = "approve"
+
+[mcp_servers.codedb-mcp.tools.codedb_query]
+approval_mode = "approve"
 ```
 
 After registration, restart or reload the agent MCP session and call `codedb_status`.

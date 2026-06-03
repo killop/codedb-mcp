@@ -2,7 +2,7 @@
 
 [English version](CHANGELOG.md)
 
-## Unreleased - 2026-06-02
+## Unreleased - 2026-06-03
 
 ### 变更
 
@@ -21,6 +21,7 @@
 - 重新测量 `u3dclient` 的 1,000 文件增量维护：新增 1.508s，修改 1.544s，删除 0.504s，均走 `live-incremental` path。
 - 重新测量语言和 atlas smoke：`gameserver` Java cold rebuild 3.939s，峰值 212.7 MB WS / 212.4 MB private；当前仓库 Rust index 0.372s；多语言 smoke 0.069s；module atlas full sampled export 7.960s，峰值 286.2 MB WS / 289.1 MB private。
 - 在最近的 `u3dclient` Codex 会话上验证 transcript 观察脚本：20 个候选 JSONL 文件扫描 185.1ms，匹配 19 个 session，识别 301 次 codedb 调用、134 次 bundle 调用和 834 个 bundle 子工具 section，并生成高输出 codedb/源码查找问题列表。
+- 移除 feature 调用次数限制和强制 bundle 输出 clamp 后，重新测量 `联盟集结和加入集结` Codex benchmark：启用 codedb-mcp 为 128,865 tokens / 300.4s，禁用 codedb-mcp 为 185,448 tokens / 485.2s，节省 56,583 tokens（30.5%），耗时快 38.1%。README 合计更新为启用 335,940 tokens / 920.9s，对比禁用 590,834 tokens / 1,482.9s，节省 254,894 tokens（43.1%），耗时快 37.9%。
 
 ## Unreleased - 2026-05-28
 

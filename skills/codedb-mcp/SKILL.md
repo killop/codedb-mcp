@@ -1,106 +1,108 @@
 ---
 name: codedb-mcp
 description: >-
-  Use codedb MCP tools for codebase lookup, feature-flow analysis, source
-  evidence, references, dependencies, and semantic or exact code search in
-  repositories with .codedb-mcp. Prefer codedb_bundle to combine lookups and
-  avoid shell source search. For broad feature analysis, use twelve to eighteen
-  codedb MCP calls total, then answer. Never use shell commands to search,
-  print, grep, line-number, or verify source code when codedb tools are
-  available.
+  Use codedb MCP tools for repository understanding, feature-flow analysis,
+  source evidence, references, dependencies, semantic search, and exact text
+  search in repositories with .codedb-mcp. Prefer codedb_bundle and compact
+  codedb_context/codedb_text_search before any source reading. For broad
+  "main logic", "how does this feature work", module, caller, dependency, or
+  architecture questions, gather a small evidence map with codedb tools and
+  answer from that evidence. Never use shell commands to search, print,
+  line-number, or verify source code when codedb tools are available.
+  Do not open skill files during normal repository analysis.
 ---
 
 # codedb-mcp
 
-## Feature Analysis Limit
+## Core Rule
 
-For prompts such as "main logic", "analyze this feature", "flow", "architecture", or "how does this module work", the default workflow is complete flow analysis with bounded output:
+Use codedb tools as the only source-code lookup path.
 
-- Use twelve to eighteen codedb MCP tool invocations total for a normal feature-flow answer.
-- Prefer `codedb_bundle` calls: discovery, focus, evidence, connection checks, boundary/consumer checks, final gap check.
-- After the eighteenth codedb call, answer immediately from current evidence.
-- More than eighteen codedb calls for a broad feature analysis is a failure unless the user explicitly asks for an exhaustive audit.
-- If results include backup, generated, legacy, or irrelevant files, filter them mentally from the current result. Do not spend extra calls just to exclude them.
-- Do not chase secondary branches after the main entry points, data flow, processing path, output/effect path, and compatibility layer are clear.
-- For feature analysis, infer the project-appropriate flow and explicitly connect trigger/input, external boundary, state/data, processing/update logic, output or side effects, and consumers when they exist.
-
-## Hard Rules
-
-- Use codedb tools as the only source-code lookup path.
 - Do not use shell commands for source search, source printing, line numbering, or source verification.
+- Do not use shell commands to inspect repository structure, list files, check current files, or confirm the active project during code analysis.
 - Do not use `rg`, `grep`, `findstr`, `Select-String`, `Get-Content`, `type`, `cat`, `sed`, or scripts to inspect source files.
-- Do not suggest `rg` or shell lookup as a cross-check, fallback,补漏, or verification method.
-- Do not describe the workflow as "local file search" or "local code search"; describe it as codedb MCP lookup only.
-- Shell commands are only for non-source operations such as checking process state, config paths, or generated artifacts.
-- Use `codedb_bundle` when more than one codedb lookup is needed.
+- Do not suggest shell lookup as a cross-check, fallback, gap fill, or verification method.
+- Use `codedb_bundle` whenever more than one codedb lookup is needed.
+- For feature-flow or "main logic" analysis, do not call direct `codedb_context`, `codedb_search`, `codedb_text_search`, `codedb_read`, `codedb_outline`, `codedb_callers`, or `codedb_deps`; put them inside `codedb_bundle`.
 - Do not call `codedb_projects` in normal repository work; the active repo is already implied by the MCP session.
+- Do not read this `SKILL.md` or reference files during normal analysis; these instructions are already active.
 
-## Bundle Format
+## Feature Analysis Guidance
 
-Use this exact `codedb_bundle` shape. Child arguments go under `arguments`, not `args`:
+For prompts such as "main logic", "analyze this feature", "flow", "architecture", or "how does this module work":
+
+- Prefer `codedb_bundle` for multi-step lookup so related evidence arrives in coherent batches.
+- Start with compact discovery and focused source evidence, then continue only when the answer still lacks a concrete link.
+- Set `max_output_chars` and `max_child_chars` explicitly when a task needs output control; increase them when the current evidence is too thin.
+- Prefer a complete main flow over exhaustive branch coverage.
+- Connect the project-appropriate flow: trigger/input, external boundary, state/data, processing/update logic, output or side effects, and consumers when they exist.
+- When the prompt names multiple actions, states, or slash-separated paths, preserve each named path as an explicit section in the final answer.
+- If a minor detail is still missing after reasonable codedb evidence, state the uncertainty from current codedb evidence and answer.
+- Batch related exact terms with one `codedb_text_search` child using `queries`, instead of separate children.
+- Do not chase optional automation, compatibility, generated, or alternate UI/configuration branches after the main flow is clear. Mention them briefly as adjacent paths when discovered.
+
+## Bundle Shape
+
+Use this shape. Child arguments go under `arguments`, not `args`:
 
 ```json
 {
+  "timing": true,
+  "max_output_chars": 18000,
+  "max_child_chars": 6000,
   "ops": [
     {
       "tool": "codedb_context",
       "arguments": {
         "query": "feature words",
-        "max_files": 8,
-        "max_results": 30
+        "max_files": 6,
+        "max_results": 24
       }
     },
     {
       "tool": "codedb_text_search",
       "arguments": {
-        "query": "ExactName",
+        "queries": ["ExactName", "ProtocolName", "UICommandName"],
         "compact": true,
-        "max_results": 15
+        "max_results": 8
       }
     }
-  ],
-  "timing": true
+  ]
 }
 ```
 
-If a bundle returns "missing query argument", retry the same bundle once with `arguments`. Do not fall back to many separate tool calls.
+If a bundle returns "missing query argument", retry the same bundle once with `arguments`. Do not replace it with many separate calls.
 
-## Feature Analysis Workflow
+## Default Workflow
 
-Use this workflow for broad feature analysis:
+1. Discovery bundle: `codedb_context`, plus one batch `codedb_text_search` for exact domain terms or protocol/API names.
+2. Focus bundle: one `codedb_explore` with an explicit `max_chars`; add compact search if a key symbol is missing.
+3. Relationship bundle: `codedb_deps`, `codedb_callers`, `codedb_outline`, or compact searches that connect entry points to state, processing, output, and consumers.
+4. Evidence bundle: use `codedb_read` ranges after candidate files and line ranges are known. Prefer `compact=true`; use `compact=false` only when exact source wording is needed.
+5. Gap bundle: optional compact searches or short reads for a critical missing link.
 
-1. Discovery bundle: one `codedb_bundle` containing `codedb_context` plus at most two compact `codedb_text_search` or `codedb_search` calls.
-2. Focus bundle: one `codedb_bundle` containing one `codedb_explore` with `max_chars <= 14000`, plus at most one compact search if a key name is missing.
-3. Evidence bundle: one `codedb_bundle` containing at most five `codedb_read` ranges. Each read must use `compact=true`, `line_start`, and `line_end`. Keep each range to 90 lines or less and the total evidence reads to 420 lines or less.
-4. Connection bundle: one `codedb_bundle` for `codedb_callers`, `codedb_deps`, `codedb_outline`, or compact searches that connect entry points to processing, state, output, or consumer paths.
-5. Boundary/consumer bundle: optional one `codedb_bundle` with compact searches or short reads for project-specific boundaries such as API, protocol, CLI, event, job, UI, test, or integration code.
-6. State/effect bundle: optional one `codedb_bundle` with compact searches or short reads for storage, cache, indexing, rendering, background work, file IO, network IO, or other side effects.
-7. Gap bundle: optional one small `codedb_bundle` with at most two reads or searches for a missing critical link.
-
-After these 12-18 codedb tool calls, stop looking up code and answer from the evidence. Do not keep expanding every type, branch, message, or file.
-
-If you are missing a minor detail after the budget is spent, state the uncertainty from the current codedb evidence. Do not switch to shell lookup.
+Do not keep expanding every type, UI branch, message, enum, or compatibility layer after the main chain is clear.
 
 ## Output Control
 
-- Keep `codedb_context` to `max_files <= 8` and `max_results <= 30` for broad feature analysis.
-- Keep broad `codedb_text_search` calls compact with `max_results <= 15`.
-- Use `codedb_explore` before reads; it is the normal way to get a focused snippet set.
-- Use `codedb_read` only for exact evidence after candidate files and line ranges are known.
+- Use `codedb_context` for broad planning and ranking before reading source.
+- Use `codedb_explore` for source snippets under a hard `max_chars` budget.
+- Use broad `codedb_text_search` with `queries`, `compact=true`, and explicit `max_results`.
+- Use direct `codedb_read` only after candidate files and line ranges are known.
+- Prefer `codedb_read compact=true` for feature-flow analysis; use `compact=false` only when necessary for exact code wording.
 - Never read a whole source file for a feature-analysis task.
-- Never read one large file in many chunks for a broad analysis task. Use `codedb_outline` or the current evidence and summarize the main path.
-- Never run repeated direct `codedb_read` calls after the evidence bundle. If more evidence is truly needed, use one small bundle with no more than two ranges.
-- Prefer complete flow understanding over extreme token cutting. The target is roughly half of an unconstrained search session, not the smallest possible output.
+- Never read one large file in many chunks for a broad analysis task.
+- In the final answer, cite the important files and line starts, but do not dump code blocks unless the user asks.
 
 ## Tool Choices
 
-- `codedb_bundle`: combine multi-step lookup and reduce tool-call overhead.
+- `codedb_bundle`: combine lookup steps and keep output budgeted.
 - `codedb_context`: first choice for feature, flow, onboarding, and architecture questions.
-- `codedb_explore`: focused source context after discovery; prefer it over many reads.
-- `codedb_text_search`: exact text or regex search; use compact output and low result limits.
+- `codedb_explore`: focused source context after discovery.
+- `codedb_text_search`: exact text or regex search inside the indexed corpus.
 - `codedb_search`: semantic or fuzzy concept search.
 - `codedb_outline`: symbols in a known file before reading source.
-- `codedb_read`: short line-scoped source evidence only.
+- `codedb_read`: short line-scoped source evidence only; supports `paths` batch.
 - `codedb_callers`: references/callers; pass `definition_path` and `definition_line` when known.
 - `codedb_deps`: file dependencies and reverse dependencies.
 - `codedb_find`, `codedb_query`, `codedb_glob`, `codedb_ls`: compact navigation.

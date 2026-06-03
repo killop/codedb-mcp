@@ -4,8 +4,8 @@
 
 | Tool | Use | Notes |
 |---|---|---|
-| `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. Stays inside the indexed source corpus. |
-| `codedb_search` | Symbol/word-trigram plus natural-language vector search | Use `query` for one lookup or `queries` for batch. Symbol-shaped default queries stay on the indexed lexical/symbol/text path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
+| `codedb_text_search` | Trigram exact/regex full-text search | Use `query` for one lookup or `queries` for batch. Supports `regex=true`, `path_glob`, `compact`, and `scope`. With `compact=true`, it returns file/line/scope evidence instead of source-line text. Stays inside the indexed source corpus. |
+| `codedb_search` | Symbol/word-trigram plus natural-language vector search | Use `query` for one lookup or `queries` for batch. Use `compact=true` for discovery. Symbol-shaped default queries stay on the indexed lexical/symbol/text path, while natural-language queries add lazy Model2Vec flat-cosine ranking. `regex=true` delegates to `codedb_text_search`. |
 | `codedb_context` | Answer-oriented context builder | Use first for architecture, flow, onboarding, or feature-area questions. It ranks files and returns reasons, hit lines, key symbols, and compact dependency signals without dumping large source bodies. |
 | `codedb_explore` | Budgeted source-context explorer | Use after `codedb_context` or directly with a query/path when source snippets are needed. It returns focused outlines, dependencies, and line-numbered excerpts capped by `max_chars`. |
 | `codedb_callers` | LSP-like symbol references | Pass `definition_path` and `definition_line` for same-name symbols. Use `targets` for batch. Strongest on C#/Java. |
@@ -45,7 +45,7 @@
 | `codedb_status` | Health and index stats | Check after setup, watch rebuild, or benchmark. |
 | `codedb_changes` | Files changed since sequence | Useful for incremental agent context. |
 | `codedb_index` | Reindex a local folder | Usually not needed when the server watches files. |
-| `codedb_bundle` | Up to 100 mixed tool calls | Prefer this whenever a task needs more than one codedb lookup. Batch status, search, outline, read, callers, and dependency calls into one MCP request. Nested `codedb_bundle` is rejected. `timing=true` and `discard_output=true` are useful for benchmark runs. |
+| `codedb_bundle` | Up to 100 mixed tool calls | Prefer this whenever a task needs more than one codedb lookup. Batch status, search, outline, read, callers, and dependency calls into one MCP request. Nested `codedb_bundle` is rejected. Output is budgeted by default; set `max_output_chars` and `max_child_chars` explicitly when the task needs tighter or broader evidence, and use `discard_output=true` for benchmark timing. |
 | `codedb_query` | Small find/filter/search/limit/outline pipeline | Good for compact exploration without writing a custom loop. |
 | `codedb_projects` | Projects loaded in this server process | Mostly diagnostic because storage is project-local under `.codedb-mcp`. |
 | `codedb_snapshot` | JSON snapshot of files, symbols, dependencies | Use carefully on large repos. |
@@ -56,4 +56,4 @@
 
 Use the codedb tool surface for repository lookup and stay inside codedb. Use `codedb_context` for broad architecture or flow questions before falling into manual multi-step lookup. Use `codedb_explore` when the answer needs source snippets under an explicit budget. Use `codedb_text_search` for exact or regex text search inside the indexed tree-sitter corpus. Use `codedb_search` for hybrid word-trigram/symbol/vector ranking. Use `codedb_outline` across configured languages, including Rust. Use `codedb_callers` and `codedb_deps` when the task needs code-aware behavior, with the highest confidence on C#/Java symbols. If results look incomplete, inspect `codedb_status`, scan roots, include/exclude rules, watch freshness, and reindex through codedb.
 
-Default to `codedb_bundle` for multi-step investigation. A typical bundle should combine the health check, search, outline/read, and dependency or caller follow-up calls that would otherwise be separate MCP round trips.
+Default to `codedb_bundle` for multi-step investigation. A typical bundle should combine search, outline/read, and dependency or caller follow-up calls that would otherwise be separate MCP round trips. For broad feature analysis, keep the bundle output budgeted so the agent receives a compact evidence map instead of raw source dumps.

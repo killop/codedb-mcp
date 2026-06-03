@@ -91,7 +91,7 @@ npm run dev -- --port 5174 --strictPort
 
 测试目标：`u3dclient`。
 
-以下 benchmark 于 2026-06-02 在 Windows 上重跑。工具耗时只记录已加载 server-style 进程内的 warm 调用；相关 lazy sidecar 已加载，不包含进程启动和 cache open 时间。
+以下 benchmark 在 Windows 上重跑。索引和 warm tool 耗时于 2026-06-02 刷新；“联盟集结和加入集结”这行 Codex 功能分析 token benchmark 于 2026-06-03 使用当前 skill 行为重测：没有 feature 调用次数限制，也没有强制 bundle 输出 clamp。工具耗时只记录已加载 server-style 进程内的 warm 调用；相关 lazy sidecar 已加载，不包含进程启动和 cache open 时间。
 
 当前 Unity C# benchmark 配置索引状态：
 
@@ -114,8 +114,8 @@ Codex 功能分析 token benchmark：
 |---|---:|---:|---:|---:|
 | 大地图行军主逻辑 | 92,639 tokens / 272.5s | 231,810 tokens / 617.8s | 节省 139,171 tokens，60.0% | 快 55.9% |
 | 英雄属性和战力计算 | 114,436 tokens / 348.0s | 173,576 tokens / 379.9s | 节省 59,140 tokens，34.1% | 快 8.4% |
-| 联盟集结和加入集结 | 133,363 tokens / 355.0s | 185,448 tokens / 485.2s | 节省 52,085 tokens，28.1% | 快 26.8% |
-| **合计** | **340,438 tokens / 1,025.5s** | **590,834 tokens / 1,482.9s** | **节省 250,396 tokens，42.4%** | **快 30.8%** |
+| 联盟集结和加入集结 | 128,865 tokens / 300.4s | 185,448 tokens / 485.2s | 节省 56,583 tokens，30.5% | 快 38.1% |
+| **合计** | **335,940 tokens / 920.9s** | **590,834 tokens / 1,482.9s** | **节省 254,894 tokens，43.1%** | **快 37.9%** |
 
 索引和 cache 基线：
 

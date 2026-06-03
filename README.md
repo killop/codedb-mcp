@@ -91,7 +91,7 @@ The intended distribution model is setup-guide first: give an agent `setup-for-a
 
 Benchmark target: `u3dclient`.
 
-Benchmarks below were rerun on 2026-06-02 on Windows. Tool timings are warm in-process measurements from one loaded server-style process after the relevant lazy sidecars are loaded; they do not include process startup or cache-open time.
+Benchmarks below were rerun on Windows. Index and warm tool timings were refreshed on 2026-06-02; the Codex feature-analysis token row for alliance rally / join-rally was refreshed on 2026-06-03 with the current skill behavior: no feature-call count limit and no forced bundle output clamp. Tool timings are warm in-process measurements from one loaded server-style process after the relevant lazy sidecars are loaded; they do not include process startup or cache-open time.
 
 Current index status with the Unity C# benchmark config:
 
@@ -111,8 +111,8 @@ The runs below used the same custom Codex model, the same `u3dclient` repository
 |---|---:|---:|---:|---:|
 | World-map marching logic | 92,639 tokens / 272.5s | 231,810 tokens / 617.8s | 139,171 tokens saved, 60.0% | 55.9% faster |
 | Hero attributes and power calculation | 114,436 tokens / 348.0s | 173,576 tokens / 379.9s | 59,140 tokens saved, 34.1% | 8.4% faster |
-| Alliance rally and join-rally logic | 133,363 tokens / 355.0s | 185,448 tokens / 485.2s | 52,085 tokens saved, 28.1% | 26.8% faster |
-| **Total** | **340,438 tokens / 1,025.5s** | **590,834 tokens / 1,482.9s** | **250,396 tokens saved, 42.4%** | **30.8% faster** |
+| Alliance rally and join-rally logic | 128,865 tokens / 300.4s | 185,448 tokens / 485.2s | 56,583 tokens saved, 30.5% | 38.1% faster |
+| **Total** | **335,940 tokens / 920.9s** | **590,834 tokens / 1,482.9s** | **254,894 tokens saved, 43.1%** | **37.9% faster** |
 
 Index and cache baseline:
 

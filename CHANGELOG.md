@@ -2,7 +2,7 @@
 
 [中文版本](CHANGELOG.zh-CN.md)
 
-## Unreleased - 2026-06-02
+## Unreleased - 2026-06-03
 
 ### Changed
 
@@ -21,6 +21,7 @@
 - Re-ran 1,000-file incremental maintenance on `u3dclient`: add 1.508s, modify 1.544s, delete 0.504s, all through the `live-incremental` path.
 - Re-ran language and atlas smoke checks: `gameserver` Java cold rebuild 3.939s at 212.7 MB WS / 212.4 MB private, current-repo Rust index 0.372s, multi-language smoke 0.069s, and module atlas full sampled export 7.960s at 286.2 MB WS / 289.1 MB private.
 - Validated the Codex observer on 19 recent `u3dclient` sessions: 20 candidate JSONL files scanned in 185.1ms, 301 codedb calls found, 134 bundle calls split into 834 child tool sections, and high-output codedb/source lookup findings generated.
+- Re-ran the `Alliance rally and join-rally logic` Codex benchmark after removing feature-call count limits and forced bundle output clamps: codedb-mcp enabled used 128,865 tokens / 300.4s versus 185,448 tokens / 485.2s disabled, saving 56,583 tokens (30.5%) and finishing 38.1% faster. The README total is now 335,940 tokens / 920.9s enabled versus 590,834 tokens / 1,482.9s disabled, saving 254,894 tokens (43.1%) and finishing 37.9% faster.
 
 ## Unreleased - 2026-05-28
 

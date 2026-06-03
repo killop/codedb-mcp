@@ -4,8 +4,13 @@
 
 ## Unreleased - 2026-06-03
 
+### 新增
+
+- 新增 `codedb_version` MCP 工具，直接返回编译进可执行文件的 server/package 版本，不加载项目索引。
+
 ### 变更
 
+- 将 crate、CLI `--version` 和 MCP serverInfo 使用的版本源统一提升到 `0.5.0`。
 - 将当前 `codedb_search` 的 lexical 路径替换为固定的 symbol/word-trigram 文本命中 + lazy Model2Vec 向量融合。cold index 不再构建旧的 lexical ranker，regex 和 exact text search 继续使用 codedb-style trigram sidecar。
 - 为 `codedb_text_search` 和 regex route 的 `codedb_search` 行命中增加有上限的进程内结果缓存，对齐 README warm-tool benchmark 口径，同时不让完整源码常驻内存。
 - 新增 `codedb_context` 和 `codedb_explore`，让 agent 可以一次拿到排序后的答案上下文和预算化源码片段，而不是手动串联 search、outline、deps 和 read。

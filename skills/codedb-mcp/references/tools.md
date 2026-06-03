@@ -42,6 +42,7 @@
 
 | Tool | Use | Notes |
 |---|---|---|
+| `codedb_version` | Server/package version | Does not load a project index. Use for setup checks and release verification. |
 | `codedb_status` | Health and index stats | Check after setup, watch rebuild, or benchmark. |
 | `codedb_changes` | Files changed since sequence | Useful for incremental agent context. |
 | `codedb_index` | Reindex a local folder | Usually not needed when the server watches files. |

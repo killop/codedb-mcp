@@ -294,6 +294,11 @@ fn tools_list() -> Value {
                 "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}
             },
             {
+                "name": "codedb_version",
+                "description": "Return the codedb-mcp server/package version without loading a project index.",
+                "inputSchema": {"type": "object", "properties": {}, "required": []}
+            },
+            {
                 "name": "codedb_snapshot",
                 "description": "JSON snapshot of files, symbols, and dependency graph.",
                 "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}

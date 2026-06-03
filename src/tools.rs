@@ -640,6 +640,7 @@ fn dispatch_tool_with_context(
 
 fn dispatch_tool_inner(manager: &ProjectManager, name: &str, args: &Value) -> String {
     let result = match name {
+        "codedb_version" => Ok(handle_version()),
         "codedb_index" => handle_index(manager, args),
         "codedb_projects" => Ok(handle_projects(manager)),
         "codedb_bundle" => handle_bundle(manager, args),
@@ -656,6 +657,13 @@ fn dispatch_tool_inner(manager: &ProjectManager, name: &str, args: &Value) -> St
         }
     };
     result.unwrap_or_else(|err| format!("error: {err}"))
+}
+
+fn handle_version() -> String {
+    format!(
+        "name: codedb-mcp\npackage: codebase-mcp\nversion: {}\n",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn dispatch_index_tool(index: &Codebase, name: &str, args: &Value) -> Result<String> {

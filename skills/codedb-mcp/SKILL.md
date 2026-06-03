@@ -106,6 +106,7 @@ Do not keep expanding every type, UI branch, message, enum, or compatibility lay
 - `codedb_callers`: references/callers; pass `definition_path` and `definition_line` when known.
 - `codedb_deps`: file dependencies and reverse dependencies.
 - `codedb_find`, `codedb_query`, `codedb_glob`, `codedb_ls`: compact navigation.
+- `codedb_version`: server/package version check without loading a project index.
 - `codedb_status`, `codedb_changes`, `codedb_hot`: freshness and scan-scope checks when results look stale.
 
 ## Setup Boundary

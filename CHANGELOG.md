@@ -4,8 +4,13 @@
 
 ## Unreleased - 2026-06-03
 
+### Added
+
+- Added `codedb_version`, a lightweight MCP tool that returns the compiled server/package version without loading a project index.
+
 ### Changed
 
+- Bumped the crate, CLI `--version`, and MCP serverInfo version source to `0.5.0`.
 - Replaced the current `codedb_search` lexical path with fixed symbol/word-trigram text hits plus lazy Model2Vec vector fusion. Cold indexing no longer builds the old lexical ranker, while regex and exact text search continue to use the codedb-style trigram sidecar.
 - Added a bounded in-process result cache for `codedb_text_search` / regex-routed `codedb_search` line hits, matching the README warm-tool benchmark contract without keeping full source files resident.
 - Added `codedb_context` and `codedb_explore` so agents can ask for ranked answer context and budgeted source excerpts instead of manually chaining search, outline, deps, and read calls.

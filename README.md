@@ -53,6 +53,7 @@ The server keeps a tree-sitter indexed, project-local code database under `.code
 - LSP-like callers anchored to a definition path and line;
 - direct and reverse file dependencies, including transitive walks;
 - fuzzy file lookup, path globbing, compact query pipelines, and 100-call bundles;
+- version, status, freshness, and scan-scope diagnostics;
 - graph summaries, lazy Louvain communities, module planning, atlas export, and DeepWiki evidence gathering.
 
 ## Codex Token Observation
@@ -139,6 +140,7 @@ The table is intentionally three columns so it fits GitHub README pages without 
 |---|---|---|
 | `codedb_index`<br>Build/rebuild local index | cold rebuild 13.818s; peak 226.9 / 220.2 MB | none |
 | `codedb_status`<br>Health, counts, scan state | one-shot status open 0.454s; cache hit | none |
+| `codedb_version`<br>Server/package version | trivial response; no project index load | none |
 | `codedb_tree`<br>Indexed tree with language, lines, symbols | 8.782ms | partial file list only |
 | `codedb_outline`<br>One-file symbol outline | sampled files 0.088-0.351ms; 100-call p95 0.214ms after first load | none |
 | `codedb_symbol`<br>Symbol definition lookup | 2.021ms | regex approximates text only |

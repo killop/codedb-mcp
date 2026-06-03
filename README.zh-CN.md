@@ -53,6 +53,7 @@
 - 基于 definition path/line 锚定的 LSP-like callers；
 - 文件正向依赖、反向依赖和 transitive 依赖查询；
 - 模糊文件查找、路径 glob、小型 query pipeline 和一次最多 100 个内部调用的 bundle；
+- version、status、freshness 和扫描范围诊断；
 - 图摘要、懒计算 Louvain community、模块规划、atlas 导出和 DeepWiki 证据收集。
 
 ## Codex Token 观察
@@ -142,6 +143,7 @@ Codex 功能分析 token benchmark：
 |---|---|---|
 | `codedb_index`<br>构建/重建本地索引 | cold rebuild 13.818s；峰值 226.9 / 220.2 MB | 无 |
 | `codedb_status`<br>健康状态、数量、扫描状态 | one-shot status open 0.454s；cache hit | 无 |
+| `codedb_version`<br>server/package 版本 | trivial response；不加载项目索引 | 无 |
 | `codedb_tree`<br>索引树，含语言、行数、符号数 | 8.782ms | 只能部分列文件 |
 | `codedb_outline`<br>单文件符号大纲 | 抽样文件 0.088-0.351ms；100-call p95 0.214ms after first load | 无 |
 | `codedb_symbol`<br>按符号名找定义 | 2.021ms | regex 只能近似文本 |
@@ -301,6 +303,7 @@ MCP 模式会先完成协议握手，再在后台构建默认项目索引；如�
 | `codedb_find` | 模糊文件名/路径查找 |
 | `codedb_query` | find/search/filter/limit/outline 小型 pipeline |
 | `codedb_bundle` | 一次 MCP 请求里执行最多 100 个工具调用 |
+| `codedb_version` | 返回 server/package 版本，不加载项目索引 |
 | `codedb_graph` | 图摘要或导出 |
 | `codedb_communities` | 懒计算 Louvain community/subcommunity |
 | `codedb_module_map` | DeepWiki 模块规划 atlas：依赖内聚度、跨目录证据、入口点、关键符号、语义近邻和 c-TF-IDF-like 标签 |

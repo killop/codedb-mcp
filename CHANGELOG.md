@@ -2,7 +2,31 @@
 
 [中文版本](CHANGELOG.zh-CN.md)
 
-## Unreleased - 2026-06-03
+## Unreleased - 2026-07-23
+
+### Changed
+
+- Removed Model2Vec, semantic units, vector stores, embedding configuration, model downloads, and `embeddings.bin` from the runtime and cache schema.
+- Bumped the project cache to v28 and kept graph, dependency, exact text, word, caller, outline, and BM25 sidecars.
+- Reworked `codedb_flow` / `codedb_context` into a query-model-free graph workflow: unscoped calls return a compact atlas; scoped calls select structural roots and community boundaries, apply structural-seed PPR with hub cost, connect anchors through weighted shortest paths, and progressively disclose exact call/dependency/body evidence.
+- Removed keyword, synonym, morphology, language, and call-quota guidance from the packaged skill. Multi-phase questions may use as many scoped graph projections as needed to close the evidence chain.
+- Applied `neug`-inspired graph-query mechanics: resident CSR file adjacency, forward/reverse dependency views, bidirectional frontier expansion selected by actual neighbor cost, parent-chain path reconstruction, dependency corridors, and deterministic executable call corridors that stop at branches, terminals, or cycles instead of a fixed traversal depth.
+- Kept MCP operations atomic: `codedb_bundle` remains internal and is not exposed. `codedb_outline include_connected_ranges=true` can project a same-file call/reference component into one explicit `connected_range=true` read; that read is a complete active-code closure and does not expand another lead bundle.
+
+### Fixed
+
+- Fixed continuation traversal recursively expanding the original symbol instead of the next symbol.
+- Fixed callpath false edges from comments, strings, repeated identifiers, optional-argument matching, local same-name methods, and unresolved explicit qualifiers falling back to unrelated global definitions.
+- Stopped rebuilding a full dependency `HashMap<BTreeSet<_>>` for every callpath corridor; queries now walk the existing forward/reverse dependency indexes and cache only visited neighbor rows.
+
+### Benchmark And Validation
+
+- Expanded the Rust suite to 68 passing tests, including deterministic multi-hop continuation, connected member ranges, qualified callpaths, optional arguments, and false-edge regressions.
+- Re-ran the startup-to-main-interface MCP/no-MCP scenario: 122,851 vs 224,922 effective tokens, 414.6s vs 732.8s, and 244,291 vs 742,368 tool-output characters.
+- Completed same-model reference runs for world-map marching, hero attributes/power, and alliance rally analysis. Completed MCP samples used 8.8-12.6% fewer effective tokens and 23.0-53.3% fewer tool-output characters than their RG controls, while broad-scenario call count and convergence remained variable.
+- Excluded a final consolidated rerun after Codex rejected `gpt-5.6-sol` for the account mid-run; failed turns with no usage record are not reported as benchmark wins.
+
+## 0.5.0 - 2026-06-03
 
 ### Added
 

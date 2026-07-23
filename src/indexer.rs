@@ -1,18 +1,18 @@
-use crate::bm25::{Bm25Builder, Bm25Index, SpillingBm25Builder};
+use crate::bm25::{Bm25Builder, Bm25Index};
 use crate::cache::{
     CacheWriteTransaction, CachedIndexPayload, ProjectCache, SourceFingerprint, read_deps_forward,
-    read_embeddings, read_word_index,
+    read_word_index,
 };
-use crate::embedding::MinishEmbeddingModel;
 use crate::event_log;
 use crate::graph::CodeGraph;
-use crate::language::{analyze_source, chunk_source_metadata, language_for_extension};
+use crate::language::{
+    analyze_source, chunk_source_metadata, language_for_extension, mask_comments,
+};
 use crate::text_search::{
     TextSearchIndex, read_text_search_index, source_hash as text_search_source_hash,
 };
 use crate::tokens::{raw_identifiers, split_identifier};
-use crate::types::{Chunk, FileEntry, SearchHit, SemanticUnit, Symbol, WordHit, WordIndex};
-use crate::vector_store::MinishVectorStore;
+use crate::types::{Chunk, FileEntry, SearchHit, Symbol, WordHit, WordIndex};
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
@@ -36,7 +36,6 @@ const TEXT_LINE_CACHE_MAX_HITS_PER_ENTRY: usize = 2_048;
 pub struct IndexOptions {
     pub extensions: Vec<String>,
     pub max_file_bytes: u64,
-    pub embedding_model: String,
     pub respect_gitignore: bool,
     pub root_paths: Vec<String>,
     pub include_paths: Vec<String>,
@@ -50,7 +49,6 @@ impl IndexOptions {
     pub fn cache_identity_eq(&self, other: &Self) -> bool {
         self.extensions == other.extensions
             && self.max_file_bytes == other.max_file_bytes
-            && self.embedding_model == other.embedding_model
             && self.respect_gitignore == other.respect_gitignore
             && self.root_paths == other.root_paths
             && self.include_paths == other.include_paths
@@ -88,10 +86,9 @@ impl Default for IndexOptions {
         Self {
             extensions: default_source_extensions(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            embedding_model: default_embedding_model_path(),
             respect_gitignore: true,
             root_paths: Vec::new(),
-            include_paths: vec!["Library/PackageCache".to_string()],
+            include_paths: Vec::new(),
             exclude_paths: Vec::new(),
             skip_dirs: vec![
                 ".git".to_string(),
@@ -108,14 +105,12 @@ impl Default for IndexOptions {
                 "coverage".to_string(),
                 "out".to_string(),
                 ".codedb-mcp".to_string(),
-                "library".to_string(),
                 "temp".to_string(),
                 "logs".to_string(),
                 "obj".to_string(),
                 "bin".to_string(),
                 "build".to_string(),
                 "builds".to_string(),
-                "usersettings".to_string(),
             ],
             diagnostics: DiagnosticsOptions {
                 timing: false,
@@ -127,88 +122,6 @@ impl Default for IndexOptions {
             },
         }
     }
-}
-
-#[cfg(windows)]
-fn default_embedding_model_path() -> String {
-    if let Some(path) = default_hf_embedding_model_path() {
-        return path_to_config_string(&path);
-    }
-    let drives = (b'C'..=b'Z')
-        .filter_map(|letter| {
-            let root = format!("{}:/", letter as char);
-            Path::new(&root).exists().then_some(letter as char)
-        })
-        .collect::<Vec<_>>();
-    let drive = drives
-        .get(1)
-        .or_else(|| drives.first())
-        .copied()
-        .unwrap_or('C');
-    format!("{drive}:/codedb-mcp-cache/models/potion-code-16M")
-}
-
-#[cfg(windows)]
-fn default_hf_embedding_model_path() -> Option<PathBuf> {
-    let hub = default_hf_hub_dir()?;
-    if let Some(snapshot) = existing_hf_model_snapshot(&hub) {
-        return Some(snapshot);
-    }
-    hub.exists().then(|| {
-        hub.join("codedb-mcp")
-            .join("models")
-            .join("potion-code-16M")
-    })
-}
-
-#[cfg(windows)]
-fn default_hf_hub_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".cache")
-            .join("huggingface")
-            .join("hub"),
-    )
-}
-
-#[cfg(windows)]
-fn existing_hf_model_snapshot(hub: &Path) -> Option<PathBuf> {
-    let repo = hub.join("models--minishlab--potion-code-16M");
-    let refs_main = repo.join("refs").join("main");
-    if let Ok(commit) = fs::read_to_string(&refs_main) {
-        let snapshot = repo.join("snapshots").join(commit.trim());
-        if is_model_dir(&snapshot) {
-            return Some(snapshot);
-        }
-    }
-    let snapshots = repo.join("snapshots");
-    let mut entries = fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && is_model_dir(path))
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries.into_iter().next()
-}
-
-#[cfg(windows)]
-fn is_model_dir(path: &Path) -> bool {
-    path.join("tokenizer.json").exists()
-        && path.join("model.safetensors").exists()
-        && (path.join("config.json").exists()
-            || path.join("config_sentence_transformers.json").exists())
-}
-
-#[cfg(windows)]
-fn path_to_config_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-#[cfg(not(windows))]
-fn default_embedding_model_path() -> String {
-    ".codedb-mcp/models/potion-code-16M".to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,10 +136,6 @@ pub struct IndexStats {
     pub graph_nodes: usize,
     pub graph_edges: usize,
     pub graph_communities: usize,
-    pub embedding_model: String,
-    pub embedding_dims: usize,
-    pub vector_count: usize,
-    pub vector_units: &'static str,
     pub storage_dir: Option<String>,
     pub cache: &'static str,
 }
@@ -244,10 +153,8 @@ pub struct Codebase {
     pub seq: u64,
     pub file_paths: Vec<String>,
     pub files: BTreeMap<String, FileEntry>,
+    symbol_lookup: HashMap<String, Vec<(String, usize)>>,
     pub chunks: Vec<Chunk>,
-    pub semantic_units: Vec<SemanticUnit>,
-    pub chunk_indices_by_file: HashMap<String, Vec<usize>>,
-    pub symbol_definition_chunks: HashMap<String, Vec<usize>>,
     pub word_index: parking_lot::RwLock<Option<WordIndex>>,
     pub word_index_path: Option<PathBuf>,
     pub word_hits_path: Option<PathBuf>,
@@ -259,21 +166,10 @@ pub struct Codebase {
     pub deps_reverse: parking_lot::RwLock<Option<HashMap<String, Vec<String>>>>,
     pub graph_stats: LightweightGraphStats,
     pub graph: parking_lot::RwLock<Option<Arc<CodeGraph>>>,
-    #[allow(dead_code)]
-    pub bm25: Bm25Index,
-    pub embeddings: parking_lot::RwLock<Option<Vec<Vec<f32>>>>,
-    pub embeddings_path: Option<PathBuf>,
-    pub vectors: parking_lot::RwLock<Option<Arc<MinishVectorStore>>>,
-    pub model: parking_lot::RwLock<Option<Arc<MinishEmbeddingModel>>>,
-    pub embedding_model_id: String,
-    pub embedding_dims: usize,
-    pub vector_count: usize,
+    bm25: parking_lot::RwLock<Option<Bm25Index>>,
     pub changed_files: Vec<ChangedFile>,
     pub storage_dir: Option<String>,
     pub cache_status: &'static str,
-    pub louvain_communities: parking_lot::RwLock<Option<Vec<crate::graph::GraphCommunity>>>,
-    pub louvain_subcommunities:
-        parking_lot::RwLock<HashMap<usize, Vec<crate::graph::GraphCommunity>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -335,6 +231,21 @@ impl TextLineCacheKey {
     }
 }
 
+fn build_symbol_lookup(
+    files: &BTreeMap<String, FileEntry>,
+) -> HashMap<String, Vec<(String, usize)>> {
+    let mut lookup = HashMap::<String, Vec<(String, usize)>>::new();
+    for (path, file) in files {
+        for (symbol_idx, symbol) in file.symbols.iter().enumerate() {
+            lookup
+                .entry(symbol.name.clone())
+                .or_default()
+                .push((path.clone(), symbol_idx));
+        }
+    }
+    lookup
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedFile {
     pub path: String,
@@ -366,7 +277,6 @@ impl Codebase {
             match project_cache.load(&options) {
                 Ok(Some(payload)) => {
                     log_timing(timing, "load_project_cache", stage);
-                    let embeddings_path = project_cache.embeddings_path();
                     return Self::from_cached(
                         root,
                         options,
@@ -375,7 +285,7 @@ impl Codebase {
                         Some(project_cache.word_index_path()),
                         Some(project_cache.word_hits_path()),
                         Some(project_cache.text_search_index_path()),
-                        embeddings_path.is_file().then_some(embeddings_path),
+                        Some(project_cache.bm25_postings_path()),
                         project_cache.current_deps_path()?,
                         total_start,
                     );
@@ -455,8 +365,6 @@ impl Codebase {
         }
         assign_chunk_file_ids(&mut chunks, &file_paths);
         let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
-        let symbol_definition_chunks =
-            build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "chunk_files", stage);
 
         let stage = Instant::now();
@@ -505,56 +413,19 @@ impl Codebase {
                 )
             })?;
         }
-        let mut bm25 = Bm25Index::default();
-        if project_cache.enabled() {
-            if let Some(transaction) = cache_write.as_ref() {
-                bm25.use_postings_file(transaction.bm25_postings_path().to_path_buf());
-            } else {
-                bm25.use_postings_file(project_cache.bm25_postings_path());
-            }
-        }
+        let bm25 = Bm25Index::default();
         strip_chunk_contents(&mut chunks);
-        log_timing(timing, "bm25_skipped", stage);
+        log_timing(timing, "bm25_deferred", stage);
 
-        let stage = Instant::now();
-        let mut semantic_units = files
-            .iter()
-            .enumerate()
-            .map(|(id, file)| SemanticUnit {
-                id,
-                file_path: file.path.clone(),
-                text: semantic_text_for_file(file),
-            })
-            .collect::<Vec<_>>();
-        for (id, unit) in semantic_units.iter_mut().enumerate() {
-            unit.id = id;
-        }
-        log_timing(timing, "semantic_units", stage);
-
-        let embedding_model_id = options.embedding_model.clone();
-        let embedding_dims = 0;
-        let vector_count = semantic_units.len();
-        let embeddings = Vec::<Vec<f32>>::new();
-        let embeddings_path = None;
         let mut word_index_path = None;
         let mut word_hits_path = None;
-        strip_semantic_unit_text(&mut semantic_units);
         strip_chunk_contents(&mut chunks);
         strip_chunk_paths(&mut chunks);
         if project_cache.enabled() && deps_path.is_some() && cache_write.is_some() {
             let stage = Instant::now();
             let transaction = cache_write.take().expect("cache transaction checked");
-            let save_result = project_cache.save(
-                transaction,
-                &options,
-                &files,
-                &chunks,
-                &semantic_units,
-                &bm25,
-                graph_stats,
-                embedding_dims,
-                vector_count,
-            );
+            let save_result =
+                project_cache.save(transaction, &options, &files, &chunks, &bm25, graph_stats);
             if let Err(err) = save_result {
                 eprintln!(
                     "codebase-mcp cache save failed at {}: {err:#}",
@@ -573,6 +444,7 @@ impl Codebase {
             .collect::<BTreeMap<_, _>>();
         log_timing(timing, "total", total_start);
         strip_file_contents(&mut file_map);
+        let symbol_lookup = build_symbol_lookup(&file_map);
 
         Ok(Self {
             root,
@@ -580,10 +452,8 @@ impl Codebase {
             seq: now_ms() as u64,
             file_paths,
             files: file_map,
+            symbol_lookup,
             chunks,
-            semantic_units,
-            chunk_indices_by_file,
-            symbol_definition_chunks,
             word_index: parking_lot::RwLock::new(None),
             word_index_path,
             word_hits_path,
@@ -601,20 +471,7 @@ impl Codebase {
             deps_reverse: parking_lot::RwLock::new(None),
             graph_stats,
             graph: parking_lot::RwLock::new(None),
-            bm25,
-            embeddings: parking_lot::RwLock::new(if embeddings_path.is_some() {
-                None
-            } else if embeddings.is_empty() {
-                None
-            } else {
-                Some(embeddings)
-            }),
-            embeddings_path,
-            vectors: parking_lot::RwLock::new(None),
-            model: parking_lot::RwLock::new(None),
-            embedding_model_id,
-            embedding_dims,
-            vector_count,
+            bm25: parking_lot::RwLock::new(None),
             changed_files: Vec::new(),
             storage_dir,
             cache_status: if project_cache.enabled() {
@@ -622,8 +479,6 @@ impl Codebase {
             } else {
                 "disabled"
             },
-            louvain_communities: parking_lot::RwLock::new(None),
-            louvain_subcommunities: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -635,14 +490,12 @@ impl Codebase {
         word_index_path: Option<PathBuf>,
         word_hits_path: Option<PathBuf>,
         text_search_index_path: Option<PathBuf>,
-        embeddings_path: Option<PathBuf>,
+        bm25_postings_path: Option<PathBuf>,
         deps_path: Option<PathBuf>,
         total_start: Instant,
     ) -> Result<Self> {
         let timing = options.diagnostics.timing;
         let stage = Instant::now();
-        let embedding_dims = payload.embedding_dims;
-        let vector_count = payload.vector_count;
         let files = payload
             .files
             .into_iter()
@@ -654,14 +507,16 @@ impl Codebase {
             .collect::<Vec<_>>();
         let mut chunks = payload.chunks;
         assign_chunk_file_ids(&mut chunks, &file_paths);
-        let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
         strip_chunk_paths(&mut chunks);
-        let symbol_definition_chunks =
-            build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "restore_cached_files", stage);
 
-        let bm25 = payload.bm25;
-        let embedding_model_id = options.embedding_model.clone();
+        let mut bm25 = payload.bm25;
+        if let Some(path) = bm25_postings_path
+            && path.is_file()
+        {
+            bm25.use_postings_file(path);
+        }
+        let bm25 = (!bm25.is_empty()).then_some(bm25);
         let mut file_map = files
             .into_iter()
             .map(|file| (file.path.clone(), file))
@@ -669,6 +524,7 @@ impl Codebase {
         let graph_stats = payload.graph_stats;
         log_timing(timing, "total", total_start);
         strip_file_contents(&mut file_map);
+        let symbol_lookup = build_symbol_lookup(&file_map);
 
         Ok(Self {
             root,
@@ -676,10 +532,8 @@ impl Codebase {
             seq: now_ms() as u64,
             file_paths,
             files: file_map,
+            symbol_lookup,
             chunks,
-            semantic_units: payload.semantic_units,
-            chunk_indices_by_file,
-            symbol_definition_chunks,
             word_index: parking_lot::RwLock::new(None),
             word_index_path,
             word_hits_path,
@@ -691,19 +545,10 @@ impl Codebase {
             deps_reverse: parking_lot::RwLock::new(None),
             graph_stats,
             graph: parking_lot::RwLock::new(None),
-            bm25,
-            embeddings: parking_lot::RwLock::new(None),
-            embeddings_path,
-            vectors: parking_lot::RwLock::new(None),
-            model: parking_lot::RwLock::new(None),
-            embedding_model_id,
-            embedding_dims,
-            vector_count,
+            bm25: parking_lot::RwLock::new(bm25),
             changed_files: Vec::new(),
             storage_dir,
             cache_status: "hit",
-            louvain_communities: parking_lot::RwLock::new(None),
-            louvain_subcommunities: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -741,7 +586,7 @@ impl Codebase {
                 .or_default()
                 .push((old_idx, chunk));
         }
-        let _old_bm25 = payload.bm25;
+        drop(payload.bm25);
         log_timing(timing, "incremental_restore_old_cache", stage);
 
         let stage = Instant::now();
@@ -815,8 +660,6 @@ impl Codebase {
             .collect::<Vec<_>>();
         assign_chunk_file_ids(&mut chunks, &file_paths);
         let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
-        let symbol_definition_chunks =
-            build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "incremental_merge_files", stage);
 
         let stage = Instant::now();
@@ -880,44 +723,16 @@ impl Codebase {
         }
 
         let stage = Instant::now();
-        let mut bm25 = Bm25Index::default();
-        if let Some(transaction) = cache_write.as_ref() {
-            bm25.use_postings_file(transaction.bm25_postings_path().to_path_buf());
-        }
-        log_timing(timing, "incremental_bm25_skipped", stage);
+        let bm25 = Bm25Index::default();
+        log_timing(timing, "incremental_bm25_deferred", stage);
 
-        let stage = Instant::now();
-        let mut semantic_units = files
-            .iter()
-            .enumerate()
-            .map(|(id, file)| SemanticUnit {
-                id,
-                file_path: file.path.clone(),
-                text: semantic_text_for_file(file),
-            })
-            .collect::<Vec<_>>();
-        strip_semantic_unit_text(&mut semantic_units);
         strip_chunk_contents(&mut chunks);
         strip_chunk_paths(&mut chunks);
-        log_timing(timing, "incremental_semantic_units", stage);
-
-        let embedding_model_id = options.embedding_model.clone();
-        let embedding_dims = 0;
-        let vector_count = semantic_units.len();
         if project_cache.enabled() && deps_path.is_some() && cache_write.is_some() {
             let stage = Instant::now();
             let transaction = cache_write.take().expect("cache transaction checked");
-            let save_result = project_cache.save(
-                transaction,
-                &options,
-                &files,
-                &chunks,
-                &semantic_units,
-                &bm25,
-                graph_stats,
-                embedding_dims,
-                vector_count,
-            );
+            let save_result =
+                project_cache.save(transaction, &options, &files, &chunks, &bm25, graph_stats);
             if let Err(err) = save_result {
                 eprintln!(
                     "codebase-mcp incremental cache save failed at {}: {err:#}",
@@ -942,6 +757,7 @@ impl Codebase {
             .collect::<BTreeMap<_, _>>();
         log_timing(timing, "total", total_start);
         strip_file_contents(&mut file_map);
+        let symbol_lookup = build_symbol_lookup(&file_map);
 
         Ok(Self {
             root,
@@ -949,10 +765,8 @@ impl Codebase {
             seq: now_ms() as u64,
             file_paths,
             files: file_map,
+            symbol_lookup,
             chunks,
-            semantic_units,
-            chunk_indices_by_file,
-            symbol_definition_chunks,
             word_index: parking_lot::RwLock::new(None),
             word_index_path,
             word_hits_path,
@@ -968,19 +782,10 @@ impl Codebase {
             deps_reverse: parking_lot::RwLock::new(None),
             graph_stats,
             graph: parking_lot::RwLock::new(None),
-            bm25,
-            embeddings: parking_lot::RwLock::new(None),
-            embeddings_path: None,
-            vectors: parking_lot::RwLock::new(None),
-            model: parking_lot::RwLock::new(None),
-            embedding_model_id,
-            embedding_dims,
-            vector_count,
+            bm25: parking_lot::RwLock::new(None),
             changed_files: Vec::new(),
             storage_dir,
             cache_status: "incremental",
-            louvain_communities: parking_lot::RwLock::new(None),
-            louvain_subcommunities: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -1087,8 +892,6 @@ impl Codebase {
         }
         assign_chunk_file_ids(&mut chunks, &file_paths);
         let chunk_indices_by_file = build_chunk_indices_by_file(&chunks, &file_paths);
-        let symbol_definition_chunks =
-            build_symbol_definition_chunks(&files, &chunks, &chunk_indices_by_file);
         log_timing(timing, "live_incremental_merge_files", stage);
 
         let stage = Instant::now();
@@ -1105,21 +908,8 @@ impl Codebase {
         log_timing(timing, "live_incremental_dependencies", stage);
 
         let stage = Instant::now();
-        let bm25 = Bm25Index::default();
-        log_timing(timing, "live_incremental_bm25_skipped", stage);
+        log_timing(timing, "live_incremental_bm25_deferred", stage);
 
-        let stage = Instant::now();
-        let mut semantic_units = files
-            .iter()
-            .enumerate()
-            .map(|(id, file)| SemanticUnit {
-                id,
-                file_path: file.path.clone(),
-                text: semantic_text_for_file(file),
-            })
-            .collect::<Vec<_>>();
-        strip_semantic_unit_text(&mut semantic_units);
-        let vector_count = semantic_units.len();
         strip_chunk_contents(&mut chunks);
         strip_chunk_paths(&mut chunks);
         let mut file_map = files
@@ -1127,6 +917,7 @@ impl Codebase {
             .map(|file| (file.path.clone(), file))
             .collect::<BTreeMap<_, _>>();
         strip_file_contents(&mut file_map);
+        let symbol_lookup = build_symbol_lookup(&file_map);
         log_timing(timing, "live_incremental_finish", stage);
         log_timing(timing, "total", total_start);
 
@@ -1136,10 +927,8 @@ impl Codebase {
             seq: now_ms() as u64,
             file_paths,
             files: file_map,
+            symbol_lookup,
             chunks,
-            semantic_units,
-            chunk_indices_by_file,
-            symbol_definition_chunks,
             word_index: parking_lot::RwLock::new(None),
             word_index_path: None,
             word_hits_path: None,
@@ -1151,19 +940,10 @@ impl Codebase {
             deps_reverse: parking_lot::RwLock::new(None),
             graph_stats,
             graph: parking_lot::RwLock::new(None),
-            bm25,
-            embeddings: parking_lot::RwLock::new(None),
-            embeddings_path: None,
-            vectors: parking_lot::RwLock::new(None),
-            model: parking_lot::RwLock::new(None),
-            embedding_model_id: self.embedding_model_id.clone(),
-            embedding_dims: self.embedding_dims,
-            vector_count,
+            bm25: parking_lot::RwLock::new(None),
             changed_files: Vec::new(),
             storage_dir: self.storage_dir.clone(),
             cache_status: "live-incremental",
-            louvain_communities: parking_lot::RwLock::new(None),
-            louvain_subcommunities: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -1179,10 +959,6 @@ impl Codebase {
             graph_nodes: self.graph_summary().nodes,
             graph_edges: self.graph_summary().edges,
             graph_communities: self.graph_summary().communities,
-            embedding_model: self.embedding_model_id.clone(),
-            embedding_dims: self.embedding_dims,
-            vector_count: self.vector_count,
-            vector_units: "files",
             storage_dir: self.storage_dir.clone(),
             cache: self.cache_status,
         }
@@ -1213,29 +989,53 @@ impl Codebase {
         chunk_file_path(chunk, &self.file_paths)
     }
 
-    pub fn chunk_content_cached(
+    pub fn ranked_bm25_chunks(
         &self,
-        chunk: &Chunk,
-        content_by_file: &mut HashMap<String, String>,
-    ) -> Result<String> {
-        if !chunk.content.is_empty() {
-            return Ok(chunk.content.clone());
+        query: &str,
+        top_k: usize,
+        selector: Option<&[usize]>,
+    ) -> Result<Vec<(usize, f32)>> {
+        {
+            let guard = self.bm25.read();
+            if let Some(index) = guard.as_ref()
+                && !index.is_empty()
+            {
+                return index.query(query, top_k, selector);
+            }
         }
-        let file_path = self.chunk_file_path(chunk);
-        if !content_by_file.contains_key(file_path) {
-            let file = self
-                .file(file_path)
-                .ok_or_else(|| anyhow!("chunk file not indexed: {}", file_path))?;
-            content_by_file.insert(file_path.to_string(), self.file_content(file)?);
+
+        let mut guard = self.bm25.write();
+        let needs_build = match guard.as_ref() {
+            Some(index) => index.is_empty(),
+            None => true,
+        };
+        if needs_build {
+            let chunk_indices_by_file = build_chunk_indices_by_file(&self.chunks, &self.file_paths);
+            let built = build_full_bm25_in_memory(
+                &self.root,
+                &self.chunks,
+                &self.file_paths,
+                &chunk_indices_by_file,
+            )?;
+            self.persist_lazy_bm25(&built);
+            *guard = Some(built);
         }
-        let content = content_by_file
-            .get(file_path)
-            .ok_or_else(|| anyhow!("chunk file not cached: {}", file_path))?;
-        Ok(extract_content_lines(
-            content,
-            chunk.start_line,
-            chunk.end_line,
-        ))
+
+        match guard.as_ref() {
+            Some(index) => index.query(query, top_k, selector),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn persist_lazy_bm25(&self, bm25: &Bm25Index) {
+        let Ok(cache) = ProjectCache::new(&self.root, &self.options.storage) else {
+            return;
+        };
+        if cache.enabled()
+            && let Err(err) = cache.save_bm25_index(bm25)
+        {
+            eprintln!("codebase-mcp BM25 cache save failed: {err:#}");
+        }
     }
 
     pub fn graph(&self) -> Arc<CodeGraph> {
@@ -1246,8 +1046,20 @@ impl Codebase {
         if let Some(graph) = guard.as_ref().cloned() {
             return graph;
         }
+        if let Ok(cache) = ProjectCache::new(&self.root, &self.options.storage)
+            && let Ok(Some(graph)) = cache.load_graph(&self.options)
+        {
+            let graph = Arc::new(graph);
+            *guard = Some(graph.clone());
+            return graph;
+        }
         let deps_forward = self.deps_forward_snapshot();
         let graph = Arc::new(CodeGraph::build(&self.files, &deps_forward));
+        if let Ok(cache) = ProjectCache::new(&self.root, &self.options.storage)
+            && let Err(err) = cache.save_graph(&self.options, graph.as_ref())
+        {
+            eprintln!("codebase-mcp graph cache save failed: {err:#}");
+        }
         *guard = Some(graph.clone());
         graph
     }
@@ -1261,58 +1073,6 @@ impl Codebase {
             };
         }
         self.graph_stats
-    }
-
-    pub fn embedding_model(&self) -> Result<Arc<MinishEmbeddingModel>> {
-        if let Some(model) = self.model.read().as_ref().cloned() {
-            return Ok(model);
-        }
-        let mut guard = self.model.write();
-        if let Some(model) = guard.as_ref().cloned() {
-            return Ok(model);
-        }
-        let model = Arc::new(load_embedding_model(
-            &self.root,
-            &self.options.embedding_model,
-        )?);
-        *guard = Some(model.clone());
-        Ok(model)
-    }
-
-    pub fn vector_store(&self) -> Result<Arc<MinishVectorStore>> {
-        if let Some(vectors) = self.vectors.read().as_ref().cloned() {
-            return Ok(vectors);
-        }
-        let mut guard = self.vectors.write();
-        if let Some(vectors) = guard.as_ref().cloned() {
-            return Ok(vectors);
-        }
-        let embeddings = if let Some(embeddings) = self.embeddings.write().take() {
-            embeddings
-        } else if let Some(path) = &self.embeddings_path
-            && path.is_file()
-        {
-            read_embeddings(path)?
-        } else {
-            let model = self.embedding_model()?;
-            let texts = self
-                .semantic_units
-                .iter()
-                .map(|unit| {
-                    if !unit.text.is_empty() {
-                        unit.text.clone()
-                    } else {
-                        self.file(&unit.file_path)
-                            .map(semantic_text_for_file)
-                            .unwrap_or_else(|| unit.file_path.clone())
-                    }
-                })
-                .collect::<Vec<_>>();
-            model.encode(&texts)
-        };
-        let vectors = Arc::new(MinishVectorStore::build(&embeddings, self.embedding_dims)?);
-        *guard = Some(vectors.clone());
-        Ok(vectors)
     }
 
     pub fn reverse_deps_for(&self, path: &str) -> Vec<String> {
@@ -1753,15 +1513,15 @@ impl Codebase {
     }
 
     pub fn symbols_named(&self, name: &str) -> Vec<(&FileEntry, &Symbol)> {
-        let mut results = Vec::new();
-        for file in self.files.values() {
-            for symbol in &file.symbols {
-                if symbol.name == name {
-                    results.push((file, symbol));
-                }
-            }
-        }
-        results
+        self.symbol_lookup
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(path, symbol_idx)| {
+                let file = self.files.get(path)?;
+                Some((file, file.symbols.get(*symbol_idx)?))
+            })
+            .collect()
     }
 
     pub fn path_selector(&self, glob: Option<&str>) -> Vec<usize> {
@@ -1867,13 +1627,6 @@ fn strip_chunk_paths(chunks: &mut [Chunk]) {
     }
 }
 
-fn strip_semantic_unit_text(units: &mut [SemanticUnit]) {
-    for unit in units {
-        unit.text.clear();
-        unit.text.shrink_to_fit();
-    }
-}
-
 fn assign_chunk_file_ids(chunks: &mut [Chunk], file_paths: &[String]) {
     let path_to_id = file_paths
         .iter()
@@ -1904,24 +1657,6 @@ fn is_single_identifier_query(query: &str) -> bool {
     }
     let identifiers = raw_identifiers(trimmed);
     identifiers.len() == 1 && identifiers[0] == trimmed
-}
-
-fn extract_content_lines(content: &str, start: usize, end: usize) -> String {
-    let mut out = String::new();
-    for (idx, line) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        if line_no < start {
-            continue;
-        }
-        if line_no > end {
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    out
 }
 
 fn estimate_graph_stats(
@@ -1994,36 +1729,6 @@ fn build_chunk_indices_by_file(
             .push(idx);
     }
     by_file
-}
-
-fn build_symbol_definition_chunks(
-    files: &[FileEntry],
-    chunks: &[Chunk],
-    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
-) -> HashMap<String, Vec<usize>> {
-    let mut by_symbol: HashMap<String, Vec<usize>> = HashMap::new();
-    for file in files {
-        let Some(file_chunks) = chunk_indices_by_file.get(&file.path) else {
-            continue;
-        };
-        for symbol in &file.symbols {
-            let Some(&chunk_idx) = file_chunks.iter().find(|&&idx| {
-                let chunk = &chunks[idx];
-                chunk.start_line <= symbol.line_start && symbol.line_start <= chunk.end_line
-            }) else {
-                continue;
-            };
-            by_symbol
-                .entry(symbol.name.to_ascii_lowercase())
-                .or_default()
-                .push(chunk_idx);
-        }
-    }
-    for indices in by_symbol.values_mut() {
-        indices.sort_unstable();
-        indices.dedup();
-    }
-    by_symbol
 }
 
 pub fn collect_source_paths(root: &Path, options: &IndexOptions) -> Result<Vec<PathBuf>> {
@@ -2418,28 +2123,6 @@ fn comparable_path_text(path: &str) -> String {
     }
 }
 
-fn load_embedding_model(root: &Path, model_id: &str) -> Result<MinishEmbeddingModel> {
-    let configured_path = Path::new(model_id);
-    let path = if configured_path.is_absolute() {
-        configured_path.to_path_buf()
-    } else {
-        root.join(configured_path)
-    };
-    if path.exists() {
-        MinishEmbeddingModel::load_local(&path)
-    } else if configured_path.components().count() > 1
-        || model_id.starts_with('.')
-        || model_id.contains('\\')
-    {
-        Err(anyhow!(
-            "configured local embedding model path does not exist: {}",
-            path.display()
-        ))
-    } else {
-        MinishEmbeddingModel::load(model_id)
-    }
-}
-
 struct IndexedFileSource {
     file: FileEntry,
     chunks: Vec<Chunk>,
@@ -2542,17 +2225,18 @@ fn build_dependency_references_from_sources(
             } else {
                 file.content.as_str()
             };
+            let active_source = mask_comments(file.language.as_str(), source);
             let mut dependency_references = DependencyReferences::default();
-            let aliases =
-                (file.language == "csharp").then(|| parse_using_aliases_from_iter(source.lines()));
+            let aliases = (file.language == "csharp")
+                .then(|| parse_using_aliases_from_iter(active_source.lines()));
             if file.language == "csharp" {
                 collect_static_using_dependency_references_from_iter(
-                    source.lines(),
+                    active_source.lines(),
                     dependency_symbols,
                     &mut dependency_references,
                 );
             }
-            for line in source.lines() {
+            for line in active_source.lines() {
                 let identifiers = raw_identifiers(line);
                 let code = strip_strings_and_line_comment(line);
                 let dependency_line = is_dependency_reference_line(file.language.as_str(), &code);
@@ -2612,7 +2296,14 @@ fn build_word_index_from_sources(root: &Path, file_paths: &[String]) -> Result<W
                     return index;
                 }
                 let content = String::from_utf8_lossy(&bytes);
-                for (line_idx, line) in content.lines().enumerate() {
+                let language = Path::new(rel_path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(language_for_extension);
+                let active_content = language
+                    .map(|language| mask_comments(language, &content))
+                    .unwrap_or_else(|| content.to_string());
+                for (line_idx, line) in active_content.lines().enumerate() {
                     let mut seen = HashSet::new();
                     for raw in raw_identifiers(line) {
                         if seen.insert(raw.clone()) {
@@ -2654,16 +2345,41 @@ fn build_word_index(
         .fold(WordIndexBuild::default, |mut built, (file_id, file)| {
             let mut dependency_references = DependencyReferences::default();
             let lines = file_chunk_lines(file, chunks, chunk_indices_by_file);
-            let aliases =
-                (file.language == "csharp").then(|| parse_using_aliases_from_lines(&lines));
+            let active_content = if file.content.is_empty() {
+                lines
+                    .iter()
+                    .map(|(_, line)| *line)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                mask_comments(file.language.as_str(), &file.content)
+            };
+            let active_lines = active_content.lines().collect::<Vec<_>>();
+            let aliases = (file.language == "csharp").then(|| {
+                let numbered = active_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| (idx + 1, *line))
+                    .collect::<Vec<_>>();
+                parse_using_aliases_from_lines(&numbered)
+            });
             if file.language == "csharp" {
+                let numbered = active_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| (idx + 1, *line))
+                    .collect::<Vec<_>>();
                 collect_static_using_dependency_references_from_lines(
-                    &lines,
+                    &numbered,
                     dependency_symbols,
                     &mut dependency_references,
                 );
             }
-            for (line_no, line) in lines {
+            for (line_no, original_line) in lines {
+                let line = active_lines
+                    .get(line_no.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(original_line);
                 let mut seen = HashSet::new();
                 let identifiers = raw_identifiers(line);
                 let code = strip_strings_and_line_comment(line);
@@ -3436,7 +3152,7 @@ fn normalize_qualified_name(value: &str) -> String {
         .join(".")
 }
 
-fn strip_strings_and_line_comment(line: &str) -> String {
+pub(crate) fn strip_strings_and_line_comment(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut in_string = false;
@@ -3572,7 +3288,6 @@ pub fn now_ms() -> i128 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 fn add_bm25_documents_from_sources(
     root: &Path,
     chunks: &[Chunk],
@@ -3589,7 +3304,14 @@ fn add_bm25_documents_from_sources(
             continue;
         }
         let content = read_source_content(root, rel_path)?;
-        let lines = content.lines().collect::<Vec<_>>();
+        let language = Path::new(rel_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(language_for_extension);
+        let active_content = language
+            .map(|language| mask_comments(language, &content))
+            .unwrap_or(content);
+        let lines = active_content.lines().collect::<Vec<_>>();
         for &idx in indices {
             while next_chunk_idx < idx {
                 add_document(Vec::<String>::new())?;
@@ -3609,87 +3331,6 @@ fn add_bm25_documents_from_sources(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn bm25_replacement_documents_from_sources(
-    root: &Path,
-    chunks: &[Chunk],
-    changed_path_set: &HashSet<String>,
-    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
-) -> Result<Vec<(usize, Vec<String>)>> {
-    let mut changed_paths = changed_path_set.iter().collect::<Vec<_>>();
-    changed_paths.sort();
-    let mut documents = Vec::new();
-    for rel_path in changed_paths {
-        let Some(indices) = chunk_indices_by_file.get(rel_path) else {
-            continue;
-        };
-        if indices.is_empty() {
-            continue;
-        }
-        let content = read_source_content(root, rel_path)?;
-        let lines = content.lines().collect::<Vec<_>>();
-        for &idx in indices {
-            let Some(chunk) = chunks.get(idx) else {
-                continue;
-            };
-            documents.push((idx, bm25_tokens_for_chunk(chunk, rel_path, &lines)));
-        }
-    }
-    Ok(documents)
-}
-
-#[allow(dead_code)]
-fn bm25_replacement_documents_from_indexed_sources(
-    chunks: &[Chunk],
-    changed_path_set: &HashSet<String>,
-    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
-    indexed_sources: &HashMap<String, IndexedFileSource>,
-) -> Vec<(usize, Vec<String>)> {
-    let mut changed_paths = changed_path_set.iter().collect::<Vec<_>>();
-    changed_paths.sort();
-    let mut documents = Vec::new();
-    for rel_path in changed_paths {
-        let Some(indices) = chunk_indices_by_file.get(rel_path) else {
-            continue;
-        };
-        if indices.is_empty() {
-            continue;
-        }
-        let Some(indexed) = indexed_sources.get(rel_path) else {
-            continue;
-        };
-        let lines = indexed.file.content.lines().collect::<Vec<_>>();
-        for &idx in indices {
-            let Some(chunk) = chunks.get(idx) else {
-                continue;
-            };
-            documents.push((idx, bm25_tokens_for_chunk(chunk, rel_path, &lines)));
-        }
-    }
-    documents
-}
-
-#[allow(dead_code)]
-fn build_full_bm25_to_cache(
-    root: &Path,
-    chunks: &[Chunk],
-    file_paths: &[String],
-    chunk_indices_by_file: &HashMap<String, Vec<usize>>,
-    postings_path: &Path,
-) -> Result<Bm25Index> {
-    let spill_dir = postings_path.parent().unwrap_or(root).join("bm25-build");
-    let mut builder = SpillingBm25Builder::new(spill_dir)?;
-    add_bm25_documents_from_sources(
-        root,
-        chunks,
-        file_paths,
-        chunk_indices_by_file,
-        |document| builder.add_document(document),
-    )?;
-    builder.finish_to_postings_file(postings_path)
-}
-
-#[allow(dead_code)]
 fn build_full_bm25_in_memory(
     root: &Path,
     chunks: &[Chunk],
@@ -3856,44 +3497,6 @@ fn is_bm25_code_stopword(token: &str) -> bool {
     )
 }
 
-fn semantic_text_for_file(file: &FileEntry) -> String {
-    let path = Path::new(&file.path);
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    let parent = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let mut text = String::new();
-    text.push_str(&file.path);
-    text.push('\n');
-    text.push_str(stem);
-    text.push(' ');
-    text.push_str(parent);
-    text.push('\n');
-    if let Some(namespace) = &file.namespace {
-        text.push_str("namespace ");
-        text.push_str(namespace);
-        text.push('\n');
-    }
-    if !file.imports.is_empty() {
-        text.push_str("imports ");
-        text.push_str(&file.imports.join(" "));
-        text.push('\n');
-    }
-    text.push_str("symbols ");
-    for symbol in file.symbols.iter().take(256) {
-        text.push_str(symbol.kind.as_str());
-        text.push(' ');
-        text.push_str(&symbol.name);
-        text.push(' ');
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3964,21 +3567,21 @@ mod tests {
     #[test]
     fn include_paths_override_skipped_parent_dirs() {
         let root = std::env::temp_dir().join(format!("codebase_mcp_include_paths_{}", now_ms()));
-        let package_cache = root.join("Library").join("PackageCache");
-        let other_library = root.join("Library").join("Other");
-        std::fs::create_dir_all(&package_cache).unwrap();
-        std::fs::create_dir_all(&other_library).unwrap();
+        let included_child = root.join("skipped_parent").join("included_child");
+        let other_child = root.join("skipped_parent").join("other_child");
+        std::fs::create_dir_all(&included_child).unwrap();
+        std::fs::create_dir_all(&other_child).unwrap();
         std::fs::write(
-            package_cache.join("Included.cs"),
+            included_child.join("Included.cs"),
             "public class Included {}",
         )
         .unwrap();
-        std::fs::write(other_library.join("Skipped.cs"), "public class Skipped {}").unwrap();
+        std::fs::write(other_child.join("Skipped.cs"), "public class Skipped {}").unwrap();
 
         let mut options = IndexOptions::default();
         options.extensions = vec!["cs".to_string()];
-        options.include_paths = vec!["Library/PackageCache".to_string()];
-        options.skip_dirs = vec!["library".to_string()];
+        options.include_paths = vec!["skipped_parent/included_child".to_string()];
+        options.skip_dirs = vec!["skipped_parent".to_string()];
 
         let paths = collect_paths(&root, &options).unwrap();
         let rel_paths = paths
@@ -3990,8 +3593,8 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect::<Vec<_>>();
-        assert!(rel_paths.contains(&"Library/PackageCache/Included.cs".to_string()));
-        assert!(!rel_paths.contains(&"Library/Other/Skipped.cs".to_string()));
+        assert!(rel_paths.contains(&"skipped_parent/included_child/Included.cs".to_string()));
+        assert!(!rel_paths.contains(&"skipped_parent/other_child/Skipped.cs".to_string()));
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4042,47 +3645,41 @@ mod tests {
     }
 
     #[test]
-    fn unity_runtime_scope_keeps_runtime_roots_and_excludes_editor_dirs() {
-        let root = std::env::temp_dir().join(format!("codebase_mcp_unity_runtime_{}", now_ms()));
-        std::fs::create_dir_all(root.join("Assets").join("Scripts").join("Editor")).unwrap();
-        std::fs::create_dir_all(root.join("Packages").join("GamePackage")).unwrap();
-        std::fs::create_dir_all(
-            root.join("Library")
-                .join("PackageCache")
-                .join("UnityPackage"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("Library").join("Other")).unwrap();
+    fn root_scope_combines_roots_includes_excludes_and_skips() {
+        let root = std::env::temp_dir().join(format!("codebase_mcp_root_scope_{}", now_ms()));
+        std::fs::create_dir_all(root.join("src").join("feature").join("excluded")).unwrap();
+        std::fs::create_dir_all(root.join("plugins").join("shared")).unwrap();
+        std::fs::create_dir_all(root.join("cache").join("included").join("shared_generated"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("cache").join("other")).unwrap();
         std::fs::write(
-            root.join("Assets").join("Scripts").join("Runtime.cs"),
-            "public class Runtime {}",
+            root.join("src").join("feature").join("Runtime.cs"),
+            "public class RuntimeEntry {}",
         )
         .unwrap();
         std::fs::write(
-            root.join("Assets")
-                .join("Scripts")
-                .join("Editor")
-                .join("EditorOnly.cs"),
-            "public class EditorOnly {}",
+            root.join("src")
+                .join("feature")
+                .join("excluded")
+                .join("SkippedByGlob.cs"),
+            "public class SkippedByGlob {}",
         )
         .unwrap();
         std::fs::write(
-            root.join("Packages")
-                .join("GamePackage")
-                .join("PackageRuntime.cs"),
-            "public class PackageRuntime {}",
+            root.join("plugins").join("shared").join("SharedRuntime.cs"),
+            "public class SharedRuntime {}",
         )
         .unwrap();
         std::fs::write(
-            root.join("Library")
-                .join("PackageCache")
-                .join("UnityPackage")
-                .join("PackageCacheRuntime.cs"),
-            "public class PackageCacheRuntime {}",
+            root.join("cache")
+                .join("included")
+                .join("shared_generated")
+                .join("IncludedFromSkippedParent.cs"),
+            "public class IncludedFromSkippedParent {}",
         )
         .unwrap();
         std::fs::write(
-            root.join("Library").join("Other").join("Skipped.cs"),
+            root.join("cache").join("other").join("SkippedByParent.cs"),
             "public class Skipped {}",
         )
         .unwrap();
@@ -4090,13 +3687,13 @@ mod tests {
         let mut options = IndexOptions::default();
         options.extensions = vec!["cs".to_string()];
         options.root_paths = vec![
-            "Assets".to_string(),
-            "Packages".to_string(),
-            "Library/PackageCache".to_string(),
+            "src".to_string(),
+            "plugins".to_string(),
+            "cache/included".to_string(),
         ];
         options.include_paths = Vec::new();
-        options.exclude_paths = vec!["**/Editor".to_string(), "**/Editor/**".to_string()];
-        options.skip_dirs = vec!["library".to_string(), ".git".to_string()];
+        options.exclude_paths = vec!["**/excluded".to_string(), "**/excluded/**".to_string()];
+        options.skip_dirs = vec!["cache".to_string(), ".git".to_string()];
 
         let paths = collect_paths(&root, &options).unwrap();
         let rel_paths = paths
@@ -4108,14 +3705,15 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect::<Vec<_>>();
-        assert!(rel_paths.contains(&"Assets/Scripts/Runtime.cs".to_string()));
-        assert!(rel_paths.contains(&"Packages/GamePackage/PackageRuntime.cs".to_string()));
+        assert!(rel_paths.contains(&"src/feature/Runtime.cs".to_string()));
+        assert!(rel_paths.contains(&"plugins/shared/SharedRuntime.cs".to_string()));
         assert!(
-            rel_paths
-                .contains(&"Library/PackageCache/UnityPackage/PackageCacheRuntime.cs".to_string())
+            rel_paths.contains(
+                &"cache/included/shared_generated/IncludedFromSkippedParent.cs".to_string()
+            )
         );
-        assert!(!rel_paths.contains(&"Assets/Scripts/Editor/EditorOnly.cs".to_string()));
-        assert!(!rel_paths.contains(&"Library/Other/Skipped.cs".to_string()));
+        assert!(!rel_paths.contains(&"src/feature/excluded/SkippedByGlob.cs".to_string()));
+        assert!(!rel_paths.contains(&"cache/other/SkippedByParent.cs".to_string()));
 
         std::fs::remove_dir_all(root).unwrap();
     }

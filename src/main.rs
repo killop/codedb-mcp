@@ -4,7 +4,6 @@ mod bm25;
 mod cache;
 mod config;
 mod config_watcher;
-mod embedding;
 mod event_log;
 mod graph;
 mod indexer;
@@ -17,7 +16,6 @@ mod tokens;
 mod tools;
 mod tree_sitter_lang;
 mod types;
-mod vector_store;
 mod watcher;
 
 use anyhow::Result;
@@ -26,10 +24,12 @@ use config::AppConfig;
 use indexer::{IndexOptions, collect_source_paths, normalize_rel_path};
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tools::{ProjectManager, ReindexCheck, dispatch_cached_cli_tool, dispatch_tool};
+
+const DEFAULT_CONFIG_PATH: &str = ".codedb-mcp/codedb-mcp.toml";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,8 +44,8 @@ struct Cli {
     #[arg(global = true, long, short = 'C', default_value = ".")]
     root: PathBuf,
 
-    #[arg(global = true, long, default_value = ".codedb-mcp/codedb-mcp.toml")]
-    config: PathBuf,
+    #[arg(global = true, long)]
+    config: Option<PathBuf>,
 
     #[arg(global = true, long)]
     no_watch: bool,
@@ -79,16 +79,16 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value_t = 1000)]
         count: usize,
-        #[arg(long, default_value = "Assets/CodedbMcpBench")]
+        #[arg(long, default_value = ".codedb-mcp-bench")]
         bench_dir: String,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.clone();
-    let config = AppConfig::load(&config_path)?;
     let log_root = command_root(&cli);
+    let config_path = resolve_config_path(&log_root, cli.config.as_deref());
+    let config = AppConfig::load(&config_path)?;
     event_log::init(&log_root, &config.logging.event_log_config())?;
     let options = config.index_options();
     let watch_enabled = config.watch.enabled && !cli.no_watch;
@@ -220,6 +220,12 @@ fn command_root(cli: &Cli) -> PathBuf {
     }
 }
 
+fn resolve_config_path(root: &Path, configured: Option<&Path>) -> PathBuf {
+    configured
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join(DEFAULT_CONFIG_PATH))
+}
+
 fn bench_incremental(
     path: PathBuf,
     options: IndexOptions,
@@ -331,4 +337,28 @@ fn time_apply(manager: &ProjectManager, changed: Vec<String>, deleted: Vec<Strin
 
 fn round_ms(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_config_path_follows_command_root() {
+        assert_eq!(
+            resolve_config_path(Path::new("target-repo"), None,),
+            PathBuf::from("target-repo")
+                .join(".codedb-mcp")
+                .join("codedb-mcp.toml")
+        );
+    }
+
+    #[test]
+    fn explicit_config_path_is_preserved() {
+        let configured = PathBuf::from("custom").join("codedb-mcp.toml");
+        assert_eq!(
+            resolve_config_path(Path::new("target-repo"), Some(&configured)),
+            configured
+        );
+    }
 }

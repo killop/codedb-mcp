@@ -7,28 +7,24 @@
 # Humans can edit this list before indexing; only these extensions are scanned.
 extensions = ["cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
 
-# Skip extremely large generated files before parsing or embedding.
+# Skip extremely large generated files before parsing.
 max_file_bytes = 50000000
 
 # Respect .gitignore files under this project for the normal tree walk. Nested
 # Git worktrees/submodules under the target root are still scanned as source
 # directories; .git/info/exclude and global gitignore are not project boundaries.
-# Unity PackageCache is included explicitly through include_paths below, so
-# ignored packages can still be indexed.
 respect_gitignore = true
 
 # Optional scan roots relative to the project root. Empty means "walk the whole
-# project root". For Unity runtime-only C# indexing, use:
-# root_paths = ["Assets", "Packages", "Library/PackageCache"]
+# project root".
 root_paths = []
 
 # Extra paths to include even when the normal scan would ignore them.
-include_paths = ["Library/PackageCache"]
+include_paths = []
 
-# Glob paths to exclude after root/include selection. Useful for runtime-only
-# Unity indexing where Editor folders should not be part of the runtime graph.
+# Glob paths to exclude after root/include selection.
 # Examples:
-# exclude_paths = ["**/Editor", "**/Editor/**"]
+# exclude_paths = ["generated/**", "**/*.min.js"]
 exclude_paths = []
 
 # Directory names to skip. A path listed in include_paths is still scanned even
@@ -48,21 +44,13 @@ skip_dirs = [
   "coverage",
   "out",
   ".codedb-mcp",
-  "Library",
   "Temp",
   "Logs",
   "obj",
   "bin",
   "Build",
   "Builds",
-  "UserSettings",
 ]
-
-[embedding]
-# Absolute Model2Vec model directory selected by setup-for-agent.
-# If the default HuggingFace hub cache exists, setup should use it; otherwise
-# it should fall back to the second available Windows drive.
-model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
 
 [diagnostics]
 # Set timing=true only while benchmarking; it writes stage timings to stderr.
@@ -74,8 +62,7 @@ slow_file_ms = 0
 [logging]
 # Disabled by default. When enabled, MCP tool calls and file-watch digest
 # batches are written through a bounded non-blocking queue and a background
-# writer. codedb_bundle logs only its child tools with mode=bundle. Queue
-# overflow drops log lines instead of slowing indexing or MCP.
+# writer. Queue overflow drops log lines instead of slowing indexing or MCP.
 enabled = false
 file = ".codedb-mcp/codedb-mcp.log"
 queue_capacity = 8192

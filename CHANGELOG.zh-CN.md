@@ -2,7 +2,31 @@
 
 [English version](CHANGELOG.md)
 
-## Unreleased - 2026-06-03
+## Unreleased - 2026-07-23
+
+### 变更
+
+- 从 runtime 和 cache schema 中删除 Model2Vec、semantic units、vector store、embedding 配置、模型下载和 `embeddings.bin`。
+- 项目 cache 升级到 v28，保留 graph、dependency、exact text、word、caller、outline 和 BM25 sidecar。
+- 将 `codedb_flow` / `codedb_context` 改成无查询模型的纯图工作流：无 scope 时返回 compact atlas；有 scope 时选择结构根和 community 边界，运行带 hub cost 的结构 seed PPR，通过 weighted shortest path 连接锚点，再渐进披露精确调用、依赖和 body 证据。
+- 从打包 skill 删除关键词、同义词、词形、语言和调用配额指导。多阶段问题可以继续使用 scoped 图投影，直到证据链闭合。
+- 吸收 `neug` 的图查询思路：常驻 CSR 文件邻接、正反 dependency view、按真实邻接成本选择双向 frontier、父链路径重建、dependency corridor，以及遇到分叉/终点/环才停止而不是固定深度的 deterministic executable call corridor。
+- MCP 操作保持原子化：`codedb_bundle` 仍为内部实现，不对 MCP 暴露。`codedb_outline include_connected_ranges=true` 可以把同文件 call/reference component 投影为一次显式 `connected_range=true` read；该 read 是完整 active-code 闭包，不再扩展另一组 leads。
+
+### 修复
+
+- 修复 continuation 递归时反复展开原始 symbol、没有沿下一跳继续的问题。
+- 修复 callpath 中由注释、字符串、同行重复 identifier、optional 参数、局部同名方法以及无法解析的显式 qualifier 引入的假边。
+- callpath corridor 不再每次重建完整 dependency `HashMap<BTreeSet<_>>`，改为遍历已有正反 dependency 索引，并只缓存实际访问的邻接行。
+
+### Benchmark 与验证
+
+- Rust 测试扩展到 68 项全部通过，覆盖 deterministic 多跳 continuation、connected member range、qualified callpath、optional 参数和假边回归。
+- 重跑“启动到主界面” MCP/no-MCP：122,851 vs 224,922 effective tokens，414.6s vs 732.8s，工具输出字符 244,291 vs 742,368。
+- 完成大地图行军、英雄属性/战力、联盟集结的同模型参考样本。已完成 MCP 样本相对 RG control 的 effective tokens 低 8.8-12.6%，工具输出字符低 23.0-53.3%；宽场景调用数和收敛仍有波动。
+- Codex 在最后一次合并重跑中途开始拒绝账号使用 `gpt-5.6-sol`；没有 usage 的失败 turn 被排除，没有当成 benchmark 胜利。
+
+## 0.5.0 - 2026-06-03
 
 ### 新增
 

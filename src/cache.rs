@@ -1,7 +1,8 @@
 use crate::bm25::Bm25Index;
+use crate::graph::CodeGraph;
 use crate::indexer::{IndexOptions, LightweightGraphStats, StorageOptions};
 use crate::text_search::{TextSearchIndex, write_text_search_index};
-use crate::types::{Chunk, FileEntry, LanguageId, Scope, SemanticUnit, Symbol, WordIndex};
+use crate::types::{Chunk, FileEntry, LanguageId, Scope, Symbol, WordIndex};
 use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 23;
+const CACHE_VERSION: u32 = 28;
 const MANIFEST_FILE: &str = "manifest.json";
 const FINGERPRINTS_FILE: &str = "fingerprints.bin";
 const PAYLOAD_FILE: &str = "index.bin";
@@ -21,9 +22,9 @@ const BM25_POSTINGS_FILE: &str = "bm25.postings";
 const WORD_INDEX_FILE: &str = "word_index.bin";
 const WORD_HITS_FILE: &str = "word_hits.bin";
 const TEXT_SEARCH_INDEX_FILE: &str = "text_search_index.bin";
-const EMBEDDINGS_FILE: &str = "embeddings.bin";
 const DEPS_FILE: &str = "deps.bin";
 const CALLERS_FILE: &str = "callers.bin";
+const GRAPH_FILE: &str = "graph.bin";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,12 +52,8 @@ struct CacheManifest {
     version: u32,
     created_unix_ms: i128,
     config_hash: String,
-    embedding_model: String,
-    embedding_dims: usize,
     file_count: usize,
     chunk_count: usize,
-    semantic_unit_count: usize,
-    vector_count: usize,
     #[serde(default)]
     graph_stats: LightweightGraphStats,
     #[serde(default = "default_payload_file")]
@@ -84,9 +81,6 @@ pub struct CachedStatusSnapshot {
     pub seq: i128,
     pub files: usize,
     pub chunks: usize,
-    pub embedding_model: String,
-    pub embedding_dims: usize,
-    pub vector_count: usize,
     pub graph_stats: LightweightGraphStats,
     pub storage_dir: String,
 }
@@ -136,12 +130,15 @@ struct CachedCallers {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct CachedGraph {
+    source_seq: i128,
+    graph: CodeGraph,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CachedIndexPayload {
     pub files: Vec<CachedFileEntry>,
     pub chunks: Vec<Chunk>,
-    pub semantic_units: Vec<SemanticUnit>,
-    pub embedding_dims: usize,
-    pub vector_count: usize,
     pub graph_stats: LightweightGraphStats,
     pub bm25: Bm25Index,
 }
@@ -194,9 +191,6 @@ pub struct CachedFileEntry {
 struct CachedIndexPayloadRef<'a> {
     files: Vec<CachedFileEntryRef<'a>>,
     chunks: &'a [Chunk],
-    semantic_units: &'a [SemanticUnit],
-    embedding_dims: usize,
-    vector_count: usize,
     graph_stats: LightweightGraphStats,
     bm25: &'a Bm25Index,
 }
@@ -218,7 +212,6 @@ struct CachedFileEntryRef<'a> {
 struct CacheConfigSignature<'a> {
     extensions: &'a [String],
     max_file_bytes: u64,
-    embedding_model: &'a str,
     respect_gitignore: bool,
     root_paths: &'a [String],
     include_paths: &'a [String],
@@ -254,10 +247,6 @@ impl CacheWriteTransaction {
             bm25_postings_file,
             deps_file,
         }
-    }
-
-    pub fn bm25_postings_path(&self) -> &Path {
-        &self.bm25_postings_path
     }
 
     pub fn deps_path(&self) -> &Path {
@@ -325,10 +314,6 @@ impl ProjectCache {
         self.dir.join(TEXT_SEARCH_INDEX_FILE)
     }
 
-    pub fn embeddings_path(&self) -> PathBuf {
-        self.dir.join(EMBEDDINGS_FILE)
-    }
-
     pub fn current_deps_path(&self) -> Result<Option<PathBuf>> {
         if !self.enabled {
             return Ok(None);
@@ -345,6 +330,39 @@ impl ProjectCache {
 
     pub fn callers_path(&self) -> PathBuf {
         self.dir.join(CALLERS_FILE)
+    }
+
+    pub fn graph_path(&self) -> PathBuf {
+        self.dir.join(GRAPH_FILE)
+    }
+
+    pub fn load_graph(&self, options: &IndexOptions) -> Result<Option<CodeGraph>> {
+        let Some((manifest, _fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(None);
+        };
+        let path = self.graph_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mut cached: CachedGraph = read_bin(&path)?;
+        if cached.source_seq != manifest.created_unix_ms {
+            return Ok(None);
+        }
+        cached.graph.rebuild_runtime_indexes();
+        Ok(Some(cached.graph))
+    }
+
+    pub fn save_graph(&self, options: &IndexOptions, graph: &CodeGraph) -> Result<()> {
+        let Some((manifest, _fingerprints)) = self.valid_manifest(options)? else {
+            return Ok(());
+        };
+        write_bin_atomic(
+            &self.graph_path(),
+            &CachedGraph {
+                source_seq: manifest.created_unix_ms,
+                graph: graph.clone(),
+            },
+        )
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -378,7 +396,6 @@ impl ProjectCache {
         let fingerprints: CacheFingerprints = read_bin(&fingerprints_path)?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
-            || manifest.embedding_model != options.embedding_model
             || fingerprints.files.len() != manifest.file_count
             || !source_files_match_current(&self.root, &fingerprints.files, options.max_file_bytes)
             || !source_dirs_match_current(&self.root, &fingerprints.dirs)
@@ -389,9 +406,6 @@ impl ProjectCache {
         let mut payload: CachedIndexPayload = read_bin(&payload_path)?;
         if payload.files.len() != manifest.file_count
             || payload.chunks.len() != manifest.chunk_count
-            || payload.semantic_units.len() != manifest.semantic_unit_count
-            || payload.embedding_dims != manifest.embedding_dims
-            || payload.vector_count != manifest.vector_count
         {
             return Ok(None);
         }
@@ -418,7 +432,6 @@ impl ProjectCache {
         let manifest: CacheManifest = read_json(&manifest_path)?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
-            || manifest.embedding_model != options.embedding_model
             || !self.required_files_exist_for(&manifest)
         {
             return Ok(None);
@@ -428,9 +441,6 @@ impl ProjectCache {
             read_bin(&self.manifest_file_path(&manifest.payload_file))?;
         if payload.files.len() != manifest.file_count
             || payload.chunks.len() != manifest.chunk_count
-            || payload.semantic_units.len() != manifest.semantic_unit_count
-            || payload.embedding_dims != manifest.embedding_dims
-            || payload.vector_count != manifest.vector_count
         {
             return Ok(None);
         }
@@ -457,7 +467,6 @@ impl ProjectCache {
         let manifest: CacheManifest = read_json(&manifest_path)?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
-            || manifest.embedding_model != options.embedding_model
             || !self.required_files_exist_for(&manifest)
         {
             return Ok(None);
@@ -474,9 +483,6 @@ impl ProjectCache {
             seq: manifest.created_unix_ms,
             files: manifest.file_count,
             chunks: manifest.chunk_count,
-            embedding_model: manifest.embedding_model,
-            embedding_dims: manifest.embedding_dims,
-            vector_count: manifest.vector_count,
             graph_stats: manifest.graph_stats,
             storage_dir: self.dir.display().to_string(),
         }))
@@ -511,7 +517,6 @@ impl ProjectCache {
         let manifest: CacheManifest = read_json(&manifest_path)?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
-            || manifest.embedding_model != options.embedding_model
             || !self.required_files_exist_for(&manifest)
         {
             return Ok(None);
@@ -635,7 +640,6 @@ impl ProjectCache {
             read_bin(&self.manifest_file_path(&manifest.fingerprints_file))?;
         if manifest.version != CACHE_VERSION
             || manifest.config_hash != config_hash(options)?
-            || manifest.embedding_model != options.embedding_model
             || fingerprints.files.len() != manifest.file_count
             || !source_files_match_current(&self.root, &fingerprints.files, options.max_file_bytes)
             || !source_dirs_match_current(&self.root, &fingerprints.dirs)
@@ -651,24 +655,21 @@ impl ProjectCache {
             manifest.payload_file.as_str(),
             manifest.outlines_file.as_str(),
             manifest.outlines_index_file.as_str(),
+            manifest.bm25_postings_file.as_str(),
             manifest.deps_file.as_str(),
         ]
         .into_iter()
         .all(|name| self.manifest_file_path(name).is_file())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
         transaction: CacheWriteTransaction,
         options: &IndexOptions,
         files: &[FileEntry],
         chunks: &[Chunk],
-        semantic_units: &[SemanticUnit],
         bm25: &Bm25Index,
         graph_stats: LightweightGraphStats,
-        embedding_dims: usize,
-        vector_count: usize,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -688,12 +689,8 @@ impl ProjectCache {
             version: CACHE_VERSION,
             created_unix_ms: now_ms(),
             config_hash: config_hash(options)?,
-            embedding_model: options.embedding_model.clone(),
-            embedding_dims,
             file_count: files.len(),
             chunk_count: chunks.len(),
-            semantic_unit_count: semantic_units.len(),
-            vector_count,
             graph_stats,
             payload_file: transaction.payload_file.clone(),
             outlines_file: transaction.outlines_file.clone(),
@@ -715,14 +712,10 @@ impl ProjectCache {
                 .map(CachedFileEntryRef::from_file_entry)
                 .collect(),
             chunks,
-            semantic_units,
-            embedding_dims,
-            vector_count,
             graph_stats,
             bm25,
         };
         write_bin_atomic(&transaction.payload_path, &payload)?;
-        self.remove_unsafe_lazy_sidecars();
         write_json_atomic(&self.manifest_path(), &manifest)?;
         self.cleanup_old_generation_files(&manifest);
         Ok(())
@@ -753,6 +746,25 @@ impl ProjectCache {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("failed to create cache dir {}", self.dir.display()))?;
         write_text_search_index(&self.text_search_index_path(), index)
+    }
+
+    pub fn save_bm25_index(&self, bm25: &Bm25Index) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let manifest_path = self.manifest_path();
+        if !manifest_path.is_file() {
+            return Ok(());
+        }
+        let manifest: CacheManifest = read_json(&manifest_path)?;
+        if manifest.version != CACHE_VERSION || !self.required_files_exist_for(&manifest) {
+            return Ok(());
+        }
+        let payload_path = self.manifest_file_path(&manifest.payload_file);
+        let mut payload: CachedIndexPayload = read_bin(&payload_path)?;
+        payload.bm25 = bm25.clone();
+        bm25.write_postings(&self.manifest_file_path(&manifest.bm25_postings_file))?;
+        write_bin_atomic(&payload_path, &payload)
     }
 
     fn cleanup_old_generation_files(&self, keep: &CacheManifest) {
@@ -792,12 +804,6 @@ impl ProjectCache {
             }
         }
     }
-
-    fn remove_unsafe_lazy_sidecars(&self) {
-        for file_name in [EMBEDDINGS_FILE] {
-            let _ = fs::remove_file(self.dir.join(file_name));
-        }
-    }
 }
 
 fn manifest_generation_files(keep: &CacheManifest) -> Vec<String> {
@@ -818,10 +824,6 @@ fn is_generated_cache_file(name: &str) -> bool {
         || (name.starts_with("fingerprints.") && name.ends_with(".bin"))
         || (name.starts_with("deps.") && name.ends_with(".bin"))
         || (name.starts_with("bm25.") && name.ends_with(".postings"))
-}
-
-pub fn read_embeddings(path: &Path) -> Result<Vec<Vec<f32>>> {
-    read_bin(path)
 }
 
 pub fn read_deps_forward(path: &Path) -> Result<std::collections::HashMap<String, Vec<String>>> {
@@ -992,7 +994,6 @@ fn config_hash(options: &IndexOptions) -> Result<String> {
     let signature = CacheConfigSignature {
         extensions: &options.extensions,
         max_file_bytes: options.max_file_bytes,
-        embedding_model: &options.embedding_model,
         respect_gitignore: options.respect_gitignore,
         root_paths: &options.root_paths,
         include_paths: &options.include_paths,

@@ -1,4 +1,77 @@
 interface:
   display_name: "codedb-mcp"
-  short_description: "Use local indexed code lookup tools"
-  default_prompt: "Use the configured local codedb-mcp server for repository lookup, and combine multi-step searches, outlines, reads, callers, and dependency checks with codedb_bundle."
+  short_description: "Use local graph-backed code lookup tools"
+  default_prompt: >-
+    Use codedb_* as the repository lookup path for source analysis. If the
+    human's task is not English, translate the complete task once while
+    preserving exact identifiers, paths, quoted literals, errors, uncertainty,
+    and code. The server treats task text as an opaque label; do not split it
+    into keywords, add synonyms, apply morphology, or invent language,
+    framework, or domain-specific boosts.
+
+    Start broad feature, lifecycle, flow, or architecture questions with
+    codedb_flow and no path_glob. In an atlas row written as
+    parent: child(count), scope first to the entry leaf parent/child/** rather
+    than the broad parent/**. Once an exact body is found, follow its returned
+    qualified/tail handoffs across directories. Open another scoped flow only
+    when the current evidence has no exact next path. There is no arbitrary
+    codedb call quota.
+
+    Read scoped results as structural roots, graph-community boundaries,
+    weighted dependency bridges, call edges, traces, and active symbol bodies.
+    Continue from exact returned paths, symbols, references, callers,
+    dependencies, outlines, previews, literals, and callpaths. Prefer
+    codedb_callpath, codedb_deps, and codedb_symbol body=true max_results=1;
+    use short compact codedb_read ranges only when no exact symbol body fits.
+    When exact entry and final endpoint symbols are known, try one callpath
+    before manually expanding intermediates. A found path already includes the
+    complete active bodies for its nodes; fill only genuine gaps.
+    codedb_symbol body=true already returns the complete active body; do not add
+    format=full or repeat the same body. Use expand=true only when the direct
+    handoffs do not expose the next exact lifecycle link. Follow body qualified
+    tail call leads before search/find; they are exact cross-file calls taken
+    from active source. Read the exact body evidence card first: its handoffs are
+    candidates, not a checklist, and the returned body already closes the current
+    phase. Once a state or helper contract and its next transition are proven,
+    do not enumerate every generic resource/configuration/UI-manager internal.
+
+    A lifecycle is complete when every requested phase has one exact active
+    body, adjacent phases have a direct handoff or graph path, and the final
+    visible/readiness callback has an exact body. Answer immediately then. A
+    direct call in a body already proves the handoff; do not add callers/search
+    just to re-prove it. For UI readiness, the exact UI-open call plus the target
+    view show/ready body is enough unless the user explicitly asks for generic
+    UI-loader internals. Ignore editor/test alternatives once the active runtime
+    chain is connected.
+
+    Never invent lifecycle symbols or probe guessed siblings such as OnInit,
+    OnCreate, Ready, or CheckReady. Use codedb_symbol only with a name returned
+    verbatim by codedb evidence. After one missing exact name in a known file,
+    call that file's outline once and select a real symbol from it.
+
+    Traverse phases once in execution order and keep a compact evidence ledger:
+    phase, active body, next handoff. Do not return to a closed phase for extra
+    constants, assets, compile variants, callers, or a second verification pass
+    unless downstream evidence contradicts it. Once the final phase closes,
+    write the answer. The final requested callback/readiness body is a hard stop;
+    do not inspect upstream FSM update plumbing, later readiness variants, or
+    another implementation unless the user explicitly requested them.
+
+    Keep every follow-up atomic. Consume one scoped flow or one exact body before
+    choosing the next graph edge. Do not prefetch later regions or unrelated
+    sibling bodies; progressive evidence, not a phase inventory, determines the
+    next call.
+
+    Treat complete spine source bodies as already read. Treat literal bridge
+    leads as navigation and verify their exact path/body. Preserve active-body
+    tail handoffs and source order. Verify primary/current paths with live
+    bodies plus active callers, handoffs, dependencies, or downstream consumers.
+    Treat commented, disabled, generated-legacy, and deprecated code as
+    historical evidence. Close the normal entry-to-readiness chain before
+    optional failure, retry, reconnect, editor, legacy, or alternate branches.
+
+    Once any codedb_* source lookup is used, stay on codedb_* for repository
+    lookup until the answer is complete. Do not use shell, rg, grep,
+    Get-Content, scripts, or other file lookup paths after that lock starts.
+    Do not use codedb_search for natural-language task words; use it only for
+    exact identifiers, paths, quoted literals, or strings returned by evidence.

@@ -1,527 +1,120 @@
 use crate::indexer::Codebase;
-use crate::tokens::{has_whole_word, split_identifier, tokenize};
-use crate::types::ChunkSearchHit;
+use crate::tokens::raw_identifiers;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
 
-const RRF_K: f32 = 60.0;
-
-pub fn hybrid_search(
+pub fn hybrid_ranked_chunks(
     index: &Codebase,
     query: &str,
     top_k: usize,
     selector: Option<&[usize]>,
-) -> Result<Vec<ChunkSearchHit>> {
-    if query.trim().is_empty() || index.chunks.is_empty() {
+) -> Result<Vec<(usize, f32)>> {
+    ranked_chunks(index, query, top_k, selector)
+}
+
+pub fn lexical_ranked_chunks(
+    index: &Codebase,
+    query: &str,
+    top_k: usize,
+    selector: Option<&[usize]>,
+) -> Result<Vec<(usize, f32)>> {
+    ranked_chunks(index, query, top_k, selector)
+}
+
+fn ranked_chunks(
+    index: &Codebase,
+    query: &str,
+    top_k: usize,
+    selector: Option<&[usize]>,
+) -> Result<Vec<(usize, f32)>> {
+    if query.trim().is_empty() || top_k == 0 || index.chunks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let text = text_chunk_scores(index, query, top_k, selector)?;
-    let semantic = if should_run_semantic(query, top_k, text.len()) {
-        semantic_search(index, query, top_k, selector).unwrap_or_else(|err| {
-            eprintln!("codebase-mcp semantic search skipped: {err:#}");
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    };
-
-    let text_rrf = rrf_scores(&text);
-    let semantic_rrf = rrf_scores(&semantic);
-    let mut candidates = HashSet::new();
-    candidates.extend(text_rrf.keys().copied());
-    candidates.extend(semantic_rrf.keys().copied());
-
-    if candidates.is_empty() {
+    let candidate_count = top_k.saturating_mul(5).clamp(20, 400);
+    let mut scores = index.ranked_bm25_chunks(query, candidate_count, selector)?;
+    if scores.is_empty() {
         return Ok(Vec::new());
     }
 
-    let natural = is_natural_language_query(query);
-    let text_weight = if semantic_rrf.is_empty() {
-        1.0
-    } else if text_rrf.is_empty() {
-        0.0
-    } else if natural {
-        0.45
-    } else {
-        0.75
-    };
-    let semantic_weight = 1.0 - text_weight;
-
-    let mut scores = HashMap::new();
-    let mut sources = HashMap::new();
-    for idx in candidates {
-        let has_text = text_rrf.contains_key(&idx);
-        let has_semantic = semantic_rrf.contains_key(&idx);
-        let score = text_weight * text_rrf.get(&idx).copied().unwrap_or(0.0)
-            + semantic_weight * semantic_rrf.get(&idx).copied().unwrap_or(0.0);
-        scores.insert(idx, score);
-        sources.insert(
-            idx,
-            match (has_text, has_semantic) {
-                (true, true) => "text+semantic",
-                (true, false) => {
-                    if is_symbol_query(query) {
-                        "symbol"
-                    } else {
-                        "text"
-                    }
-                }
-                (false, true) => "semantic",
-                (false, false) => "search",
-            },
-        );
-    }
-
-    boost_multi_chunk_files(index, &mut scores);
-    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-    apply_query_boost(index, query, &mut scores, allowed.as_ref())?;
-    ranked_hits(index, scores, top_k, &sources)
-}
-
-fn text_chunk_scores(
-    index: &Codebase,
-    query: &str,
-    top_k: usize,
-    selector: Option<&[usize]>,
-) -> Result<HashMap<usize, f32>> {
-    let text_limit = (top_k.max(1) * 12).clamp(24, 400);
-    let hits = index.text_line_hits(query, text_limit, false, None, true, false)?;
-    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-    let mut scores = HashMap::<usize, f32>::new();
-    for (rank, hit) in hits.iter().enumerate() {
-        let Some(chunk_idx) = chunk_for_line(index, &hit.path, hit.line) else {
-            continue;
-        };
-        if allowed
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&chunk_idx))
-        {
-            continue;
-        }
-        let rank_score = 1.0 / (rank as f32 + 1.0);
-        let exact_bonus = if is_symbol_query(query) && has_whole_word(&hit.text, query) {
-            0.35
-        } else {
-            0.0
-        };
-        *scores.entry(chunk_idx).or_default() += rank_score + exact_bonus;
-    }
-    Ok(scores)
-}
-
-fn semantic_search(
-    index: &Codebase,
-    query: &str,
-    top_k: usize,
-    selector: Option<&[usize]>,
-) -> Result<HashMap<usize, f32>> {
-    let candidate_count = (top_k.max(1) * 8)
-        .min(index.semantic_units.len())
-        .max(top_k);
-    if candidate_count == 0 {
-        return Ok(HashMap::new());
-    }
-    let model = index.embedding_model()?;
-    let query_vec = model.encode_one(query);
-    let semantic_files = index
-        .vector_store()?
-        .query(&query_vec, candidate_count, None)?
-        .into_iter()
-        .collect::<HashMap<usize, f32>>();
-    semantic_chunk_scores(index, query, &semantic_files, top_k, selector)
-}
-
-fn chunk_for_line(index: &Codebase, path: &str, line: usize) -> Option<usize> {
-    let indices = index.chunk_indices_by_file.get(path)?;
-    indices.iter().copied().find(|idx| {
-        let chunk = &index.chunks[*idx];
-        chunk.start_line <= line && line <= chunk.end_line
-    })
-}
-
-fn should_run_semantic(query: &str, top_k: usize, text_candidate_count: usize) -> bool {
-    let trimmed = query.trim();
-    if trimmed.len() < 3 {
-        return false;
-    }
-    if text_candidate_count < top_k {
-        return true;
-    }
-    is_natural_language_query(trimmed)
-}
-
-fn is_natural_language_query(query: &str) -> bool {
-    let trimmed = query.trim();
-    trimmed.split_whitespace().nth(1).is_some()
-        || trimmed.chars().any(|c| !c.is_ascii())
-        || (!is_symbol_query(trimmed) && tokenize(trimmed).len() >= 3)
-}
-
-fn ranked_hits(
-    index: &Codebase,
-    scores: HashMap<usize, f32>,
-    top_k: usize,
-    sources: &HashMap<usize, &'static str>,
-) -> Result<Vec<ChunkSearchHit>> {
-    let mut ranked = scores.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-        let a_path = index.chunk_file_path(&index.chunks[*a_idx]);
-        let b_path = index.chunk_file_path(&index.chunks[*b_idx]);
-        let a_score = *a_score * path_penalty(a_path);
-        let b_score = *b_score * path_penalty(b_path);
-        b_score
-            .total_cmp(&a_score)
-            .then_with(|| a_path.cmp(b_path))
+    apply_file_coherence(index, &mut scores);
+    scores.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+        right_score
+            .total_cmp(left_score)
             .then_with(|| {
-                index.chunks[*a_idx]
+                index
+                    .chunk_file_path(&index.chunks[*left_idx])
+                    .cmp(index.chunk_file_path(&index.chunks[*right_idx]))
+            })
+            .then_with(|| {
+                index.chunks[*left_idx]
                     .start_line
-                    .cmp(&index.chunks[*b_idx].start_line)
+                    .cmp(&index.chunks[*right_idx].start_line)
             })
     });
-    ranked.truncate(top_k.min(ranked.len()));
-    Ok(ranked
-        .into_iter()
-        .map(|(idx, score)| ChunkSearchHit {
-            chunk: index.chunks[idx].clone(),
-            score,
-            source: sources.get(&idx).copied().unwrap_or("search"),
-        })
-        .collect())
+    scores.truncate(top_k.min(scores.len()));
+    Ok(scores)
 }
 
 pub fn is_symbol_query(query: &str) -> bool {
     let trimmed = query.trim();
-    if trimmed.is_empty() || trimmed.contains(' ') {
+    if trimmed.is_empty() || trimmed.split_whitespace().nth(1).is_some() {
         return false;
     }
-    trimmed.contains("::")
-        || trimmed.contains('.')
-        || trimmed.contains('_')
-        || trimmed.chars().next().is_some_and(|c| c == '_')
-        || trimmed.chars().any(|c| c.is_ascii_uppercase())
+    let identifiers = raw_identifiers(trimmed);
+    identifiers.len() == 1
+        && (trimmed.contains("::")
+            || trimmed.contains('.')
+            || trimmed.contains('_')
+            || trimmed.chars().any(|ch| ch.is_ascii_uppercase()))
 }
 
-fn rrf_scores(scores: &HashMap<usize, f32>) -> HashMap<usize, f32> {
-    let mut ranked = scores.iter().collect::<Vec<_>>();
-    ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-        b_score.total_cmp(a_score).then_with(|| a_idx.cmp(b_idx))
-    });
-    ranked
-        .into_iter()
-        .enumerate()
-        .map(|(rank, (&idx, _))| (idx, 1.0 / (RRF_K + rank as f32 + 1.0)))
-        .collect()
-}
-
-fn semantic_chunk_scores(
-    index: &Codebase,
-    query: &str,
-    file_scores: &HashMap<usize, f32>,
-    top_k: usize,
-    selector: Option<&[usize]>,
-) -> Result<HashMap<usize, f32>> {
-    if file_scores.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let allowed = selector.map(|items| items.iter().copied().collect::<HashSet<_>>());
-    let mut content_by_file = HashMap::<String, String>::new();
-    let mut ranked_files = file_scores.iter().collect::<Vec<_>>();
-    ranked_files.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-        b_score.total_cmp(a_score).then_with(|| a_idx.cmp(b_idx))
-    });
-
-    let mut scores = HashMap::new();
-    let query_tokens = tokenize(query)
-        .into_iter()
-        .filter(|token| token.len() > 2 && !STOPWORDS.contains(&token.as_str()))
-        .collect::<HashSet<_>>();
-    let per_file = top_k.clamp(1, 4);
-    let max_files = (top_k * 4).clamp(8, 80).min(ranked_files.len());
-
-    for (&file_idx, &file_score) in ranked_files.into_iter().take(max_files) {
-        let Some(unit) = index.semantic_units.get(file_idx) else {
-            continue;
-        };
-        let Some(chunk_indices) = index.chunk_indices_by_file.get(&unit.file_path) else {
-            continue;
-        };
-        let mut chunks = chunk_indices
-            .iter()
-            .copied()
-            .filter(|idx| allowed.as_ref().is_none_or(|allowed| allowed.contains(idx)))
-            .map(|idx| {
-                let local = semantic_local_chunk_score(
-                    index,
-                    idx,
-                    &query_tokens,
-                    query,
-                    &mut content_by_file,
-                )?;
-                Ok((idx, local))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        chunks.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (rank, (idx, local_score)) in chunks.into_iter().take(per_file).enumerate() {
-            let rank_penalty = 1.0 / (rank as f32 + 1.0);
-            let score = file_score * (1.0 + local_score) * rank_penalty;
-            scores
-                .entry(idx)
-                .and_modify(|existing| {
-                    if *existing < score {
-                        *existing = score;
-                    }
-                })
-                .or_insert(score);
-        }
-    }
-    Ok(scores)
-}
-
-fn semantic_local_chunk_score(
-    index: &Codebase,
-    chunk_idx: usize,
-    query_tokens: &HashSet<String>,
-    query: &str,
-    content_by_file: &mut HashMap<String, String>,
-) -> Result<f32> {
-    let chunk = &index.chunks[chunk_idx];
-    let content = index.chunk_content_cached(chunk, content_by_file)?;
-    let mut score = 0.0f32;
-    if !query_tokens.is_empty() {
-        let chunk_tokens = tokenize(&content).into_iter().collect::<HashSet<_>>();
-        let overlap = query_tokens
-            .iter()
-            .filter(|token| chunk_tokens.contains(*token))
-            .count();
-        score += overlap as f32 / query_tokens.len() as f32;
-    }
-    if is_symbol_query(query) {
-        let symbol = query
-            .rsplit(['.', ':', '\\'])
-            .next()
-            .unwrap_or(query)
-            .trim();
-        if chunk_defines_symbol(&content, symbol) {
-            score += 2.0;
-        } else if content.contains(symbol) {
-            score += 0.5;
-        }
-    }
-    Ok(score)
-}
-
-fn boost_multi_chunk_files(index: &Codebase, scores: &mut HashMap<usize, f32>) {
+fn apply_file_coherence(index: &Codebase, scores: &mut [(usize, f32)]) {
     if scores.is_empty() {
         return;
     }
-    let max_score = scores.values().copied().fold(0.0f32, f32::max);
-    if max_score == 0.0 {
+    let max_score = scores
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0f32, f32::max);
+    if max_score <= 0.0 {
         return;
     }
-    let mut file_sum: HashMap<&str, f32> = HashMap::new();
-    let mut best_chunk: HashMap<&str, usize> = HashMap::new();
-    for (&idx, &score) in scores.iter() {
-        let path = index.chunk_file_path(&index.chunks[idx]);
-        *file_sum.entry(path).or_default() += score;
-        match best_chunk.get(path) {
-            Some(&current) if scores[&current] >= score => {}
+    let mut file_sums = HashMap::<u32, f32>::new();
+    let mut best_by_file = HashMap::<u32, (usize, f32)>::new();
+    for (idx, score) in scores.iter() {
+        let file_id = index.chunks[*idx].file_id;
+        *file_sums.entry(file_id).or_default() += *score;
+        match best_by_file.get(&file_id) {
+            Some((_, current)) if current >= score => {}
             _ => {
-                best_chunk.insert(path, idx);
+                best_by_file.insert(file_id, (*idx, *score));
             }
         }
     }
-    let max_file_sum = file_sum.values().copied().fold(0.0f32, f32::max).max(1e-6);
-    let boost_unit = max_score * 0.2;
-    for (path, idx) in best_chunk {
-        if let Some(score) = scores.get_mut(&idx) {
-            *score += boost_unit * file_sum[path] / max_file_sum;
-        }
-    }
-}
-
-fn apply_query_boost(
-    index: &Codebase,
-    query: &str,
-    scores: &mut HashMap<usize, f32>,
-    allowed: Option<&HashSet<usize>>,
-) -> Result<()> {
-    if scores.is_empty() {
-        return Ok(());
-    }
-    let max_score = scores.values().copied().fold(0.0f32, f32::max);
-    if is_symbol_query(query) {
-        let symbol = query
-            .rsplit(['.', ':', '\\'])
-            .next()
-            .unwrap_or(query)
-            .trim();
-        boost_symbol_definitions(index, scores, symbol, max_score * 3.0, allowed)?;
-    } else {
-        boost_path_keyword_matches(index, scores, query, max_score);
-        for symbol in embedded_symbols(query) {
-            boost_symbol_definitions(index, scores, &symbol, max_score * 1.5, allowed)?;
-        }
-    }
-    Ok(())
-}
-
-fn boost_symbol_definitions(
-    index: &Codebase,
-    scores: &mut HashMap<usize, f32>,
-    symbol: &str,
-    boost_unit: f32,
-    allowed: Option<&HashSet<usize>>,
-) -> Result<()> {
-    let symbol_lower = symbol.to_ascii_lowercase();
-    let mut boosted_non_candidates = Vec::new();
-    let mut content_by_file = HashMap::<String, String>::new();
-
-    if let Some(indices) = index.symbol_definition_chunks.get(&symbol_lower) {
-        for &idx in indices {
-            if allowed.is_some_and(|allowed| !allowed.contains(&idx)) {
-                continue;
-            }
-            let multiplier = symbol_definition_multiplier(index, idx, &symbol_lower);
-            if let Some(score) = scores.get_mut(&idx) {
-                *score += boost_unit * multiplier;
-            } else if multiplier > 1.0 {
-                boosted_non_candidates.push((idx, boost_unit * multiplier));
-            }
-        }
-    } else {
-        for (&idx, score) in scores.iter_mut() {
-            if allowed.is_some_and(|allowed| !allowed.contains(&idx)) {
-                continue;
-            }
-            let content = index.chunk_content_cached(&index.chunks[idx], &mut content_by_file)?;
-            if chunk_defines_symbol(&content, symbol) {
-                *score += boost_unit * symbol_definition_multiplier(index, idx, &symbol_lower);
-            }
-        }
-    }
-
-    for (idx, score) in boosted_non_candidates {
-        scores.insert(idx, score);
-    }
-    Ok(())
-}
-
-fn symbol_definition_multiplier(index: &Codebase, idx: usize, symbol_lower: &str) -> f32 {
-    let stem = Path::new(index.chunk_file_path(&index.chunks[idx]))
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if stem_matches(&stem, symbol_lower) {
-        1.5
-    } else {
-        1.0
-    }
-}
-
-fn boost_path_keyword_matches(
-    index: &Codebase,
-    scores: &mut HashMap<usize, f32>,
-    query: &str,
-    max_score: f32,
-) {
-    let keywords = tokenize(query)
-        .into_iter()
-        .filter(|word| word.len() > 2 && !STOPWORDS.contains(&word.as_str()))
-        .collect::<HashSet<_>>();
-    if keywords.is_empty() {
+    let max_file_sum = file_sums.values().copied().fold(0.0f32, f32::max);
+    if max_file_sum <= 0.0 {
         return;
     }
-    for (&idx, score) in scores.iter_mut() {
-        let path = Path::new(index.chunk_file_path(&index.chunks[idx]));
-        let mut parts = HashSet::new();
-        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-            parts.extend(split_identifier(stem));
-        }
-        if let Some(parent) = path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
+    for (idx, score) in scores.iter_mut() {
+        let file_id = index.chunks[*idx].file_id;
+        if best_by_file
+            .get(&file_id)
+            .is_some_and(|(best_idx, _)| best_idx == idx)
         {
-            parts.extend(split_identifier(parent));
-        }
-        let matches = keywords
-            .iter()
-            .filter(|keyword| parts.iter().any(|part| prefix_overlap(keyword, part)))
-            .count();
-        if matches > 0 {
-            *score += max_score * (matches as f32 / keywords.len() as f32);
+            *score += max_score * 0.2 * file_sums[&file_id] / max_file_sum;
         }
     }
 }
 
-fn embedded_symbols(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|part| {
-            part.len() > 3
-                && part.chars().any(|c| c.is_ascii_uppercase())
-                && part.chars().any(|c| c.is_ascii_lowercase())
-        })
-        .map(str::to_string)
-        .collect()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn chunk_defines_symbol(content: &str, symbol: &str) -> bool {
-    let needles = [
-        format!("class {symbol}"),
-        format!("interface {symbol}"),
-        format!("struct {symbol}"),
-        format!("enum {symbol}"),
-        format!("record {symbol}"),
-        format!(" {symbol}("),
-    ];
-    needles.iter().any(|needle| content.contains(needle))
-}
-
-fn stem_matches(stem: &str, name: &str) -> bool {
-    let stem_norm = stem.replace('_', "");
-    stem == name
-        || stem_norm == name
-        || stem.trim_end_matches('s') == name
-        || stem_norm.trim_end_matches('s') == name
-}
-
-fn prefix_overlap(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
+    #[test]
+    fn query_shape_routes_exact_symbols() {
+        assert!(is_symbol_query("TryOpenExpeditionPanel"));
+        assert!(!is_symbol_query("session"));
+        assert!(!is_symbol_query("how session state is restored"));
     }
-    let (shorter, longer) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    shorter.len() >= 3 && longer.starts_with(shorter)
 }
-
-fn path_penalty(path: &str) -> f32 {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("/test")
-        || lower.contains("tests/")
-        || lower.ends_with("test.cs")
-        || lower.ends_with("test.java")
-    {
-        return 0.75;
-    }
-    if lower.contains("/examples/") || lower.contains("/samples/") {
-        return 0.85;
-    }
-    if lower.contains("/compat/") || lower.contains("/legacy/") {
-        return 0.9;
-    }
-    1.0
-}
-
-const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from", "has", "have",
-    "how", "if", "in", "is", "it", "not", "of", "on", "or", "the", "to", "was", "what", "when",
-    "where", "which", "who", "why", "with",
-];

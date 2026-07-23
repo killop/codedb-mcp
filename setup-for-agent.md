@@ -1,332 +1,103 @@
-# setup-for-agent
+# codebase-mcp setup for an agent
 
-This file is for agents installing `codedb-mcp` into a target repository.
+Use this guide to prepare one repository for the packaged `codedb-mcp` server.
+The setup is local and explicit: project configuration and generated indexes
+stay under `<repo-root>/.codedb-mcp`. No model download or external model API is
+required.
 
-Do not treat the `codedb-mcp` skill as the installer. The skill explains how to use the MCP tools after the server is already configured. This setup guide prepares project-local files, prefers an existing default HuggingFace cache when present, falls back to a second-drive cache when it is not present, and then leaves agent-specific MCP registration to the active agent.
+The `codedb-mcp` skill explains tool usage after setup. This guide prepares the
+project and leaves agent-specific MCP registration to the active agent and the
+human.
 
 ## Inputs
 
-- `<repo-root>`: target codebase root.
-- `<codedb-package-root>`: this repository or a copied standalone package that contains `skills/codedb-mcp/assets/codebase-mcp.exe`.
-- `<model-dir>`: the final absolute model directory written to config. On Windows, if the default HuggingFace hub cache exists, use it. If it does not exist, choose the second available drive by sorted drive letter. For C/D/E drives, use `D:\codedb-mcp-cache\models\potion-code-16M`; for C/E/F drives, use `E:\codedb-mcp-cache\models\potion-code-16M`.
+- `<repo-root>`: absolute path of the repository to index.
+- `<package-root>`: absolute path of this `codebase-mcp` package.
+- Server executable:
+  `<package-root>\skills\codedb-mcp\assets\codebase-mcp.exe`.
 
-The config must contain the resolved absolute model path, not a model ID and not a relative path.
-
-## Setup Steps
-
-1. Create the project-local codedb directory and choose a model directory:
+## 1. Create the project-local directory
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "<repo-root>\.codedb-mcp" | Out-Null
-
-function Test-CodedbModelLayout([string]$Path) {
-  return (
-    (Test-Path -LiteralPath (Join-Path $Path "tokenizer.json")) -and
-    (Test-Path -LiteralPath (Join-Path $Path "model.safetensors")) -and
-    (
-      (Test-Path -LiteralPath (Join-Path $Path "config.json")) -or
-      (Test-Path -LiteralPath (Join-Path $Path "config_sentence_transformers.json"))
-    )
-  )
-}
-
-function Get-DefaultPotionSnapshot([string]$Hub) {
-  $repo = Join-Path $Hub "models--minishlab--potion-code-16M"
-  $refsMain = Join-Path $repo "refs\main"
-  if (Test-Path -LiteralPath $refsMain) {
-    $commit = (Get-Content -LiteralPath $refsMain -Raw).Trim()
-    $snapshot = Join-Path $repo "snapshots\$commit"
-    if (Test-CodedbModelLayout $snapshot) {
-      return $snapshot
-    }
-  }
-  $snapshots = Join-Path $repo "snapshots"
-  if (Test-Path -LiteralPath $snapshots) {
-    $candidate = Get-ChildItem -LiteralPath $snapshots -Directory |
-      Sort-Object Name |
-      Where-Object { Test-CodedbModelLayout $_.FullName } |
-      Select-Object -First 1
-    if ($candidate) {
-      return $candidate.FullName
-    }
-  }
-  return $null
-}
-
-$defaultHfHome = Join-Path $env:USERPROFILE ".cache\huggingface"
-$defaultHub = Join-Path $defaultHfHome "hub"
-$existingSnapshot = if (Test-Path -LiteralPath $defaultHub) { Get-DefaultPotionSnapshot $defaultHub } else { $null }
-
-if ($existingSnapshot) {
-  $modelDir = $existingSnapshot
-  $hfHome = $defaultHfHome
-  $downloadModel = $false
-} elseif (Test-Path -LiteralPath $defaultHub) {
-  $modelDir = Join-Path $defaultHub "codedb-mcp\models\potion-code-16M"
-  $hfHome = $defaultHfHome
-  $downloadModel = $true
-} else {
-  $drives = @(Get-PSDrive -PSProvider FileSystem |
-    Where-Object { $_.Root -match '^[A-Z]:\\$' -and (Test-Path -LiteralPath $_.Root) } |
-    Sort-Object Name)
-  if ($drives.Count -eq 0) {
-    throw "No filesystem drive found for codedb model cache."
-  }
-  $modelDrive = if ($drives.Count -gt 1) { $drives[1].Root } else { $drives[0].Root }
-  $modelDir = Join-Path $modelDrive "codedb-mcp-cache\models\potion-code-16M"
-  $hfHome = Join-Path $modelDrive "codedb-mcp-cache\huggingface"
-  $downloadModel = $true
-}
-
-if ($downloadModel) {
-  New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
-}
-New-Item -ItemType Directory -Force -Path $hfHome | Out-Null
-$modelForToml = $modelDir.Replace('\', '/')
-Write-Host "Selected codedb model directory: $modelForToml"
+$repoRoot = (Resolve-Path '<repo-root>').Path
+$packageRoot = (Resolve-Path '<package-root>').Path
+$codedbDir = Join-Path $repoRoot '.codedb-mcp'
+New-Item -ItemType Directory -Force -Path $codedbDir | Out-Null
 ```
 
-2. Download `minishlab/potion-code-16M` only when the selected directory does not already contain a valid default-cache snapshot:
+## 2. Create the configuration
+
+Copy the packaged template if the project does not already have a config:
 
 ```powershell
-if ($downloadModel) {
-  $env:HF_HOME = $hfHome
-  $env:CODEDB_MODEL_DIR = $modelDir
-@'
-import os
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="minishlab/potion-code-16M",
-    local_dir=os.environ["CODEDB_MODEL_DIR"],
-    local_dir_use_symlinks=False,
-)
-'@ | python -
-} else {
-  Write-Host "Using existing default HuggingFace cache snapshot: $modelForToml"
+$template = Join-Path $packageRoot 'skills\codedb-mcp\assets\codedb-mcp.toml.template'
+$config = Join-Path $codedbDir 'codedb-mcp.toml'
+if (-not (Test-Path $config)) {
+  Copy-Item -LiteralPath $template -Destination $config
+}
+Write-Host "codedb config: $config"
+```
+
+Review these scan settings before the first index:
+
+- `extensions`: source extensions to parse.
+- `root_paths`: optional source roots; empty scans the repository root.
+- `include_paths`: extra roots that override ignored/skipped parents.
+- `exclude_paths`: path globs such as `**/Editor/**`.
+- `skip_dirs`: generated, dependency, build, and cache directories to skip.
+- `max_file_bytes` and `respect_gitignore`.
+
+The server supports C#, Java, Rust, Python, Lua, JavaScript/TypeScript, C, and
+C++. Retrieval does not apply language-specific natural-language query rules.
+
+## 3. Run an index check
+
+```powershell
+$exe = Join-Path $packageRoot 'skills\codedb-mcp\assets\codebase-mcp.exe'
+& $exe --config $config index $repoRoot
+if ($LASTEXITCODE -ne 0) {
+  throw "codebase-mcp index check failed with exit code $LASTEXITCODE"
 }
 ```
 
-If Python or `huggingface_hub` is not installed, use any available agent-safe download method that creates this final directory:
+The first run creates a cache-v28 index and graph sidecars under
+`<repo-root>/.codedb-mcp`. Old cache generations are ignored when their version
+or scan signature does not match.
+
+## 4. Check status
+
+```powershell
+& $exe --config $config --root $repoRoot tool codedb_status '{}'
+```
+
+A healthy status reports files, outlines, chunks, graph nodes/edges/communities,
+the graph-atlas retrieval mode, configured extensions, cache state, and storage
+directory.
+
+## 5. Register MCP only after confirmation
+
+Ask the human whether this specific agent should register the server. Do not
+silently edit global MCP settings.
+
+Generic command:
 
 ```text
-<absolute-model-dir-selected-in-step-1>
+<package-root>\skills\codedb-mcp\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
 ```
 
-The directory must contain the Model2Vec files expected by `model2vec-rs`, such as model config, tokenizer files, and safetensors files.
+See `skills/codedb-mcp/references/mcp-install.md` for a Codex-style registration
+shape. After registration, restart or reload the MCP session and call
+`codedb_status`.
 
-3. Generate `<repo-root>\.codedb-mcp\codedb-mcp.toml`.
+## Runtime behavior
 
-Use this demo configuration as the starting point. Humans can edit it before first indexing.
-When writing the actual file, set `[embedding].model` to `$modelForToml` from step 1. The `C:/Users/...` value below is an example for a machine where the default HuggingFace cache exists.
-
-```toml
-# codedb-mcp project configuration.
-# Keep this file inside the project root under .codedb-mcp so the index,
-# cache and MCP behavior travel with the codebase. The model path below must be
-# the selected absolute model directory.
-
-[scan]
-# Current indexed languages:
-# - C#: cs
-# - Java: java
-# - Rust: rs
-# - Python: py, pyw
-# - Lua: lua
-# - JavaScript/TypeScript: js, jsx, mjs, cjs, ts, tsx
-# - C/C++: c, h, cc, cpp, cxx, hpp, hh, hxx
-# Humans can remove or add extensions here before indexing.
-extensions = ["cs", "java", "rs", "py", "pyw", "lua", "js", "jsx", "mjs", "cjs", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"]
-
-# Skip extremely large generated files before parsing or embedding.
-max_file_bytes = 50000000
-
-# Respect .gitignore files under this project for the normal tree walk. Nested
-# Git worktrees/submodules under the target root are still scanned as source
-# directories; .git/info/exclude and global gitignore are not project boundaries.
-respect_gitignore = true
-
-# Optional scan roots relative to the project root. Empty means the whole root.
-# Unity runtime C# example:
-# root_paths = ["Assets", "Packages", "Library/PackageCache"]
-root_paths = []
-
-# Extra paths to include even when the normal scan would ignore them.
-# Unity projects often need Library/PackageCache while skipping the rest of Library.
-include_paths = ["Library/PackageCache"]
-
-# Glob paths to exclude after root/include selection. Unity runtime-only example:
-# exclude_paths = ["**/Editor", "**/Editor/**"]
-exclude_paths = []
-
-# Directory names to skip. A path listed in include_paths is still scanned even
-# when one of its parent directories is skipped here.
-skip_dirs = [
-  ".git",
-  ".hg",
-  ".svn",
-  ".vs",
-  ".idea",
-  ".gradle",
-  "node_modules",
-  "target",
-  "dist",
-  ".next",
-  ".svelte-kit",
-  "coverage",
-  "out",
-  ".codedb-mcp",
-  "Library",
-  "Temp",
-  "Logs",
-  "obj",
-  "bin",
-  "Build",
-  "Builds",
-  "UserSettings",
-]
-
-[embedding]
-# Absolute Model2Vec model directory selected during setup.
-model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
-
-[diagnostics]
-# Set timing=true only while benchmarking; it writes stage timings to stderr.
-timing = false
-
-# Emit a slow-file parse log for files at or above this many ms. 0 disables it.
-slow_file_ms = 0
-
-[logging]
-# Disabled by default. When enabled, MCP tool calls and file-watch digest
-# batches are written through a bounded non-blocking queue and a background
-# writer. codedb_bundle logs only its child tools with mode=bundle. Queue
-# overflow drops log lines instead of slowing indexing or MCP.
-enabled = false
-file = ".codedb-mcp/codedb-mcp.log"
-queue_capacity = 8192
-flush_interval_ms = 500
-
-[watch]
-# MCP mode is enabled by default. Filesystem events are queued and applied as
-# one live-incremental batch every poll_interval_seconds.
-# The same tick checks this config file. Scan-scope config changes trigger one
-# background full reindex; the old index keeps serving until the new one commits.
-enabled = true
-poll_interval_seconds = 5
-
-[storage]
-# Store generated data under the target project. Deleting this directory removes
-# all local codedb-mcp data for that project.
-enabled = true
-dir = ".codedb-mcp"
-```
-
-4. Run a local index check:
-
-```powershell
-<codedb-package-root>\skills\codedb-mcp\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml index <repo-root>
-```
-
-If this fails with a model load error, verify that `[embedding].model` points to the selected model directory and that the model files exist there.
-
-5. Update `<repo-root>\AGENTS.md` so future agents actively use `codedb-mcp` for code lookup.
-
-Read the existing file first and preserve its content. If the file does not exist, create it. Append the section below only when it is not already present:
-
-```markdown
-## 5. codedb-mcp 检索约定
-
-- 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
-- 当需要精确文本、正则或字符串搜索时，使用 `codedb_text_search`；如果结果看起来不完整，通过 `codedb_status`、扫描范围、监听状态和 codedb 重新索引流程排查。
-- 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
-- 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
-- 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。
-- 当一次任务需要多个搜索、outline、read 或依赖查询时，优先使用 `codedb_bundle`、`codedb_query` 或工具自带的 batch 参数，减少 MCP 往返和 token 消耗。
-- 当怀疑索引不新鲜或监听未生效时，先调用 `codedb_status`、`codedb_changes` 或 `codedb_hot` 检查状态。
-```
-
-PowerShell helper:
-
-```powershell
-$section = @'
-## 5. codedb-mcp 检索约定
-
-- 当需要按自然语言语义、业务概念或模糊描述查找代码时，优先使用 `codedb_search`，不要先大范围读取源码树。
-- 当需要精确文本、正则或字符串搜索时，使用 `codedb_text_search`；如果结果看起来不完整，通过 `codedb_status`、扫描范围、监听状态和 codedb 重新索引流程排查。
-- 当需要查找符号定义、文件大纲或读取局部代码上下文时，优先使用 `codedb_symbol`、`codedb_outline`、`codedb_read`，并用行号范围控制上下文大小。
-- 当需要查找符号引用、调用方或“哪里用了这个类/方法”时，优先使用 `codedb_callers`；如果已知定义位置，传入 `definition_path` 和 `definition_line`。
-- 当需要分析文件依赖、反向依赖或跨模块关系时，优先使用 `codedb_deps`。
-- 当一次任务需要多个搜索、outline、read 或依赖查询时，优先使用 `codedb_bundle`、`codedb_query` 或工具自带的 batch 参数，减少 MCP 往返和 token 消耗。
-- 当怀疑索引不新鲜或监听未生效时，先调用 `codedb_status`、`codedb_changes` 或 `codedb_hot` 检查状态。
-'@
-$path = Join-Path "<repo-root>" "AGENTS.md"
-if (Test-Path -LiteralPath $path) {
-  $content = Get-Content -LiteralPath $path -Raw
-  if ($content -notmatch '##\s*(\d+\.\s*)?codedb-mcp 检索约定') {
-    Add-Content -LiteralPath $path -Value "`r`n$section`r`n"
-  }
-} else {
-  Set-Content -LiteralPath $path -Value "# AGENTS.md`r`n`r`n$section`r`n"
-}
-```
-
-6. Ask the human whether this specific agent should register the MCP server.
-
-Do not silently edit agent-wide MCP settings. After the human agrees, configure the current agent using its own MCP mechanism. The command shape is:
-
-```text
-<codedb-package-root>\skills\codedb-mcp\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
-```
-
-For Codex-style TOML, the shape is:
-
-```toml
-[mcp_servers.codedb-mcp]
-command = "<codedb-package-root>\\skills\\codedb-mcp\\assets\\codebase-mcp.exe"
-args = [
-  "--config",
-  "<repo-root>\\.codedb-mcp\\codedb-mcp.toml",
-  "mcp",
-  "<repo-root>",
-]
-
-# Codex exec with approval=never cancels unapproved MCP tools.
-# Pre-approve the codedb tools the skill uses for repository analysis.
-[mcp_servers.codedb-mcp.tools.codedb_bundle]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_status]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_context]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_text_search]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_search]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_explore]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_read]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_outline]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_callers]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_deps]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_find]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_query]
-approval_mode = "approve"
-```
-
-After registration, restart or reload the agent MCP session and call `codedb_status`.
+- `[watch] enabled = true` keeps the index current through batched filesystem
+  events.
+- Scan-scope config changes trigger a background full reindex while the old
+  index remains available.
+- Cache commits are manifest-last so interrupted writes do not replace a valid
+  previous generation.
+- Exact text, word, caller, dependency, and graph sidecars are loaded or rebuilt
+  on demand.
+- Delete `<repo-root>/.codedb-mcp` only when the human explicitly wants to remove
+  all project-local generated data.

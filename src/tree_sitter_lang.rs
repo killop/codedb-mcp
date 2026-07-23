@@ -40,6 +40,57 @@ pub fn analyze_source(language: &str, content: &str) -> ParsedSource {
     }
 }
 
+pub fn mask_comments(language: &str, content: &str) -> String {
+    let Some(grammar) = grammar(language) else {
+        return content.to_string();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return content.to_string();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return content.to_string();
+    };
+
+    let mut ranges = Vec::new();
+    collect_comment_ranges(tree.root_node(), &mut ranges);
+    if ranges.is_empty() {
+        return content.to_string();
+    }
+
+    let mut bytes = content.as_bytes().to_vec();
+    for (start, end) in ranges {
+        let len = bytes.len();
+        let start = start.min(len);
+        let end = end.min(len);
+        for byte in &mut bytes[start..end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| content.to_string())
+}
+
+fn collect_comment_ranges(node: Node<'_>, ranges: &mut Vec<(usize, usize)>) {
+    if is_comment_node_kind(node.kind()) {
+        ranges.push((node.start_byte(), node.end_byte()));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comment_ranges(child, ranges);
+    }
+}
+
+fn is_comment_node_kind(kind: &str) -> bool {
+    kind == "comment"
+        || kind == "line_comment"
+        || kind == "block_comment"
+        || kind == "doc_comment"
+        || kind.ends_with("_comment")
+}
+
 fn grammar(language: &str) -> Option<Language> {
     match language {
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),

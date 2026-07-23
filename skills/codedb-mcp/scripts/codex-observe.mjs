@@ -23,11 +23,13 @@ Usage:
 Options:
   --project <path>      Target repository path. Defaults to current directory.
   --sessions <path>     Codex sessions directory. Defaults to ~/.codex/sessions.
+  --transcript <path>   Inspect an explicit Codex exec --json transcript. May be repeated.
   --since <duration>    Only scan sessions modified in this window. Examples: 2h, 24h, 7d. Default: 24h.
   --limit <n>           Max recent session files to inspect after filtering by mtime.
   --top <n>             Number of high-cost calls to show. Default: 12.
   --json                Emit machine-readable JSON instead of Markdown.
   --show-prompts        Include short user prompt previews in JSON output.
+  --fail-on-mcp-shell   Strict audit: exit with code 2 when source lookup shell/file calls occur after codedb_* in the same turn.
   --help                Show this help.
 `)
 }
@@ -36,11 +38,13 @@ function parseArgs(argv) {
   const out = {
     project: process.cwd(),
     sessions: defaultSessionsDir(),
+    transcripts: [],
     since: DEFAULT_SINCE,
     limit: 0,
     top: DEFAULT_TOP,
     json: false,
     showPrompts: false,
+    failOnMcpShell: false,
     help: false,
   }
 
@@ -52,10 +56,15 @@ function parseArgs(argv) {
       out.json = true
     } else if (arg === '--show-prompts') {
       out.showPrompts = true
+    } else if (arg === '--fail-on-mcp-shell') {
+      out.failOnMcpShell = true
     } else if (arg === '--project') {
       out.project = argv[++i] ?? out.project
     } else if (arg === '--sessions') {
       out.sessions = argv[++i] ?? out.sessions
+    } else if (arg === '--transcript') {
+      const transcript = argv[++i]
+      if (transcript) out.transcripts.push(transcript)
     } else if (arg === '--since') {
       out.since = argv[++i] ?? out.since
     } else if (arg === '--limit') {
@@ -68,6 +77,7 @@ function parseArgs(argv) {
   }
 
   out.project = path.resolve(out.project)
+  out.transcripts = out.transcripts.map(item => path.resolve(item))
   return out
 }
 
@@ -327,11 +337,9 @@ function classifyShellCodeLookup(args, project) {
   if (/(^|[\/\s])(\.agents|skills|\.codedb-mcp)([\/\s]|$)/.test(commandText)) return null
   if (/\b(agents\.md|claude\.md|setup-for-agent\.md|skill\.md|package-lock\.json)\b/.test(commandText)) return null
 
-  const hasSourceHint = /\.(cs|java|rs|py|pyw|lua|js|jsx|mjs|cjs|ts|tsx|c|h|cc|cpp|cxx|hpp|hh|hxx)\b/.test(commandText)
-    || /\b(assets\/scripts|assets\/plugins|packages|library\/packagecache|src|source|runtime|hotfix)\b/.test(commandText)
   const broadSearch = /\b(rg|grep|select-string|findstr)\b/.test(commandText)
-  const fileDump = /\b(get-content|cat|type)\b/.test(commandText) && hasSourceHint
-  const treeLookup = /\b(get-childitem|ls|dir)\b/.test(commandText) && hasSourceHint
+  const fileDump = /\b(get-content|cat|type)\b/.test(commandText)
+  const treeLookup = /\b(get-childitem|ls|dir)\b/.test(commandText)
   if (!broadSearch && !fileDump && !treeLookup) return null
   if (!inProject && !commandText.includes(normalizedProject)) return null
   return 'shell_or_file_lookup'
@@ -354,11 +362,11 @@ function summarizeArgs(call) {
     const range = args.line_start || args.line_end ? ` lines=${args.line_start ?? ''}-${args.line_end ?? ''}` : ''
     return `path=${shortPath(args.path)}${range}${args.compact ? ' compact=true' : ''}`
   }
-  if (call.name === 'codedb_search' || call.name === 'codedb_text_search' || call.name === 'codedb_context' || call.name === 'codedb_explore') {
-    const q = args.query ? `query=${clip(String(args.query), 60)}` : Array.isArray(args.queries) ? `queries=${args.queries.length}` : ''
+  if (call.name === 'codedb_search' || call.name === 'codedb_context' || call.name === 'codedb_flow') {
+    const q = args.task ? `task=${clip(String(args.task), 60)}` : args.query ? `query=${clip(String(args.query), 60)}` : Array.isArray(args.queries) ? `queries=${args.queries.length}` : ''
     const max = args.max_results ? ` max_results=${args.max_results}` : args.max_files ? ` max_files=${args.max_files}` : ''
     const glob = args.path_glob ? ` path_glob=${shortPath(args.path_glob)}` : ''
-    const budget = args.max_chars ? ` max_chars=${args.max_chars}` : ''
+    const budget = args.max_tokens ? ` max_tokens=${args.max_tokens}` : ''
     return `${q}${max}${glob}${budget}`.trim()
   }
   if (call.name === 'codedb_callers') {
@@ -466,6 +474,7 @@ async function parseSessionFile(source, options) {
           success: null,
           codeLookupKind: null,
           bundleChildren: [],
+          sequence: session.calls.length + 1,
         }
         call.codeLookupKind = classifyNonCodedbLookup(call.name, args, options.project)
         session.calls.push(call)
@@ -507,12 +516,137 @@ async function parseSessionFile(source, options) {
   return session
 }
 
+async function parseExecTranscriptFile(filePath, options) {
+  const stat = fs.statSync(filePath)
+  const session = {
+    file: filePath,
+    cwd: options.project,
+    sessionId: path.basename(filePath, path.extname(filePath)),
+    startedAt: '',
+    mtime: new Date(stat.mtimeMs).toISOString(),
+    size: stat.size,
+    calls: [],
+    bundleChildren: [],
+    modelTokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0 },
+    modelTokenEvents: 0,
+    turns: new Map([[1, { turn: 1, promptPreview: '', calls: [] }]]),
+  }
+  if (stat.size > MAX_STREAM_FILE_BYTES) {
+    session.skipped = `transcript file exceeds ${MAX_STREAM_FILE_BYTES} bytes`
+    return session
+  }
+
+  const callsById = new Map()
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' })
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue
+      let entry
+      try {
+        entry = JSON.parse(line)
+      } catch {
+        continue
+      }
+
+      if (entry.type === 'turn.completed' && entry.usage) {
+        const usage = entry.usage
+        session.modelTokens.input += Math.max(0, (usage.input_tokens ?? 0) - (usage.cached_input_tokens ?? 0))
+        session.modelTokens.cachedInput += usage.cached_input_tokens ?? 0
+        session.modelTokens.output += usage.output_tokens ?? 0
+        session.modelTokens.reasoning += usage.reasoning_output_tokens ?? 0
+        session.modelTokenEvents += 1
+        continue
+      }
+
+      const item = entry.item
+      if (!item || (entry.type !== 'item.started' && entry.type !== 'item.completed')) continue
+      if (entry.type === 'item.started') {
+        const call = execItemToCall(item, session, options)
+        if (!call) continue
+        session.calls.push(call)
+        callsById.set(call.callId, call)
+        session.turns.get(1).calls.push(call)
+        continue
+      }
+
+      const call = callsById.get(item.id) ?? execItemToCall(item, session, options)
+      if (!call) continue
+      if (!callsById.has(call.callId)) {
+        session.calls.push(call)
+        callsById.set(call.callId, call)
+        session.turns.get(1).calls.push(call)
+      }
+      const output = execItemOutputText(item)
+      call.outputChars = output.length
+      call.outputTextChars = output.length
+      call.approxOutputTokens = approxTokens(output.length)
+      call.success = item.status === 'completed' || item.exit_code === 0 || !item.error
+      if (call.name === 'codedb_bundle') {
+        call.bundleChildren = parseBundleChildren(output)
+        session.bundleChildren.push(...call.bundleChildren.map(child => ({
+          ...child,
+          sessionId: session.sessionId,
+          turn: call.turn,
+          parentCallId: call.callId,
+          parentTimestamp: call.timestamp,
+        })))
+      }
+    }
+  } finally {
+    rl.close()
+    stream.destroy()
+  }
+  return session
+}
+
+function execItemToCall(item, session, options) {
+  if (item.type !== 'mcp_tool_call' && item.type !== 'command_execution') return null
+  const name = item.type === 'mcp_tool_call' ? item.tool : 'shell_command'
+  const args = item.type === 'mcp_tool_call'
+    ? (item.arguments ?? {})
+    : { command: item.command ?? '', workdir: options.project }
+  const call = {
+    callId: item.id ?? `${session.sessionId}:${session.calls.length + 1}`,
+    sessionId: session.sessionId,
+    sessionFile: session.file,
+    timestamp: '',
+    turn: 1,
+    name,
+    namespace: item.server ?? '',
+    args,
+    argsChars: JSON.stringify(args).length,
+    outputChars: 0,
+    outputTextChars: 0,
+    approxOutputTokens: 0,
+    wallSeconds: null,
+    success: null,
+    codeLookupKind: null,
+    bundleChildren: [],
+    sequence: session.calls.length + 1,
+  }
+  call.codeLookupKind = classifyNonCodedbLookup(call.name, args, options.project)
+  return call
+}
+
+function execItemOutputText(item) {
+  if (item.type === 'command_execution') return String(item.aggregated_output ?? '')
+  const result = item.result
+  if (!result || typeof result !== 'object') return ''
+  const content = Array.isArray(result.content) ? result.content : []
+  return content
+    .map(part => typeof part?.text === 'string' ? part.text : '')
+    .filter(Boolean)
+    .join('\n')
+}
+
 function aggregate(sessions, options, scannedFiles, elapsedMs) {
   const calls = sessions.flatMap(session => session.calls)
   const codedbCalls = calls.filter(call => isCodedbTool(call.name))
   const bundleCalls = codedbCalls.filter(call => call.name === 'codedb_bundle')
   const childCalls = sessions.flatMap(session => session.bundleChildren)
   const shellLookupCalls = calls.filter(call => call.codeLookupKind)
+  const mcpShellLockViolations = findMcpShellLockViolations(sessions)
   const modelTokens = sessions.reduce((acc, session) => {
     acc.input += session.modelTokens.input
     acc.cachedInput += session.modelTokens.cachedInput
@@ -555,6 +689,7 @@ function aggregate(sessions, options, scannedFiles, elapsedMs) {
     toolOutputTokens,
     codedbOutputTokens,
     shellLookupOutputTokens,
+    mcpShellLockViolations,
     codedbCalls: codedbCalls.length,
     bundleCalls: bundleCalls.length,
     bundleChildCalls: childCalls.length,
@@ -562,7 +697,7 @@ function aggregate(sessions, options, scannedFiles, elapsedMs) {
     directStats,
     childStats,
     topCalls,
-    findings: buildFindings(sessions, calls, codedbCalls, shellLookupCalls),
+    findings: buildFindings(sessions, calls, codedbCalls, shellLookupCalls, mcpShellLockViolations),
   }
 }
 
@@ -603,8 +738,47 @@ function average(values) {
   return values.reduce((acc, value) => acc + value, 0) / values.length
 }
 
-function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
+function findMcpShellLockViolations(sessions) {
+  const violations = []
+  for (const session of sessions) {
+    for (const turn of session.turns.values()) {
+      let lockCall = null
+      for (const call of turn.calls) {
+        if (isCodedbTool(call.name)) {
+          lockCall ??= call
+          continue
+        }
+        if (lockCall && call.codeLookupKind) {
+          violations.push({
+            sessionId: session.sessionId,
+            sessionFile: session.file,
+            turn: turn.turn,
+            lockTool: lockCall.name,
+            lockArgs: summarizeArgs(lockCall),
+            shellTool: call.name,
+            shellArgs: summarizeArgs(call),
+            tokens: call.approxOutputTokens,
+            timestamp: call.timestamp,
+          })
+        }
+      }
+    }
+  }
+  return violations
+}
+
+function buildFindings(sessions, calls, codedbCalls, shellLookupCalls, mcpShellLockViolations) {
   const findings = []
+  if (mcpShellLockViolations.length > 0) {
+    findings.push({
+      title: `${mcpShellLockViolations.length} post-codedb shell/file supplemental lookup call${mcpShellLockViolations.length === 1 ? '' : 's'}`,
+      impact: 'low',
+      tokens: sum(mcpShellLockViolations, item => item.tokens),
+      detail: mcpShellLockViolations.slice(0, 5).map(item => `${item.sessionId} t${item.turn}: after ${item.lockTool} (${item.lockArgs}) used ${item.shellTool} (${item.shellArgs}) ~${formatInt(item.tokens)} tokens`),
+      recommendation: 'After codedb_* starts, keep repository lookup inside codedb_* and continue from exact paths, identifiers, symbols, callers, deps, or quoted strings already discovered; state remaining gaps instead of using shell/rg for source lookup.',
+    })
+  }
+
   const largeCodedb = codedbCalls.filter(call => call.approxOutputTokens >= LARGE_OUTPUT_TOKEN_THRESHOLD)
   if (largeCodedb.length > 0) {
     findings.push({
@@ -615,7 +789,7 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
         .sort((a, b) => b.approxOutputTokens - a.approxOutputTokens)
         .slice(0, 5)
         .map(call => `${call.name} t${call.turn} ~${formatInt(call.approxOutputTokens)} tokens (${summarizeArgs(call)})`),
-      recommendation: 'Prefer codedb_context for answer planning, codedb_explore with max_chars for snippets, compact=true and smaller max_results for broad search, and line ranges for reads.',
+      recommendation: 'Prefer codedb_flow for broad answer planning, codedb_context only for larger exact-reference packs, paths_only/compact search for exact lookup, and line-scoped reads after outline.',
     })
   }
 
@@ -636,7 +810,7 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
   }
 
   const broadSearches = codedbCalls.filter(call => {
-    if (call.name !== 'codedb_search' && call.name !== 'codedb_text_search') return false
+    if (call.name !== 'codedb_search') return false
     const args = call.args ?? {}
     const maxResults = Number(args.max_results ?? 0)
     return call.approxOutputTokens >= LARGE_OUTPUT_TOKEN_THRESHOLD || maxResults >= 80
@@ -647,27 +821,7 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
       impact: 'medium',
       tokens: sum(broadSearches, call => Math.max(0, call.approxOutputTokens - 1200)),
       detail: broadSearches.slice(0, 5).map(call => `t${call.turn} ${call.name} ${summarizeArgs(call)} ~${formatInt(call.approxOutputTokens)} tokens`),
-      recommendation: 'For exploratory questions use codedb_context. For exact lookup use compact=true, narrower path_glob, and smaller max_results before reading code.',
-    })
-  }
-
-  const missedBundleTurns = []
-  for (const session of sessions) {
-    for (const turn of session.turns.values()) {
-      const direct = turn.calls.filter(call => isCodedbTool(call.name) && call.name !== 'codedb_bundle')
-      const hasBundle = turn.calls.some(call => call.name === 'codedb_bundle')
-      if (!hasBundle && direct.length >= 2) {
-        missedBundleTurns.push({ sessionId: session.sessionId, turn: turn.turn, count: direct.length, tools: direct.map(call => call.name) })
-      }
-    }
-  }
-  if (missedBundleTurns.length > 0) {
-    findings.push({
-      title: `${missedBundleTurns.length} turn${missedBundleTurns.length === 1 ? '' : 's'} could have used codedb_bundle`,
-      impact: 'low',
-      tokens: missedBundleTurns.length * 80,
-      detail: missedBundleTurns.slice(0, 5).map(item => `${item.sessionId} t${item.turn}: ${summarizeToolSequence(item.tools)}`),
-      recommendation: 'Batch status/search/outline/read/callers/deps into codedb_bundle when more than one codedb lookup is needed.',
+      recommendation: 'For exploratory questions use codedb_flow first. For exact lookup use paths_only, narrower path_glob, and smaller max_results before reading code.',
     })
   }
 
@@ -677,7 +831,7 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
       impact: 'medium',
       tokens: shellLookupCalls.reduce((acc, call) => acc + call.approxOutputTokens, 0),
       detail: shellLookupCalls.slice(0, 5).map(call => `t${call.turn} ${summarizeArgs(call)} ~${formatInt(call.approxOutputTokens)} tokens`),
-      recommendation: 'Use codedb_text_search, codedb_search, codedb_find, codedb_outline, and codedb_read instead of shell/file lookup for repository code retrieval.',
+      recommendation: 'Use codedb_* for broad discovery and graph-shaped lookup; keep shell/file lookup supplemental, narrow, read-only, and based on exact evidence terms.',
     })
   }
 
@@ -685,8 +839,8 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
   for (const session of sessions) {
     for (const turn of session.turns.values()) {
       const names = turn.calls.map(call => call.name)
-      const hasContext = names.includes('codedb_context') || names.includes('codedb_explore')
-      const hasSearch = names.includes('codedb_search') || names.includes('codedb_text_search')
+      const hasContext = names.includes('codedb_context') || names.includes('codedb_flow')
+      const hasSearch = names.includes('codedb_search')
       const followups = names.filter(name => name === 'codedb_outline' || name === 'codedb_read' || name === 'codedb_deps' || name === 'codedb_callers').length
       if (!hasContext && hasSearch && followups >= 2) {
         contextMisses.push({ sessionId: session.sessionId, turn: turn.turn, names })
@@ -695,11 +849,11 @@ function buildFindings(sessions, calls, codedbCalls, shellLookupCalls) {
   }
   if (contextMisses.length > 0) {
     findings.push({
-      title: `${contextMisses.length} exploratory turn${contextMisses.length === 1 ? '' : 's'} likely fit codedb_context/codedb_explore`,
+      title: `${contextMisses.length} exploratory turn${contextMisses.length === 1 ? '' : 's'} likely fit codedb_flow`,
       impact: 'low',
       tokens: contextMisses.length * 500,
       detail: contextMisses.slice(0, 5).map(item => `${item.sessionId} t${item.turn}: ${summarizeToolSequence(item.names.filter(isCodedbTool))}`),
-      recommendation: 'Start broad feature or flow questions with codedb_context; use codedb_explore only when snippets are needed.',
+      recommendation: 'Start broad feature or flow questions with codedb_flow; use codedb_context only for a larger exact-reference pack, and use outline plus line-scoped reads when snippets are needed.',
     })
   }
 
@@ -737,6 +891,7 @@ function renderMarkdown(report) {
   lines.push(`| Tool output tokens injected into context | ${formatInt(report.toolOutputTokens)} |`)
   lines.push(`| codedb tool output tokens | ${formatInt(report.codedbOutputTokens)} |`)
   lines.push(`| non-codedb shell/file lookup output tokens | ${formatInt(report.shellLookupOutputTokens)} |`)
+  lines.push(`| post-codedb shell/file lookup calls | ${formatInt(report.mcpShellLockViolations.length)} |`)
   lines.push(`| codedb calls / bundles / bundle children | ${formatInt(report.codedbCalls)} / ${formatInt(report.bundleCalls)} / ${formatInt(report.bundleChildCalls)} |`)
   lines.push('')
   lines.push('## codedb Calls')
@@ -807,26 +962,39 @@ async function main() {
   }
   const started = performance.now()
   const sinceMs = parseDurationMs(options.since)
-  const candidates = discoverJsonlFiles(options.sessions, sinceMs, options.limit)
-  const sources = []
-
-  for (const candidate of candidates) {
-    const meta = await readSessionMeta(candidate.path)
-    if (!meta) continue
-    if (!pathMatchesProject(meta.cwd, options.project)) continue
-    sources.push({ ...candidate, meta })
-  }
-
+  let scannedFiles = 0
   const sessions = []
-  for (const source of sources) {
-    sessions.push(await parseSessionFile(source, options))
+
+  if (options.transcripts.length > 0) {
+    scannedFiles = options.transcripts.length
+    for (const transcript of options.transcripts) {
+      sessions.push(await parseExecTranscriptFile(transcript, options))
+    }
+  } else {
+    const candidates = discoverJsonlFiles(options.sessions, sinceMs, options.limit)
+    scannedFiles = candidates.length
+    const sources = []
+
+    for (const candidate of candidates) {
+      const meta = await readSessionMeta(candidate.path)
+      if (!meta) continue
+      if (!pathMatchesProject(meta.cwd, options.project)) continue
+      sources.push({ ...candidate, meta })
+    }
+
+    for (const source of sources) {
+      sessions.push(await parseSessionFile(source, options))
+    }
   }
 
-  const report = aggregate(sessions, options, candidates.length, performance.now() - started)
+  const report = aggregate(sessions, options, scannedFiles, performance.now() - started)
   if (options.json) {
     console.log(JSON.stringify(report, null, 2))
   } else {
     console.log(renderMarkdown(report))
+  }
+  if (options.failOnMcpShell && report.mcpShellLockViolations.length > 0) {
+    process.exitCode = 2
   }
 }
 

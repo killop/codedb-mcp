@@ -1,10 +1,8 @@
 /target
 .mcp_data/
-.codedb-mcp/index.bin
-.codedb-mcp/manifest.json
-.codedb-mcp/bm25.postings
-.codedb-mcp/*.tmp
-.codedb-mcp/*.bin
+.codedb-mcp/*
+!.codedb-mcp/codedb-mcp.toml
+!.codedb-mcp/observe-u3d-12h.json
 skills/code-module-atlas/assets/viewer/node_modules/
 skills/code-module-atlas/assets/viewer/dist/
 skills/code-module-atlas/assets/viewer/.chrome*/

@@ -223,13 +223,6 @@ pub struct Chunk {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticUnit {
-    pub id: usize,
-    pub file_path: String,
-    pub text: String,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WordHit {
     pub file_id: u32,
@@ -365,11 +358,4 @@ pub struct SearchHit {
     pub line: usize,
     pub text: String,
     pub scope: Option<Scope>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChunkSearchHit {
-    pub chunk: Chunk,
-    pub score: f32,
-    pub source: &'static str,
 }

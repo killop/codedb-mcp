@@ -20,6 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+const MCP_INSTRUCTIONS: &str = concat!(
+    "Use codedb_* for indexed source lookup. Start broad with unscoped codedb_flow to read the graph atlas, then choose a structural prefix and call scoped codedb_flow with the same opaque task label and path_glob. ",
+    "Atlas rows written as parent: child(count) are leaf choices: scope first to the entry leaf parent/child/**, never to the broad parent/**. Once an exact body is found, follow its qualified/tail handoffs across directories; open another scoped flow only when the current evidence has no exact next path. ",
+    "Follow exact returned paths/symbols/refs/deps/callpaths progressively. Prefer callpath/deps/symbol body before reads. A symbol body includes compact deterministic executable corridor paths, continuing without a fixed traversal depth until a real branch, terminal, or cycle. Use callpath when endpoints are known; use symbol expand=true only when the compact corridor identifies a needed branch whose bodies are still missing. When one outline shows several answer-critical members in the same file, rerun that outline once with include_connected_ranges=true, then execute one returned connected_range read instead of sequential symbol calls. That read is a complete same-file evidence closure: do not reopen contained members or overlapping ranges. Do not request connected ranges preemptively for every file. ",
+    "Follow structural roots, community boundaries, weighted bridges, literal bridge leads, and active-body qualified/tail handoffs before declaring a static gap. Follow an exact qualified call target before search or find. Do not derive keywords, synonyms, facets, morphology, language rules, or repository-specific search terms from the task. ",
+    "Never invent or probe lifecycle symbol names. Request only symbols returned verbatim by flow, outline, body handoffs, callers, search, or callpath; after one missing exact symbol in a known file, call that file's outline once instead of guessing siblings. ",
+    "There is no source-call quota, but stop when every requested phase has one active body, adjacent phases have a direct handoff or graph path, and the final readiness callback has an active body. The final endpoint body is a hard stop: answer immediately. Traverse phases once; do not return to closed phases for constants, assets, compile variants, callers, later readiness variants, or a second verification pass unless downstream evidence contradicts the chain."
+);
+
 pub fn serve(
     manager: Arc<ProjectManager>,
     watch_enabled: bool,
@@ -167,6 +176,7 @@ impl ServerHandler for CodedbServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codedb-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(MCP_INSTRUCTIONS)
     }
 
     fn list_tools(
@@ -189,15 +199,23 @@ impl ServerHandler for CodedbServer {
         _context: RequestContext<rmcp::RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let text = dispatch_tool(self.manager.as_ref(), request.name.as_ref(), &args);
-        let is_error = text.starts_with("error:");
-        let content = vec![Content::text(text)];
-        let result = if is_error {
-            CallToolResult::error(content)
-        } else {
-            CallToolResult::success(content)
-        };
-        future::ready(Ok(result))
+        let name = request.name.to_string();
+        let manager = self.manager.clone();
+        async move {
+            let text =
+                tokio::task::spawn_blocking(move || dispatch_tool(manager.as_ref(), &name, &args))
+                    .await
+                    .map_err(|err| {
+                        McpError::internal_error(format!("codedb tool task failed: {err}"), None)
+                    })?;
+            let is_error = text.starts_with("error:");
+            let content = vec![Content::text(text)];
+            Ok(if is_error {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            })
+        }
     }
 
     fn on_initialized(
@@ -230,209 +248,146 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "codedb_tree",
-                "description": "Whole-repo file tree with per-file language, line counts, and symbol counts. This Rust build indexes source files from the explicit config.",
-                "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}
+                "description": "Bounded tree summary; focus with path_prefix/path_glob.",
+                "inputSchema": {"type": "object", "properties": {"max_depth": {"type": "integer"}, "max_results": {"type": "integer"}, "path_prefix": {"type": "string"}, "path_glob": {"type": "string"}, "include_files": {"type": "boolean"}, "full": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_outline",
-                "description": "Symbol outline of one file: classes, methods, properties, imports, and line numbers.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "compact": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["path"]}
+                "description": "File symbol outline with structural body candidates and literal bridge leads. If several returned members are needed, rerun once with include_connected_ranges=true to get graph-connected compact read ranges; do not enable it preemptively for every file.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "compact": {"type": "boolean"}, "skeleton": {"type": "boolean"}, "include_body_followups": {"type": "boolean"}, "include_connected_ranges": {"type": "boolean", "description": "Emit same-file call/reference connected components as exact compact read ranges; request only after the base outline shows several needed members."}, "project": {"type": "string"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_symbol",
-                "description": "Find where a named symbol is defined across the index.",
-                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "body": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["name"]}
+                "description": "Symbol lookup; body=true returns the complete active body first plus direct/tail/literal handoffs and compact deterministic executable corridor paths until a branch, terminal, or cycle. Add expand=true only when those corridor bodies or deeper references are actually needed.",
+                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "prefix": {"type": "string"}, "pattern": {"type": "string"}, "kind": {"type": "string"}, "path": {"type": "string"}, "definition_path": {"type": "string"}, "path_glob": {"type": "string"}, "fuzzy": {"type": "boolean"}, "body": {"type": "boolean"}, "expand": {"type": "boolean", "description": "Add deep reference/continuation evidence after the complete body; default false for progressive disclosure."}, "max_results": {"type": "integer"}, "format": {"type": "string", "enum": ["text", "json"]}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_search",
-                "description": "Hybrid semantic/file/symbol search over indexed source code. Pass query for one search, or queries for a batch of strings/objects. Use compact=true for discovery. Symbol-shaped queries use symbol and word/trigram text hits; natural-language queries add lazy Model2Vec flat-cosine vector search. Regex and fallback line matching are delegated to the trigram text index.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_text_search",
-                "description": "Trigram-accelerated full-text search over indexed source files. Supports regex, path_glob scoped results, compact file/line output, scopes, and batch queries.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "queries": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "max_results": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "project": {"type": "string"}}, "required": []}
+                "description": "Definition-first lexical code search: exact/regex text, BM25, symbols, and word-trigram evidence.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "offset": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "paths_only": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "format": {"type": "string"}, "project": {"type": "string"}}, "required": ["query"]}
             },
             {
                 "name": "codedb_word",
-                "description": "Exact identifier lookup via inverted index.",
+                "description": "Exact identifier lookup.",
                 "inputSchema": {"type": "object", "properties": {"word": {"type": "string"}, "project": {"type": "string"}}, "required": ["word"]}
             },
             {
                 "name": "codedb_callers",
-                "description": "Find references of named symbols with definition anchoring and C#/Java type-reference filtering. Pass name for one lookup, or targets for a batch of strings/objects. Pass definition_path and definition_line to disambiguate same-name symbols.",
-                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "targets": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "definition_path": {"type": "string"}, "definition_line": {"type": "integer"}, "path": {"type": "string"}, "line": {"type": "integer"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
+                "description": "Reference/caller sites for a symbol.",
+                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": ["name"]}
+            },
+            {
+                "name": "codedb_callpath",
+                "description": "Generic symbol-reference path.",
+                "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "from_path": {"type": "string"}, "to_path": {"type": "string"}, "from_line": {"type": "integer"}, "to_line": {"type": "integer"}, "max_hops": {"type": "integer"}, "project": {"type": "string"}}, "required": ["from", "to"]}
+            },
+            {
+                "name": "codedb_context",
+                "description": "Graph atlas without path_glob; scoped structural roots, community boundaries, weighted bridges, calls, and optional snippets with path_glob. Task text is an opaque label.",
+                "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "max_tokens": {"type": "integer"}, "max_chars": {"type": "integer"}, "max_files": {"type": "integer"}, "path_glob": {"type": "string"}, "include_deps": {"type": "boolean"}, "include_snippets": {"type": "boolean"}, "snippet_radius": {"type": "integer"}, "snippets_per_file": {"type": "integer"}, "include_inventory": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["task"]}
+            },
+            {
+                "name": "codedb_flow",
+                "description": "Graph atlas without path_glob; scoped structural roots, community boundaries, weighted bridges, calls, and bodies with path_glob. Task text is an opaque label.",
+                "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "max_tokens": {"type": "integer"}, "max_chars": {"type": "integer"}, "max_files": {"type": "integer"}, "path_glob": {"type": "string"}, "include_inventory": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["task"]}
+            },
+            {
+                "name": "codedb_module_atlas",
+                "description": "Dependency-connected module/file atlas JSON.",
+                "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}, "min_files": {"type": "integer"}, "include_files": {"type": "boolean"}, "split_files": {"type": "boolean"}, "path_prefix": {"type": "string"}, "output_path": {"type": "string"}, "project": {"type": "string"}}, "required": []}
+            },
+            {
+                "name": "codedb_diagnostics",
+                "description": "Diagnostics compatibility stub; currently reports that diagnostics are unavailable.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_hot",
-                "description": "Most recently modified indexed files.",
+                "description": "Recently modified indexed files.",
                 "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_deps",
-                "description": "Dependency graph from imports/includes/use declarations, packages/namespaces, and symbol references. C#/Java remain the strongest typed path.",
+                "description": "File dependencies or reverse dependencies.",
                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "direction": {"type": "string", "enum": ["imported_by", "depends_on"]}, "transitive": {"type": "boolean"}, "max_depth": {"type": "integer"}, "project": {"type": "string"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_read",
-                "description": "Read indexed file contents, optionally a line range. Pass path for one file, or paths for a batch of strings/objects.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "paths": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
+                "description": "Read one exact file or line range. Use a connected range command returned by outline as a complete same-file evidence closure; do not reopen its contained members individually.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "connected_range": {"type": "boolean", "description": "Read the full active-code connected component without the ordinary compact-line cap and emit a closure marker; use only with a range returned by codedb_outline include_connected_ranges=true."}, "include_symbol_leads": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_edit",
-                "description": "Compatibility stub. This server is read-only and returns an error for edits.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "op": {"type": "string"}, "content": {"type": "string"}, "range_start": {"type": "integer"}, "range_end": {"type": "integer"}, "after": {"type": "integer"}, "if_hash": {"type": "string"}, "dry_run": {"type": "boolean"}}, "required": ["path", "op"]}
+                "description": "Read-only edit compatibility stub.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "op": {"type": "string", "enum": ["str_replace", "replace", "insert", "delete", "create"]}, "content": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "range_start": {"type": "integer"}, "range_end": {"type": "integer"}, "after": {"type": "integer"}, "if_hash": {"type": "string"}, "dry_run": {"type": "boolean"}}, "required": ["path", "op"]}
             },
             {
                 "name": "codedb_changes",
-                "description": "Files changed since a sequence number.",
+                "description": "Files changed since sequence.",
                 "inputSchema": {"type": "object", "properties": {"since": {"type": "integer"}}, "required": []}
             },
             {
                 "name": "codedb_status",
-                "description": "Current indexed-file count, sequence number, scan state, vector index, and embedding model.",
+                "description": "Index status.",
                 "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_version",
-                "description": "Return the codedb-mcp server/package version without loading a project index.",
-                "inputSchema": {"type": "object", "properties": {}, "required": []}
             },
             {
                 "name": "codedb_snapshot",
-                "description": "JSON snapshot of files, symbols, and dependency graph.",
+                "description": "Full JSON index snapshot.",
                 "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}
             },
             {
-                "name": "codedb_bundle",
-                "description": "Run up to 100 codedb_* calls in one round trip. Output is budgeted by default to prevent large context injection. Optional timing=true reports per-inner-call milliseconds; discard_output=true keeps benchmark output compact.",
-                "inputSchema": {"type": "object", "properties": {"ops": {"type": "array", "items": {"type": "object"}}, "timing": {"type": "boolean"}, "discard_output": {"type": "boolean"}, "max_output_chars": {"type": "integer"}, "max_child_chars": {"type": "integer"}, "project": {"type": "string"}}, "required": ["ops"]}
-            },
-            {
                 "name": "codedb_remote",
-                "description": "Compatibility stub for codedb remote queries.",
-                "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}, "action": {"type": "string"}}, "required": ["repo", "action"]}
+                "description": "Remote compatibility stub.",
+                "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}, "action": {"type": "string", "enum": ["tree", "outline", "search", "read", "actions", "symbol", "policy", "deps", "score", "cves", "commits", "branches", "dep-history"]}, "query": {"type": "string"}, "path": {"type": "string"}, "lines": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}, "prefix": {"type": "string"}, "expand": {"type": "boolean"}, "since": {"type": "string"}, "scope": {"type": "string", "enum": ["runtime", "all"]}, "backend": {"type": "string", "enum": ["wiki"]}}, "required": ["repo", "action"]}
             },
             {
                 "name": "codedb_projects",
-                "description": "List locally indexed projects in this server process.",
+                "description": "Loaded projects.",
                 "inputSchema": {"type": "object", "properties": {}, "required": []}
             },
             {
                 "name": "codedb_index",
-                "description": "Index a local folder using the configured source extensions.",
+                "description": "Index a local source folder.",
                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_find",
-                "description": "Fuzzy file-name search against indexed source file paths.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": ["query"]}
-            },
-            {
-                "name": "codedb_context",
-                "description": "Answer-oriented context builder. Given a natural-language or symbol query, returns ranked files, why they match, key symbols, hit lines, and compact dependency signals without dumping large source bodies.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path_glob": {"type": "string"}, "max_files": {"type": "integer"}, "max_results": {"type": "integer"}, "include_deps": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["query"]}
-            },
-            {
-                "name": "codedb_explore",
-                "description": "Budgeted source-context explorer. Given a query or explicit path(s), ranks files and returns focused outlines, dependency hints, and line-numbered source excerpts capped by max_chars.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "paths": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object"}]}}, "path_glob": {"type": "string"}, "max_files": {"type": "integer"}, "max_chars": {"type": "integer"}, "context_lines": {"type": "integer"}, "max_lines_per_file": {"type": "integer"}, "compact": {"type": "boolean"}, "include_deps": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
+                "description": "Fuzzy path search.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["query"]}
             },
             {
                 "name": "codedb_query",
-                "description": "Small composable pipeline: find, search, filter, limit, outline.",
+                "description": "Composable lookup pipeline.",
                 "inputSchema": {"type": "object", "properties": {"pipeline": {"type": "array", "items": {"type": "object"}}, "project": {"type": "string"}}, "required": ["pipeline"]}
             },
             {
                 "name": "codedb_glob",
-                "description": "Match indexed paths against a glob.",
-                "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": ["pattern"]}
+                "description": "Glob indexed paths with central summaries.",
+                "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "include_paths": {"type": "boolean"}, "include_actionable_leads": {"type": "boolean"}, "summary_limit": {"type": "integer"}, "project": {"type": "string"}}, "required": ["pattern"]}
             },
             {
                 "name": "codedb_ls",
-                "description": "List immediate children of an indexed directory.",
+                "description": "List one directory.",
                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_graph",
-                "description": "Graphify-style code graph summary or limited export. Formats: summary, json, graphml, cypher.",
-                "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["summary", "json", "graphml", "cypher"]}, "max_nodes": {"type": "integer"}, "max_edges": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_explain",
-                "description": "Explain a graph node by fuzzy node/label match and show incoming/outgoing connections.",
-                "inputSchema": {"type": "object", "properties": {"node": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_path",
-                "description": "Find the shortest graph path between two symbols, files, namespaces, or node IDs.",
-                "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "target": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}, "max_depth": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_communities",
-                "description": "List lazy Louvain graph communities, inspect members, or split one community with children=true/subcommunities=true. Results are cached under the project-local storage directory.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "community_id": {"type": "integer"},
-                        "id": {"type": "integer"},
-                        "child_id": {"type": "integer"},
-                        "subcommunity_id": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                        "community_limit": {"type": "integer"},
-                        "include_members": {"type": "boolean"},
-                        "members": {"type": "boolean"},
-                        "children": {"type": "boolean"},
-                        "subcommunities": {"type": "boolean"},
-                        "project": {"type": "string"}
-                    },
-                    "required": []
-                }
-            },
-            {
-                "name": "codedb_module_map",
-                "description": "DeepWiki module-planning atlas generated from the Rust dependency-connected file graph with label propagation, dependency cohesion, cross-folder evidence, key symbols, entry points, semantic neighbors, and c-TF-IDF-like labels.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {"type": "integer"},
-                        "min_files": {"type": "integer"},
-                        "path_prefix": {"type": "string"},
-                        "include_files": {"type": "boolean"},
-                        "max_files_per_module": {"type": "integer"},
-                        "semantic_neighbors": {"type": "integer"},
-                        "project": {"type": "string"}
-                    },
-                    "required": []
-                }
-            },
-            {
-                "name": "codedb_module_atlas",
-                "description": "Export an Embedding Atlas-ready module view generated by Rust from dependency-connected file graph modules.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {"type": "integer"},
-                        "min_files": {"type": "integer"},
-                        "path_prefix": {"type": "string"},
-                        "include_files": {"type": "boolean"},
-                        "split_files": {"type": "boolean"},
-                        "output_path": {"type": "string"},
-                        "project": {"type": "string"}
-                    },
-                    "required": []
-                }
-            },
-            {
-                "name": "codedb_analyze",
-                "description": "Graph analysis: top nodes, relation/type counts, surprising connections, suggested questions.",
-                "inputSchema": {"type": "object", "properties": {"top_n": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
-            },
-            {
-                "name": "codedb_export",
-                "description": "Export the graph as json, graphml, or cypher; returns text or writes to output_path.",
-                "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["json", "graphml", "cypher"]}, "output_path": {"type": "string"}, "max_nodes": {"type": "integer"}, "max_edges": {"type": "integer"}, "project": {"type": "string"}}, "required": []}
             }
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_is_not_exposed_as_an_mcp_tool() {
+        let tools = tools_list();
+        let bundle = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "codedb_bundle");
+
+        assert!(bundle.is_none());
+    }
 }

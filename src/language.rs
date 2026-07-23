@@ -23,6 +23,10 @@ pub fn analyze_source(language: &str, content: &str) -> ParsedSource {
     crate::tree_sitter_lang::analyze_source(language, content)
 }
 
+pub fn mask_comments(language: &str, content: &str) -> String {
+    crate::tree_sitter_lang::mask_comments(language, content)
+}
+
 #[cfg(test)]
 pub fn analyze_symbols(language: &str, content: &str) -> Vec<Symbol> {
     analyze_source(language, content).symbols
@@ -72,6 +76,26 @@ pub fn regex_case_insensitive(pattern: &str) -> Result<regex::Regex, regex::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csharp_comment_mask_preserves_live_code_and_line_numbers() {
+        let source = r#"public class Demo
+{
+    /*
+    public void DeprecatedCall() { OldApi(); }
+    */
+    public void CurrentCall() { NewApi(); } // trailing note
+    public string Marker() => "/* not a comment */";
+}"#;
+        let masked = mask_comments("csharp", source);
+        assert_eq!(masked.lines().count(), source.lines().count());
+        assert!(!masked.contains("DeprecatedCall"));
+        assert!(!masked.contains("OldApi"));
+        assert!(masked.contains("CurrentCall"));
+        assert!(masked.contains("NewApi"));
+        assert!(!masked.contains("trailing note"));
+        assert!(masked.contains("/* not a comment */"));
+    }
 
     #[test]
     fn csharp_tree_sitter_extracts_outline_imports_and_namespace() {

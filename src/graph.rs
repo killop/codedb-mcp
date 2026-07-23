@@ -1,7 +1,9 @@
-use crate::tokens::{raw_identifiers, split_identifier};
+use crate::language::mask_comments;
+use crate::tokens::raw_identifiers;
 use crate::types::FileEntry;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -13,16 +15,7 @@ const MAX_EDGES_FOR_ITERATIVE_COMMUNITIES: usize = 150_000;
 const MAX_COMMUNITY_ITERATIONS: usize = 8;
 const MAX_COMMUNITY_FRACTION: f64 = 0.25;
 const MIN_COMMUNITY_SPLIT_SIZE: usize = 25;
-const LOUVAIN_MAX_ITERATIONS: usize = 20;
-const LOUVAIN_RESOLUTION: f64 = 1.0;
 const TOP_LEVEL_COMMUNITY_LABEL_DEPTH: usize = 2;
-const SUBCOMMUNITY_LABEL_DEPTH: usize = 6;
-const SUBCOMMUNITY_MAX_FRACTION: f64 = 0.08;
-const MODULE_SUBCOMMUNITY_MAX_FRACTION: f64 = 1.0;
-const MAX_TARGET_FILES_PER_SYMBOL_NAME: usize = 48;
-const MAX_FILE_REFERENCE_EDGES_PER_FILE: usize = 256;
-const MAX_FEATURE_AFFINITY_FILES: usize = 512;
-const FEATURE_AFFINITY_WEIGHT: f32 = 1.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
@@ -61,60 +54,6 @@ pub struct GraphCommunity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphStats {
-    pub nodes: usize,
-    pub edges: usize,
-    pub communities: usize,
-    pub isolated_nodes: usize,
-    pub average_degree: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphAnalysis {
-    pub stats: GraphStats,
-    pub top_nodes: Vec<NodeDegree>,
-    pub relation_counts: Vec<CountItem>,
-    pub type_counts: Vec<CountItem>,
-    pub surprising_connections: Vec<SurprisingConnection>,
-    pub suggested_questions: Vec<SuggestedQuestion>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeDegree {
-    pub id: String,
-    pub label: String,
-    #[serde(rename = "type")]
-    pub node_type: String,
-    pub degree: usize,
-    pub file_path: Option<String>,
-    pub community: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CountItem {
-    pub name: String,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SurprisingConnection {
-    pub source: String,
-    pub target: String,
-    pub relation: String,
-    pub confidence: String,
-    pub source_files: Vec<String>,
-    pub why: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuggestedQuestion {
-    #[serde(rename = "type")]
-    pub question_type: String,
-    pub question: String,
-    pub why: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathStep {
     pub id: String,
     pub label: String,
@@ -135,24 +74,395 @@ pub struct PathResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExplainResult {
-    pub node: GraphNode,
-    pub degree: usize,
-    pub incoming: Vec<EdgeNeighbor>,
-    pub outgoing: Vec<EdgeNeighbor>,
-    pub summary: String,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileGraphCsr {
+    pub paths: Vec<String>,
+    pub offsets: Vec<u32>,
+    pub neighbors: Vec<u32>,
+    pub weights: Vec<f32>,
+    pub communities: Vec<u32>,
+    #[serde(skip)]
+    path_to_id: HashMap<String, u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EdgeNeighbor {
-    pub node_id: String,
-    pub label: String,
-    #[serde(rename = "type")]
-    pub node_type: String,
-    pub relation: String,
-    pub confidence: String,
-    pub file_path: Option<String>,
+#[derive(Clone, Copy, Debug)]
+struct WeightedPathState {
+    cost: f32,
+    node: u32,
+}
+
+impl PartialEq for WeightedPathState {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.cost.to_bits() == other.cost.to_bits()
+    }
+}
+
+impl Eq for WeightedPathState {}
+
+impl PartialOrd for WeightedPathState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WeightedPathState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
+impl FileGraphCsr {
+    fn build(
+        files: &BTreeMap<String, FileEntry>,
+        nodes: &BTreeMap<String, GraphNode>,
+        edges: &[GraphEdge],
+    ) -> Self {
+        let paths = files.keys().cloned().collect::<Vec<_>>();
+        let path_to_id = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (path.clone(), id as u32))
+            .collect::<HashMap<_, _>>();
+        let mut adjacency = vec![BTreeMap::<u32, f32>::new(); paths.len()];
+        for edge in edges {
+            let Some(source_path) = nodes
+                .get(&edge.source)
+                .and_then(|node| node.file_path.as_deref())
+            else {
+                continue;
+            };
+            let Some(target_path) = nodes
+                .get(&edge.target)
+                .and_then(|node| node.file_path.as_deref())
+            else {
+                continue;
+            };
+            if source_path == target_path {
+                continue;
+            }
+            let relation_weight = match edge.relation.as_str() {
+                "depends_on" => 1.0,
+                "references" => 0.35,
+                _ => continue,
+            };
+            let Some(&source) = path_to_id.get(source_path) else {
+                continue;
+            };
+            let Some(&target) = path_to_id.get(target_path) else {
+                continue;
+            };
+            let weight = (edge.weight * edge.confidence_score * relation_weight).max(0.05);
+            *adjacency[source as usize].entry(target).or_default() += weight;
+            *adjacency[target as usize].entry(source).or_default() += weight;
+        }
+
+        let mut offsets = Vec::with_capacity(paths.len() + 1);
+        let mut neighbors = Vec::new();
+        let mut weights = Vec::new();
+        offsets.push(0);
+        for row in adjacency {
+            for (neighbor, weight) in row {
+                neighbors.push(neighbor);
+                weights.push(weight.ln_1p().max(0.05));
+            }
+            offsets.push(neighbors.len() as u32);
+        }
+        let mut graph = Self {
+            paths,
+            offsets,
+            neighbors,
+            weights,
+            communities: Vec::new(),
+            path_to_id,
+        };
+        graph.communities = graph.detect_communities(1.0);
+        graph
+    }
+
+    fn rebuild_runtime_indexes(&mut self) {
+        self.path_to_id = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (path.clone(), id as u32))
+            .collect();
+        if self.communities.len() != self.paths.len() {
+            self.communities = self.detect_communities(1.0);
+        }
+    }
+
+    pub fn id(&self, path: &str) -> Option<usize> {
+        self.path_to_id.get(path).map(|id| *id as usize)
+    }
+
+    pub fn degree(&self, id: usize) -> usize {
+        let Some((&start, &end)) = self.offsets.get(id).zip(self.offsets.get(id + 1)) else {
+            return 0;
+        };
+        end.saturating_sub(start) as usize
+    }
+
+    pub fn community(&self, id: usize) -> Option<usize> {
+        self.communities
+            .get(id)
+            .map(|community| *community as usize)
+    }
+
+    pub fn neighbor_ids(&self, id: usize) -> Vec<usize> {
+        self.neighbor_range(id)
+            .map(|edge_idx| self.neighbors[edge_idx] as usize)
+            .collect()
+    }
+
+    fn neighbor_range(&self, id: usize) -> std::ops::Range<usize> {
+        let start = self.offsets.get(id).copied().unwrap_or(0) as usize;
+        let end = self.offsets.get(id + 1).copied().unwrap_or(start as u32) as usize;
+        start..end
+    }
+
+    fn detect_communities(&self, resolution: f32) -> Vec<u32> {
+        let node_count = self.paths.len();
+        if node_count == 0 {
+            return Vec::new();
+        }
+        let degree = (0..node_count)
+            .map(|id| {
+                self.neighbor_range(id)
+                    .map(|edge_idx| self.weights[edge_idx])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let total_weight = degree.iter().sum::<f32>().max(1e-9);
+        let mut community = (0..node_count as u32).collect::<Vec<_>>();
+        let mut community_weight = degree.clone();
+        loop {
+            let mut moved = false;
+            for node in 0..node_count {
+                if degree[node] <= f32::EPSILON {
+                    continue;
+                }
+                let current = community[node] as usize;
+                let mut neighboring = BTreeMap::<u32, f32>::new();
+                for edge_idx in self.neighbor_range(node) {
+                    let target = self.neighbors[edge_idx] as usize;
+                    *neighboring.entry(community[target]).or_default() += self.weights[edge_idx];
+                }
+                community_weight[current] -= degree[node];
+                let current_internal = neighboring.get(&(current as u32)).copied().unwrap_or(0.0);
+                let mut best = current as u32;
+                let mut best_gain = current_internal
+                    - resolution * degree[node] * community_weight[current] / total_weight;
+                for (candidate, internal_weight) in neighboring {
+                    let candidate_id = candidate as usize;
+                    let gain = internal_weight
+                        - resolution * degree[node] * community_weight[candidate_id] / total_weight;
+                    if gain > best_gain + 1e-7
+                        || ((gain - best_gain).abs() <= 1e-7 && candidate < best)
+                    {
+                        best = candidate;
+                        best_gain = gain;
+                    }
+                }
+                community[node] = best;
+                community_weight[best as usize] += degree[node];
+                if best as usize != current {
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        let mut refined = vec![u32::MAX; node_count];
+        let mut next_community = 0u32;
+        for start in 0..node_count {
+            if refined[start] != u32::MAX {
+                continue;
+            }
+            let source_community = community[start];
+            refined[start] = next_community;
+            let mut queue = VecDeque::from([start]);
+            while let Some(node) = queue.pop_front() {
+                for edge_idx in self.neighbor_range(node) {
+                    let target = self.neighbors[edge_idx] as usize;
+                    if refined[target] == u32::MAX && community[target] == source_community {
+                        refined[target] = next_community;
+                        queue.push_back(target);
+                    }
+                }
+            }
+            next_community += 1;
+        }
+        refined
+    }
+
+    pub fn personalized_page_rank(
+        &self,
+        teleport: &[f32],
+        allowed: &[bool],
+        damping: f32,
+        tolerance: f32,
+    ) -> Vec<f32> {
+        let node_count = self.paths.len();
+        if node_count == 0 || teleport.len() != node_count || allowed.len() != node_count {
+            return vec![0.0; node_count];
+        }
+        let mut teleport = teleport
+            .iter()
+            .zip(allowed)
+            .map(|(value, allowed)| allowed.then_some(value.max(0.0)).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let teleport_sum = teleport.iter().sum::<f32>();
+        if teleport_sum > 0.0 {
+            for value in &mut teleport {
+                *value /= teleport_sum;
+            }
+        } else {
+            let allowed_count = allowed.iter().filter(|value| **value).count();
+            if allowed_count == 0 {
+                return vec![0.0; node_count];
+            }
+            let uniform = 1.0 / allowed_count as f32;
+            for (value, allowed) in teleport.iter_mut().zip(allowed) {
+                if *allowed {
+                    *value = uniform;
+                }
+            }
+        }
+
+        let mut strengths = vec![0.0f32; node_count];
+        for id in 0..node_count {
+            if !allowed[id] {
+                continue;
+            }
+            strengths[id] = self
+                .neighbor_range(id)
+                .filter(|edge_idx| allowed[self.neighbors[*edge_idx] as usize])
+                .map(|edge_idx| self.weights[edge_idx])
+                .sum();
+        }
+
+        let damping = damping.clamp(0.0, 0.999);
+        let tolerance = tolerance.max(f32::EPSILON);
+        let mut rank = teleport.clone();
+        let mut previous_residual = f32::INFINITY;
+        let mut stagnant_steps = 0usize;
+        loop {
+            let dangling_mass = rank
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| allowed[*id] && strengths[*id] <= f32::EPSILON)
+                .map(|(_, value)| *value)
+                .sum::<f32>();
+            let base_scale = 1.0 - damping + damping * dangling_mass;
+            let mut next = teleport
+                .iter()
+                .map(|value| value * base_scale)
+                .collect::<Vec<_>>();
+            for source in 0..node_count {
+                if !allowed[source] || strengths[source] <= f32::EPSILON {
+                    continue;
+                }
+                let scale = damping * rank[source] / strengths[source];
+                for edge_idx in self.neighbor_range(source) {
+                    let target = self.neighbors[edge_idx] as usize;
+                    if allowed[target] {
+                        next[target] += scale * self.weights[edge_idx];
+                    }
+                }
+            }
+            let residual = next
+                .iter()
+                .zip(&rank)
+                .map(|(left, right)| (left - right).abs())
+                .sum::<f32>();
+            rank = next;
+            if residual <= tolerance || !residual.is_finite() {
+                break;
+            }
+            if residual >= previous_residual * (1.0 - 1e-5) {
+                stagnant_steps += 1;
+                if stagnant_steps >= 8 {
+                    break;
+                }
+            } else {
+                stagnant_steps = 0;
+            }
+            previous_residual = residual;
+        }
+        rank
+    }
+
+    pub fn weighted_shortest_path(
+        &self,
+        source: usize,
+        target: usize,
+        allowed: &[bool],
+    ) -> Vec<usize> {
+        let node_count = self.paths.len();
+        if source >= node_count
+            || target >= node_count
+            || allowed.len() != node_count
+            || !allowed[source]
+            || !allowed[target]
+        {
+            return Vec::new();
+        }
+        if source == target {
+            return vec![source];
+        }
+        let mut distance = vec![f32::INFINITY; node_count];
+        let mut parent = vec![usize::MAX; node_count];
+        let mut queue = BinaryHeap::new();
+        distance[source] = 0.0;
+        queue.push(WeightedPathState {
+            cost: 0.0,
+            node: source as u32,
+        });
+        while let Some(WeightedPathState { cost, node }) = queue.pop() {
+            let node = node as usize;
+            if cost > distance[node] {
+                continue;
+            }
+            if node == target {
+                break;
+            }
+            for edge_idx in self.neighbor_range(node) {
+                let next = self.neighbors[edge_idx] as usize;
+                if !allowed[next] {
+                    continue;
+                }
+                let hub_cost = ((self.degree(next) + 1) as f32).ln() * 0.12;
+                let next_cost = cost + self.weights[edge_idx].max(0.05).recip() + hub_cost;
+                if next_cost < distance[next] {
+                    distance[next] = next_cost;
+                    parent[next] = node;
+                    queue.push(WeightedPathState {
+                        cost: next_cost,
+                        node: next as u32,
+                    });
+                }
+            }
+        }
+        if !distance[target].is_finite() {
+            return Vec::new();
+        }
+        let mut path = vec![target];
+        let mut current = target;
+        while current != source {
+            current = parent[current];
+            if current == usize::MAX {
+                return Vec::new();
+            }
+            path.push(current);
+        }
+        path.reverse();
+        path
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +470,7 @@ pub struct CodeGraph {
     pub nodes: BTreeMap<String, GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub communities: Vec<GraphCommunity>,
+    pub file_graph: FileGraphCsr,
     #[serde(skip)]
     adjacency: HashMap<String, Vec<usize>>,
     #[serde(skip)]
@@ -267,132 +578,19 @@ impl CodeGraph {
             add_symbol_reference_edges(files, &symbol_by_name, &file_symbol_ids, &mut edges);
         }
 
+        let graph_edges = edges.into_edges();
+        let file_graph = FileGraphCsr::build(files, &nodes, &graph_edges);
         let mut graph = Self {
             nodes,
-            edges: edges.into_edges(),
+            edges: graph_edges,
             communities: Vec::new(),
+            file_graph,
             adjacency: HashMap::new(),
             reverse_adjacency: HashMap::new(),
         };
         graph.rebuild_adjacency();
         graph.assign_communities();
         graph
-    }
-
-    pub fn stats(&self) -> GraphStats {
-        let degree_sum: usize = self.nodes.keys().map(|id| self.degree(id)).sum();
-        let isolated_nodes = self
-            .nodes
-            .keys()
-            .filter(|id| self.degree(id.as_str()) == 0)
-            .count();
-        let average_degree = if self.nodes.is_empty() {
-            0.0
-        } else {
-            degree_sum as f32 / self.nodes.len() as f32
-        };
-        GraphStats {
-            nodes: self.nodes.len(),
-            edges: self.edges.len(),
-            communities: self.communities.len(),
-            isolated_nodes,
-            average_degree: round2(average_degree),
-        }
-    }
-
-    pub fn analysis(&self, top_n: usize) -> GraphAnalysis {
-        let top_nodes = self.top_nodes(top_n);
-        GraphAnalysis {
-            stats: self.stats(),
-            top_nodes,
-            relation_counts: self.relation_counts(),
-            type_counts: self.type_counts(),
-            surprising_connections: self.surprising_connections(10),
-            suggested_questions: self.suggested_questions(7),
-        }
-    }
-
-    pub fn limited_json(&self, max_nodes: usize, max_edges: usize) -> Value {
-        let nodes = self
-            .nodes
-            .values()
-            .take(max_nodes)
-            .collect::<Vec<&GraphNode>>();
-        let edges = self
-            .edges
-            .iter()
-            .take(max_edges)
-            .collect::<Vec<&GraphEdge>>();
-        json!({
-            "metadata": {
-                "node_count": self.nodes.len(),
-                "edge_count": self.edges.len(),
-                "community_count": self.communities.len(),
-                "truncated": self.nodes.len() > max_nodes || self.edges.len() > max_edges,
-                "max_nodes": max_nodes,
-                "max_edges": max_edges,
-            },
-            "nodes": nodes,
-            "links": edges,
-            "communities": self.communities,
-        })
-    }
-
-    pub fn explain(&self, term: &str, limit: usize) -> Option<ExplainResult> {
-        let node_id = self.find_best_node(term)?;
-        let node = self.nodes.get(&node_id)?.clone();
-        let mut incoming = Vec::new();
-        let mut outgoing = Vec::new();
-
-        for edge_idx in self
-            .reverse_adjacency
-            .get(&node_id)
-            .into_iter()
-            .flatten()
-            .take(limit)
-        {
-            let edge = &self.edges[*edge_idx];
-            if let Some(other) = self.nodes.get(&edge.source) {
-                incoming.push(EdgeNeighbor {
-                    node_id: other.id.clone(),
-                    label: other.label.clone(),
-                    node_type: other.node_type.clone(),
-                    relation: edge.relation.clone(),
-                    confidence: edge.confidence.clone(),
-                    file_path: other.file_path.clone(),
-                });
-            }
-        }
-
-        for edge_idx in self
-            .adjacency
-            .get(&node_id)
-            .into_iter()
-            .flatten()
-            .take(limit)
-        {
-            let edge = &self.edges[*edge_idx];
-            if let Some(other) = self.nodes.get(&edge.target) {
-                outgoing.push(EdgeNeighbor {
-                    node_id: other.id.clone(),
-                    label: other.label.clone(),
-                    node_type: other.node_type.clone(),
-                    relation: edge.relation.clone(),
-                    confidence: edge.confidence.clone(),
-                    file_path: other.file_path.clone(),
-                });
-            }
-        }
-
-        let degree = self.degree(&node_id);
-        let summary = summarize_node(&node, incoming.len(), outgoing.len(), degree);
-        Some(ExplainResult {
-            node,
-            degree,
-            incoming,
-            outgoing,
-            summary,
-        })
     }
 
     pub fn shortest_path(&self, source: &str, target: &str, max_depth: usize) -> PathResult {
@@ -458,511 +656,6 @@ impl CodeGraph {
         }
     }
 
-    pub fn communities_summary_for(
-        &self,
-        communities: &[GraphCommunity],
-        algorithm: &str,
-        community_id: Option<usize>,
-        limit: usize,
-        community_limit: usize,
-        include_members: bool,
-    ) -> Value {
-        if let Some(id) = community_id {
-            let Some(community) = communities.iter().find(|community| community.id == id) else {
-                return json!({"error": format!("community not found: {id}")});
-            };
-            let mut members = community
-                .nodes
-                .iter()
-                .filter_map(|node_id| self.nodes.get(node_id))
-                .map(|node| {
-                    node_degree_json_for_community(node, self.degree(&node.id), community.id)
-                })
-                .collect::<Vec<_>>();
-            members.sort_by(|a, b| {
-                b.get("degree")
-                    .and_then(Value::as_u64)
-                    .cmp(&a.get("degree").and_then(Value::as_u64))
-            });
-            members.truncate(limit);
-            return json!({
-                "algorithm": algorithm,
-                "id": community.id,
-                "label": community.label,
-                "member_count": community.nodes.len(),
-                "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                "cohesion": community.cohesion,
-                "members": members,
-            });
-        }
-
-        let items = communities
-            .iter()
-            .take(community_limit)
-            .map(|community| {
-                if !include_members {
-                    return json!({
-                        "id": community.id,
-                        "label": community.label,
-                        "member_count": community.nodes.len(),
-                        "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                        "cohesion": community.cohesion,
-                    });
-                }
-                let mut top_members = community
-                    .nodes
-                    .iter()
-                    .filter_map(|node_id| self.nodes.get(node_id))
-                    .map(|node| {
-                        node_degree_json_for_community(node, self.degree(&node.id), community.id)
-                    })
-                    .collect::<Vec<_>>();
-                top_members.sort_by(|a, b| {
-                    b.get("degree")
-                        .and_then(Value::as_u64)
-                        .cmp(&a.get("degree").and_then(Value::as_u64))
-                });
-                top_members.truncate(limit.min(10));
-                json!({
-                    "id": community.id,
-                    "label": community.label,
-                    "member_count": community.nodes.len(),
-                    "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                    "cohesion": community.cohesion,
-                    "top_members": top_members,
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({
-            "algorithm": algorithm,
-            "total_communities": communities.len(),
-            "returned_communities": items.len(),
-            "community_limit": community_limit,
-            "include_members": include_members,
-            "communities": items,
-        })
-    }
-
-    pub fn louvain_communities(&self) -> Vec<GraphCommunity> {
-        detect_louvain_communities_with_label_depth(
-            &self.nodes,
-            &self.edges,
-            TOP_LEVEL_COMMUNITY_LABEL_DEPTH,
-            MAX_COMMUNITY_FRACTION,
-        )
-    }
-
-    pub fn louvain_subcommunities(
-        &self,
-        node_ids: &[String],
-        files: &BTreeMap<String, FileEntry>,
-        parent_label: Option<&str>,
-    ) -> Vec<GraphCommunity> {
-        if let Some(communities) =
-            self.louvain_file_module_subcommunities(node_ids, files, parent_label)
-        {
-            return communities;
-        }
-
-        let node_id_set = node_ids.iter().map(String::as_str).collect::<HashSet<_>>();
-        let sub_nodes = node_ids
-            .iter()
-            .filter_map(|node_id| {
-                self.nodes
-                    .get(node_id)
-                    .map(|node| (node_id.clone(), node.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let sub_edges = self
-            .edges
-            .iter()
-            .filter(|edge| {
-                node_id_set.contains(edge.source.as_str())
-                    && node_id_set.contains(edge.target.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        detect_louvain_communities_with_label_depth(
-            &sub_nodes,
-            &sub_edges,
-            SUBCOMMUNITY_LABEL_DEPTH,
-            SUBCOMMUNITY_MAX_FRACTION,
-        )
-    }
-
-    fn louvain_file_module_subcommunities(
-        &self,
-        node_ids: &[String],
-        files: &BTreeMap<String, FileEntry>,
-        parent_label: Option<&str>,
-    ) -> Option<Vec<GraphCommunity>> {
-        let scope_prefix = parent_label.and_then(community_scope_prefix);
-        let parent_files = node_ids
-            .iter()
-            .filter_map(|node_id| self.nodes.get(node_id))
-            .filter_map(|node| node.file_path.as_deref())
-            .filter(|path| files.contains_key(*path))
-            .filter(|path| {
-                scope_prefix
-                    .as_deref()
-                    .is_none_or(|prefix| path_matches_scope(path, prefix))
-            })
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>();
-        if parent_files.len() < 2 {
-            return None;
-        }
-
-        let file_nodes = parent_files
-            .iter()
-            .filter_map(|path| {
-                let id = file_node_id(path);
-                self.nodes.get(&id).map(|node| (id, node.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if file_nodes.len() < 2 {
-            return None;
-        }
-
-        let module_edges = self.module_projection_edges(files, &parent_files);
-        if module_edges.is_empty() {
-            return None;
-        }
-
-        let mut file_communities = detect_louvain_communities_with_label_depth(
-            &file_nodes,
-            &module_edges,
-            SUBCOMMUNITY_LABEL_DEPTH,
-            MODULE_SUBCOMMUNITY_MAX_FRACTION,
-        );
-        merge_file_communities_by_feature(&mut file_communities);
-        if file_communities.len() <= 1 {
-            return None;
-        }
-
-        let file_community_cohesion =
-            module_cohesion_by_file_community(&file_communities, &module_edges);
-        let file_community_labels = file_communities
-            .iter()
-            .map(|community| (community.id, community.label.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut file_to_community = HashMap::<String, usize>::new();
-        for community in &file_communities {
-            for file_node in &community.nodes {
-                if let Some(node) = file_nodes.get(file_node) {
-                    if let Some(file_path) = &node.file_path {
-                        file_to_community.insert(file_path.clone(), community.id);
-                    }
-                }
-            }
-        }
-
-        let mut grouped = BTreeMap::<usize, Vec<String>>::new();
-        for node_id in node_ids {
-            let Some(node) = self.nodes.get(node_id) else {
-                continue;
-            };
-            let Some(file_path) = &node.file_path else {
-                continue;
-            };
-            let Some(community_id) = file_to_community.get(file_path).copied() else {
-                continue;
-            };
-            grouped
-                .entry(community_id)
-                .or_default()
-                .push(node_id.clone());
-        }
-        if grouped.len() <= 1 {
-            return None;
-        }
-
-        let mut communities = grouped
-            .into_iter()
-            .map(|(file_community_id, members)| GraphCommunity {
-                id: file_community_id,
-                label: file_community_labels
-                    .get(&file_community_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        community_label(&members, &self.nodes, SUBCOMMUNITY_LABEL_DEPTH)
-                    }),
-                cohesion: file_community_cohesion
-                    .get(&file_community_id)
-                    .copied()
-                    .unwrap_or(0.0),
-                nodes: members,
-            })
-            .collect::<Vec<_>>();
-        disambiguate_duplicate_community_labels(&mut communities, &self.nodes);
-        sort_communities_by_size_and_renumber(&mut communities);
-        Some(communities)
-    }
-
-    fn module_projection_edges(
-        &self,
-        files: &BTreeMap<String, FileEntry>,
-        allowed_files: &BTreeSet<String>,
-    ) -> Vec<GraphEdge> {
-        let mut edges = build_file_reference_edges(files, allowed_files);
-        add_feature_affinity_edges(files, allowed_files, &mut edges);
-        self.add_existing_file_projection_edges(allowed_files, &mut edges);
-        edges.into_edges()
-    }
-
-    fn add_existing_file_projection_edges(
-        &self,
-        allowed_files: &BTreeSet<String>,
-        edges: &mut EdgeAccumulator,
-    ) {
-        for edge in &self.edges {
-            let Some(weight) = module_edge_weight(edge) else {
-                continue;
-            };
-            let Some(source_file) = self
-                .nodes
-                .get(&edge.source)
-                .and_then(|node| node.file_path.as_deref())
-            else {
-                continue;
-            };
-            let Some(target_file) = self
-                .nodes
-                .get(&edge.target)
-                .and_then(|node| node.file_path.as_deref())
-            else {
-                continue;
-            };
-            if source_file == target_file
-                || !allowed_files.contains(source_file)
-                || !allowed_files.contains(target_file)
-            {
-                continue;
-            }
-            edges.add(
-                &file_node_id(source_file),
-                &file_node_id(target_file),
-                "module_reference",
-                &edge.confidence,
-                edge.confidence_score,
-                weight,
-                edge.source_file.clone(),
-                edge.source_line,
-            );
-        }
-    }
-
-    pub fn subcommunities_summary_for(
-        &self,
-        parent: &GraphCommunity,
-        subcommunities: &[GraphCommunity],
-        child_id: Option<usize>,
-        limit: usize,
-        community_limit: usize,
-        include_members: bool,
-    ) -> Value {
-        let parent_json = json!({
-            "id": parent.id,
-            "label": parent.label,
-            "member_count": parent.nodes.len(),
-            "file_count": file_count_for_nodes(&parent.nodes, &self.nodes),
-            "cohesion": parent.cohesion,
-        });
-
-        if let Some(id) = child_id {
-            let Some(community) = subcommunities.iter().find(|community| community.id == id) else {
-                return json!({"error": format!("subcommunity not found: {id}")});
-            };
-            let mut members = community
-                .nodes
-                .iter()
-                .filter_map(|node_id| self.nodes.get(node_id))
-                .map(|node| {
-                    node_degree_json_for_community(node, self.degree(&node.id), community.id)
-                })
-                .collect::<Vec<_>>();
-            members.sort_by(|a, b| {
-                b.get("degree")
-                    .and_then(Value::as_u64)
-                    .cmp(&a.get("degree").and_then(Value::as_u64))
-            });
-            members.truncate(limit);
-            return json!({
-                "algorithm": "lazy-louvain-subcommunities",
-                "parent_community": parent_json,
-                "id": community.id,
-                "label": community.label,
-                "member_count": community.nodes.len(),
-                "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                "cohesion": community.cohesion,
-                "members": members,
-            });
-        }
-
-        let items = subcommunities
-            .iter()
-            .take(community_limit)
-            .map(|community| {
-                if !include_members {
-                    return json!({
-                        "id": community.id,
-                        "label": community.label,
-                        "member_count": community.nodes.len(),
-                        "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                        "cohesion": community.cohesion,
-                    });
-                }
-                let mut top_members = community
-                    .nodes
-                    .iter()
-                    .filter_map(|node_id| self.nodes.get(node_id))
-                    .map(|node| {
-                        node_degree_json_for_community(node, self.degree(&node.id), community.id)
-                    })
-                    .collect::<Vec<_>>();
-                top_members.sort_by(|a, b| {
-                    b.get("degree")
-                        .and_then(Value::as_u64)
-                        .cmp(&a.get("degree").and_then(Value::as_u64))
-                });
-                top_members.truncate(limit.min(10));
-                json!({
-                    "id": community.id,
-                    "label": community.label,
-                    "member_count": community.nodes.len(),
-                    "file_count": file_count_for_nodes(&community.nodes, &self.nodes),
-                    "cohesion": community.cohesion,
-                    "top_members": top_members,
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({
-            "algorithm": "lazy-louvain-subcommunities",
-            "parent_community": parent_json,
-            "total_subcommunities": subcommunities.len(),
-            "returned_subcommunities": items.len(),
-            "community_limit": community_limit,
-            "include_members": include_members,
-            "subcommunities": items,
-        })
-    }
-
-    pub fn to_graphml(&self, max_nodes: usize, max_edges: usize) -> String {
-        let allowed = self
-            .nodes
-            .keys()
-            .take(max_nodes)
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut out = String::new();
-        out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        out.push_str("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n");
-        out.push_str(
-            "  <key id=\"label\" for=\"node\" attr.name=\"label\" attr.type=\"string\"/>\n",
-        );
-        out.push_str("  <key id=\"type\" for=\"node\" attr.name=\"type\" attr.type=\"string\"/>\n");
-        out.push_str(
-            "  <key id=\"community\" for=\"node\" attr.name=\"community\" attr.type=\"int\"/>\n",
-        );
-        out.push_str(
-            "  <key id=\"relation\" for=\"edge\" attr.name=\"relation\" attr.type=\"string\"/>\n",
-        );
-        out.push_str("  <key id=\"confidence\" for=\"edge\" attr.name=\"confidence\" attr.type=\"string\"/>\n");
-        out.push_str("  <graph edgedefault=\"directed\">\n");
-        for node in self.nodes.values().take(max_nodes) {
-            out.push_str(&format!("    <node id=\"{}\">\n", xml_escape(&node.id)));
-            out.push_str(&format!(
-                "      <data key=\"label\">{}</data>\n",
-                xml_escape(&node.label)
-            ));
-            out.push_str(&format!(
-                "      <data key=\"type\">{}</data>\n",
-                xml_escape(&node.node_type)
-            ));
-            if let Some(community) = node.community {
-                out.push_str(&format!(
-                    "      <data key=\"community\">{community}</data>\n"
-                ));
-            }
-            out.push_str("    </node>\n");
-        }
-        for (idx, edge) in self
-            .edges
-            .iter()
-            .filter(|edge| allowed.contains(&edge.source) && allowed.contains(&edge.target))
-            .take(max_edges)
-            .enumerate()
-        {
-            out.push_str(&format!(
-                "    <edge id=\"e{}\" source=\"{}\" target=\"{}\">\n",
-                idx,
-                xml_escape(&edge.source),
-                xml_escape(&edge.target)
-            ));
-            out.push_str(&format!(
-                "      <data key=\"relation\">{}</data>\n",
-                xml_escape(&edge.relation)
-            ));
-            out.push_str(&format!(
-                "      <data key=\"confidence\">{}</data>\n",
-                xml_escape(&edge.confidence)
-            ));
-            out.push_str("    </edge>\n");
-        }
-        out.push_str("  </graph>\n</graphml>\n");
-        out
-    }
-
-    pub fn to_cypher(&self, max_nodes: usize, max_edges: usize) -> String {
-        let mut out = String::new();
-        out.push_str("// codebase-mcp graph export\n");
-        out.push_str(&format!(
-            "// Nodes: {}, Edges: {}, Communities: {}\n\n",
-            self.nodes.len(),
-            self.edges.len(),
-            self.communities.len()
-        ));
-        let allowed = self
-            .nodes
-            .keys()
-            .take(max_nodes)
-            .cloned()
-            .collect::<HashSet<_>>();
-        for node in self.nodes.values().take(max_nodes) {
-            let label = neo4j_label(&node.node_type);
-            out.push_str(&format!(
-                "MERGE (n:{label} {{id: '{}'}}) SET n.label = '{}', n.type = '{}'",
-                cypher_escape(&node.id),
-                cypher_escape(&node.label),
-                cypher_escape(&node.node_type)
-            ));
-            if let Some(file_path) = &node.file_path {
-                out.push_str(&format!(", n.file_path = '{}'", cypher_escape(file_path)));
-            }
-            if let Some(community) = node.community {
-                out.push_str(&format!(", n.community = {community}"));
-            }
-            out.push_str(";\n");
-        }
-        out.push('\n');
-        for edge in self
-            .edges
-            .iter()
-            .filter(|edge| allowed.contains(&edge.source) && allowed.contains(&edge.target))
-            .take(max_edges)
-        {
-            out.push_str(&format!(
-                "MATCH (a {{id: '{}'}}), (b {{id: '{}'}}) MERGE (a)-[r:{}]->(b) SET r.weight = {:.3}, r.confidence = '{}';\n",
-                cypher_escape(&edge.source),
-                cypher_escape(&edge.target),
-                neo4j_relation(&edge.relation),
-                edge.weight,
-                cypher_escape(&edge.confidence)
-            ));
-        }
-        out
-    }
-
     fn rebuild_adjacency(&mut self) {
         self.adjacency.clear();
         self.reverse_adjacency.clear();
@@ -976,6 +669,11 @@ impl CodeGraph {
                 .or_default()
                 .push(idx);
         }
+    }
+
+    pub fn rebuild_runtime_indexes(&mut self) {
+        self.rebuild_adjacency();
+        self.file_graph.rebuild_runtime_indexes();
     }
 
     fn assign_communities(&mut self) {
@@ -1046,190 +744,6 @@ impl CodeGraph {
     fn degree(&self, node_id: &str) -> usize {
         self.adjacency.get(node_id).map_or(0, Vec::len)
             + self.reverse_adjacency.get(node_id).map_or(0, Vec::len)
-    }
-
-    fn top_nodes(&self, top_n: usize) -> Vec<NodeDegree> {
-        let mut nodes = self
-            .nodes
-            .values()
-            .filter(|node| !is_file_node(node))
-            .map(|node| NodeDegree {
-                id: node.id.clone(),
-                label: node.label.clone(),
-                node_type: node.node_type.clone(),
-                degree: self.degree(&node.id),
-                file_path: node.file_path.clone(),
-                community: node.community,
-            })
-            .collect::<Vec<_>>();
-        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
-        nodes.truncate(top_n);
-        nodes
-    }
-
-    fn relation_counts(&self) -> Vec<CountItem> {
-        let mut counts = BTreeMap::<String, usize>::new();
-        for edge in &self.edges {
-            *counts.entry(edge.relation.clone()).or_default() += 1;
-        }
-        sorted_counts(counts)
-    }
-
-    fn type_counts(&self) -> Vec<CountItem> {
-        let mut counts = BTreeMap::<String, usize>::new();
-        for node in self.nodes.values() {
-            *counts.entry(node.node_type.clone()).or_default() += 1;
-        }
-        sorted_counts(counts)
-    }
-
-    fn surprising_connections(&self, top_n: usize) -> Vec<SurprisingConnection> {
-        let mut candidates = Vec::new();
-        for edge in &self.edges {
-            if matches!(
-                edge.relation.as_str(),
-                "contains" | "declares_namespace" | "depends_on"
-            ) {
-                continue;
-            }
-            let Some(source) = self.nodes.get(&edge.source) else {
-                continue;
-            };
-            let Some(target) = self.nodes.get(&edge.target) else {
-                continue;
-            };
-            if is_file_node(source) || is_file_node(target) {
-                continue;
-            }
-            let source_file = source.file_path.clone().unwrap_or_default();
-            let target_file = target.file_path.clone().unwrap_or_default();
-            if source_file.is_empty() || target_file.is_empty() || source_file == target_file {
-                continue;
-            }
-
-            let mut score = 0usize;
-            let mut reasons = Vec::new();
-            if edge.confidence == "INFERRED" {
-                score += 2;
-                reasons.push("inferred from identifier references".to_string());
-            } else {
-                score += 1;
-            }
-            if top_level_dir(&source_file) != top_level_dir(&target_file) {
-                score += 2;
-                reasons.push("crosses top-level directories".to_string());
-            }
-            if source.community.is_some()
-                && target.community.is_some()
-                && source.community != target.community
-            {
-                score += 1;
-                reasons.push("bridges separate communities".to_string());
-            }
-            if self.degree(&source.id).min(self.degree(&target.id)) <= 2
-                && self.degree(&source.id).max(self.degree(&target.id)) >= 5
-            {
-                score += 1;
-                reasons.push("connects a peripheral symbol to a hub".to_string());
-            }
-
-            candidates.push((
-                score,
-                SurprisingConnection {
-                    source: source.label.clone(),
-                    target: target.label.clone(),
-                    relation: edge.relation.clone(),
-                    confidence: edge.confidence.clone(),
-                    source_files: vec![source_file, target_file],
-                    why: if reasons.is_empty() {
-                        "cross-file graph connection".to_string()
-                    } else {
-                        reasons.join("; ")
-                    },
-                },
-            ));
-        }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        candidates
-            .into_iter()
-            .take(top_n)
-            .map(|(_, connection)| connection)
-            .collect()
-    }
-
-    fn suggested_questions(&self, top_n: usize) -> Vec<SuggestedQuestion> {
-        let mut questions = Vec::new();
-
-        for node in self.top_nodes(5) {
-            let cross_community = self
-                .undirected_neighbors(&node.id)
-                .into_iter()
-                .filter_map(|(neighbor, _, _)| self.nodes.get(&neighbor))
-                .filter(|neighbor| neighbor.community != node.community)
-                .count();
-            if cross_community >= 2 {
-                questions.push(SuggestedQuestion {
-                    question_type: "bridge_node".to_string(),
-                    question: format!(
-                        "Why does `{}` connect multiple code communities?",
-                        node.label
-                    ),
-                    why: format!(
-                        "`{}` has degree {} and crosses {} community boundaries.",
-                        node.label, node.degree, cross_community
-                    ),
-                });
-            }
-        }
-
-        for community in &self.communities {
-            if community.nodes.len() >= 20 && community.cohesion < 0.05 {
-                questions.push(SuggestedQuestion {
-                    question_type: "low_cohesion".to_string(),
-                    question: format!(
-                        "Should `{}` be split into smaller architectural areas?",
-                        community.label
-                    ),
-                    why: format!(
-                        "Community {} has {} nodes but cohesion is only {:.2}.",
-                        community.id,
-                        community.nodes.len(),
-                        community.cohesion
-                    ),
-                });
-            }
-        }
-
-        let weak = self
-            .nodes
-            .values()
-            .filter(|node| !is_file_node(node) && self.degree(&node.id) <= 1)
-            .take(3)
-            .map(|node| format!("`{}`", node.label))
-            .collect::<Vec<_>>();
-        if !weak.is_empty() {
-            questions.push(SuggestedQuestion {
-                question_type: "weakly_connected".to_string(),
-                question: format!(
-                    "What connects {} to the rest of the project?",
-                    weak.join(", ")
-                ),
-                why: "These symbols have one or zero graph connections.".to_string(),
-            });
-        }
-
-        if questions.is_empty() {
-            questions.push(SuggestedQuestion {
-                question_type: "no_signal".to_string(),
-                question: "What are the highest-degree symbols and why are they central?"
-                    .to_string(),
-                why: "The graph did not expose clear low-confidence or bridge-node questions."
-                    .to_string(),
-            });
-        }
-
-        questions.truncate(top_n);
-        questions
     }
 
     fn find_best_node(&self, term: &str) -> Option<String> {
@@ -1441,7 +955,8 @@ fn add_symbol_reference_edges(
         .cloned()
         .collect::<HashSet<_>>();
     for file in files.values() {
-        let lines = file.content.lines().collect::<Vec<_>>();
+        let active_content = mask_comments(file.language.as_str(), &file.content);
+        let lines = active_content.lines().collect::<Vec<_>>();
         for symbol in &file.symbols {
             let source_id = symbol_node_id(&file.path, symbol.line_start, &symbol.name);
             if !symbol_id_set.contains(&source_id) {
@@ -1576,496 +1091,6 @@ fn detect_communities(
     split_oversized_communities(nodes, node_to_community)
 }
 
-fn detect_louvain_communities_with_label_depth(
-    nodes: &BTreeMap<String, GraphNode>,
-    edges: &[GraphEdge],
-    label_depth: usize,
-    max_community_fraction: f64,
-) -> Vec<GraphCommunity> {
-    if nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let node_ids = nodes.keys().cloned().collect::<Vec<_>>();
-    let node_index = node_ids
-        .iter()
-        .enumerate()
-        .map(|(idx, id)| (id.as_str(), idx))
-        .collect::<HashMap<_, _>>();
-    let mut adjacency = vec![HashMap::<usize, f64>::new(); node_ids.len()];
-    let mut node_degree = vec![0.0f64; node_ids.len()];
-
-    for edge in edges {
-        let (Some(&source), Some(&target)) = (
-            node_index.get(edge.source.as_str()),
-            node_index.get(edge.target.as_str()),
-        ) else {
-            continue;
-        };
-        if source == target {
-            continue;
-        }
-        let weight = edge.weight.max(0.1) as f64;
-        *adjacency[source].entry(target).or_default() += weight;
-        *adjacency[target].entry(source).or_default() += weight;
-        node_degree[source] += weight;
-        node_degree[target] += weight;
-    }
-
-    let total_edge_weight = node_degree.iter().sum::<f64>() / 2.0;
-    if total_edge_weight <= f64::EPSILON {
-        return node_ids
-            .into_iter()
-            .enumerate()
-            .map(|(id, node_id)| GraphCommunity {
-                id,
-                label: nodes
-                    .get(&node_id)
-                    .map(initial_community_label)
-                    .unwrap_or_else(|| "Community".to_string()),
-                nodes: vec![node_id],
-                cohesion: 1.0,
-            })
-            .collect();
-    }
-
-    let mut node_to_community = (0..node_ids.len()).collect::<Vec<_>>();
-    let mut community_total_degree = node_degree.clone();
-    let m2 = 2.0 * total_edge_weight;
-    let m2_sq = m2 * m2;
-    let mut edges_to_community = HashMap::<usize, f64>::new();
-
-    for _ in 0..LOUVAIN_MAX_ITERATIONS {
-        let mut improved = false;
-        for node_idx in 0..node_ids.len() {
-            let current_community = node_to_community[node_idx];
-            let degree = node_degree[node_idx];
-            if degree <= f64::EPSILON {
-                continue;
-            }
-
-            edges_to_community.clear();
-            for (&neighbor, &weight) in &adjacency[node_idx] {
-                if neighbor == node_idx {
-                    continue;
-                }
-                let neighbor_community = node_to_community[neighbor];
-                *edges_to_community.entry(neighbor_community).or_default() += weight;
-            }
-
-            let edges_to_current = edges_to_community
-                .get(&current_community)
-                .copied()
-                .unwrap_or(0.0);
-            let current_total = community_total_degree[current_community];
-            let mut best_community = current_community;
-            let mut best_gain = 0.0f64;
-
-            for (&target_community, &edges_to_target) in &edges_to_community {
-                if target_community == current_community {
-                    continue;
-                }
-                let target_total = community_total_degree[target_community];
-                let gain = LOUVAIN_RESOLUTION
-                    * ((edges_to_target - edges_to_current) / m2
-                        + (current_total - target_total - degree) * degree / m2_sq);
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_community = target_community;
-                }
-            }
-
-            if best_community != current_community {
-                community_total_degree[current_community] -= degree;
-                community_total_degree[best_community] += degree;
-                node_to_community[node_idx] = best_community;
-                improved = true;
-            }
-        }
-        if !improved {
-            break;
-        }
-    }
-
-    let mut grouped: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    for (node_idx, community_id) in node_to_community.into_iter().enumerate() {
-        grouped
-            .entry(community_id)
-            .or_default()
-            .push(node_ids[node_idx].clone());
-    }
-
-    let max_size =
-        MIN_COMMUNITY_SPLIT_SIZE.max((nodes.len() as f64 * max_community_fraction) as usize);
-    let mut final_groups = Vec::<Vec<String>>::new();
-    for (_, members) in grouped {
-        if members.len() <= max_size {
-            final_groups.push(members);
-        } else {
-            let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for member in members {
-                let key = nodes
-                    .get(&member)
-                    .map(split_key_for_node)
-                    .unwrap_or_else(|| "unknown".to_string());
-                buckets.entry(key).or_default().push(member);
-            }
-            for (_, bucket) in buckets {
-                if bucket.len() <= max_size {
-                    final_groups.push(bucket);
-                } else {
-                    for chunk in bucket.chunks(max_size) {
-                        final_groups.push(chunk.to_vec());
-                    }
-                }
-            }
-        }
-    }
-
-    final_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    communities_from_groups(nodes, edges, final_groups, label_depth)
-}
-
-fn communities_from_groups(
-    nodes: &BTreeMap<String, GraphNode>,
-    edges: &[GraphEdge],
-    groups: Vec<Vec<String>>,
-    label_depth: usize,
-) -> Vec<GraphCommunity> {
-    let node_to_community = groups
-        .iter()
-        .enumerate()
-        .flat_map(|(community_id, members)| {
-            members
-                .iter()
-                .map(move |node_id| (node_id.as_str(), community_id))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut internal_edge_counts = HashMap::<usize, usize>::new();
-    for edge in edges {
-        let source = node_to_community.get(edge.source.as_str()).copied();
-        let target = node_to_community.get(edge.target.as_str()).copied();
-        if let (Some(source), Some(target)) = (source, target) {
-            if source == target {
-                *internal_edge_counts.entry(source).or_default() += 1;
-            }
-        }
-    }
-
-    let mut communities = groups
-        .into_iter()
-        .enumerate()
-        .map(|(id, members)| GraphCommunity {
-            id,
-            label: community_label(&members, nodes, label_depth),
-            cohesion: cohesion_from_count(
-                members.len(),
-                internal_edge_counts.get(&id).copied().unwrap_or(0),
-            ),
-            nodes: members,
-        })
-        .collect::<Vec<_>>();
-    disambiguate_duplicate_community_labels(&mut communities, nodes);
-    communities
-}
-
-fn sort_communities_by_size_and_renumber(communities: &mut [GraphCommunity]) {
-    communities.sort_by(|a, b| {
-        b.nodes
-            .len()
-            .cmp(&a.nodes.len())
-            .then_with(|| a.label.cmp(&b.label))
-    });
-    for (id, community) in communities.iter_mut().enumerate() {
-        community.id = id;
-    }
-}
-
-fn merge_file_communities_by_feature(communities: &mut Vec<GraphCommunity>) {
-    let mut grouped = BTreeMap::<String, Vec<GraphCommunity>>::new();
-    for community in communities.drain(..) {
-        let key = feature_key_for_community(&community)
-            .map(|feature| format!("feature:{feature}"))
-            .unwrap_or_else(|| format!("community:{}", community.id));
-        grouped.entry(key).or_default().push(community);
-    }
-
-    let mut merged = Vec::new();
-    for (key, group) in grouped {
-        if group.len() == 1 {
-            merged.push(group.into_iter().next().expect("single community exists"));
-            continue;
-        }
-
-        let feature = key.strip_prefix("feature:").unwrap_or(&key);
-        let mut nodes = group
-            .into_iter()
-            .flat_map(|community| community.nodes)
-            .collect::<Vec<_>>();
-        nodes.sort();
-        nodes.dedup();
-        merged.push(GraphCommunity {
-            id: merged.len(),
-            label: title_feature(feature),
-            nodes,
-            cohesion: 0.0,
-        });
-    }
-
-    sort_communities_by_size_and_renumber(&mut merged);
-    *communities = merged;
-}
-
-fn feature_key_for_community(community: &GraphCommunity) -> Option<String> {
-    let suffix = community
-        .label
-        .split_once(" :: ")
-        .map(|(_, suffix)| suffix)
-        .unwrap_or(&community.label);
-    ordered_feature_tokens_for_path(suffix)
-        .into_iter()
-        .next()
-        .or_else(|| feature_key_for_file_nodes(&community.nodes))
-        .or_else(|| {
-            ordered_feature_tokens_for_path(&community.label)
-                .into_iter()
-                .next()
-        })
-}
-
-fn title_feature(feature: &str) -> String {
-    let mut chars = feature.chars();
-    let Some(first) = chars.next() else {
-        return "Module".to_string();
-    };
-    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
-}
-
-fn build_file_reference_edges(
-    files: &BTreeMap<String, FileEntry>,
-    allowed_files: &BTreeSet<String>,
-) -> EdgeAccumulator {
-    let mut symbol_files = HashMap::<String, BTreeSet<String>>::new();
-    for path in allowed_files {
-        let Some(file) = files.get(path) else {
-            continue;
-        };
-        for symbol in &file.symbols {
-            symbol_files
-                .entry(symbol.name.clone())
-                .or_default()
-                .insert(file.path.clone());
-        }
-    }
-
-    let mut edges = EdgeAccumulator::default();
-    for source_path in allowed_files {
-        let Some(file) = files.get(source_path) else {
-            continue;
-        };
-        if file.content.is_empty() {
-            continue;
-        }
-        let identifiers = raw_identifiers(&file.content)
-            .into_iter()
-            .filter(|ident| should_consider_reference(ident, ""))
-            .collect::<BTreeSet<_>>();
-        let mut target_weights = BTreeMap::<String, f32>::new();
-        for ident in identifiers {
-            let Some(targets) = symbol_files.get(&ident) else {
-                continue;
-            };
-            if targets.len() > MAX_TARGET_FILES_PER_SYMBOL_NAME {
-                continue;
-            }
-            for target_path in targets {
-                if target_path == source_path {
-                    continue;
-                }
-                *target_weights.entry(target_path.clone()).or_default() += 1.0;
-            }
-        }
-
-        let mut ranked = target_weights.into_iter().collect::<Vec<_>>();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (target_path, weight) in ranked.into_iter().take(MAX_FILE_REFERENCE_EDGES_PER_FILE) {
-            edges.add(
-                &file_node_id(source_path),
-                &file_node_id(&target_path),
-                "module_reference",
-                "INFERRED",
-                0.65,
-                weight.clamp(1.0, 50.0),
-                Some(source_path.clone()),
-                None,
-            );
-        }
-    }
-    edges
-}
-
-fn add_feature_affinity_edges(
-    files: &BTreeMap<String, FileEntry>,
-    allowed_files: &BTreeSet<String>,
-    edges: &mut EdgeAccumulator,
-) {
-    let mut token_files = HashMap::<String, BTreeSet<String>>::new();
-    for path in allowed_files {
-        if !files.contains_key(path) {
-            continue;
-        }
-        for token in feature_tokens_for_path(path) {
-            token_files.entry(token).or_default().insert(path.clone());
-        }
-    }
-
-    for (token, paths) in token_files {
-        if paths.len() < 2 || paths.len() > MAX_FEATURE_AFFINITY_FILES {
-            continue;
-        }
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        let anchor = &paths[0];
-        for path in paths.iter().skip(1) {
-            edges.add(
-                &file_node_id(anchor),
-                &file_node_id(path),
-                "feature_affinity",
-                "INFERRED",
-                0.45,
-                FEATURE_AFFINITY_WEIGHT,
-                Some(format!("feature:{token}")),
-                None,
-            );
-        }
-    }
-}
-
-fn feature_tokens_for_path(path: &str) -> BTreeSet<String> {
-    ordered_feature_tokens_for_path(path).into_iter().collect()
-}
-
-fn ordered_feature_tokens_for_path(path: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut tokens = Vec::new();
-    path.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .flat_map(feature_tokens_for_part)
-        .filter(|token| is_feature_token(token))
-        .for_each(|token| {
-            if seen.insert(token.clone()) {
-                tokens.push(token);
-            }
-        });
-    tokens
-}
-
-fn feature_tokens_for_part(part: &str) -> Vec<String> {
-    let mut tokens = split_identifier(part);
-    if tokens.len() > 1 {
-        tokens.remove(0);
-    }
-    tokens
-}
-
-fn feature_key_for_file_nodes(node_ids: &[String]) -> Option<String> {
-    let mut scores = BTreeMap::<String, usize>::new();
-    for node_id in node_ids {
-        let Some(path) = node_id.strip_prefix("file:") else {
-            continue;
-        };
-        score_feature_tokens_for_path(path, &mut scores);
-    }
-    scores
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        .map(|(token, _)| token)
-}
-
-fn score_feature_tokens_for_path(path: &str, scores: &mut BTreeMap<String, usize>) {
-    for (idx, part) in path
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .filter(|part| !part.is_empty())
-        .enumerate()
-    {
-        let part_lower = part.to_ascii_lowercase();
-        for token in feature_tokens_for_part(part) {
-            if !is_feature_token(&token) {
-                continue;
-            }
-            let mut score = 1 + idx;
-            if part_lower == token {
-                score += 12;
-            } else if part_lower.contains(&token) {
-                score += 8;
-            }
-            *scores.entry(token).or_default() += score;
-        }
-    }
-}
-
-fn is_feature_token(token: &str) -> bool {
-    token.len() >= 3
-        && token.chars().any(|ch| ch.is_ascii_alphabetic())
-        && !token.chars().all(|ch| ch.is_ascii_digit())
-        && !CS_KEYWORDS.contains(&token)
-        && !FEATURE_STOP_TOKENS.contains(&token)
-}
-
-fn module_edge_weight(edge: &GraphEdge) -> Option<f32> {
-    match edge.relation.as_str() {
-        "references_file" | "module_reference" => Some(edge.weight.max(1.0) * 3.0),
-        "feature_affinity" => Some(edge.weight.max(0.1)),
-        "references" => Some(edge.weight.max(0.1) * 2.0),
-        "depends_on" => Some(edge.weight.max(1.0)),
-        _ => None,
-    }
-}
-
-fn module_cohesion_by_file_community(
-    communities: &[GraphCommunity],
-    edges: &[GraphEdge],
-) -> HashMap<usize, f32> {
-    let file_to_community = communities
-        .iter()
-        .flat_map(|community| {
-            community
-                .nodes
-                .iter()
-                .map(move |node_id| (node_id.as_str(), community.id))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut internal = HashMap::<usize, f32>::new();
-    let mut total = HashMap::<usize, f32>::new();
-    for edge in edges {
-        let Some(source_community) = file_to_community.get(edge.source.as_str()).copied() else {
-            continue;
-        };
-        let Some(target_community) = file_to_community.get(edge.target.as_str()).copied() else {
-            continue;
-        };
-        let weight = edge.weight.max(0.1);
-        if source_community == target_community {
-            *internal.entry(source_community).or_default() += weight;
-            *total.entry(source_community).or_default() += weight;
-        } else {
-            *total.entry(source_community).or_default() += weight;
-            *total.entry(target_community).or_default() += weight;
-        }
-    }
-    communities
-        .iter()
-        .map(|community| {
-            let inside = internal.get(&community.id).copied().unwrap_or(0.0);
-            let all = total.get(&community.id).copied().unwrap_or(0.0);
-            let cohesion = if all <= f32::EPSILON {
-                0.0
-            } else {
-                round2((inside / all).clamp(0.0, 1.0))
-            };
-            (community.id, cohesion)
-        })
-        .collect()
-}
-
 fn split_oversized_communities(
     nodes: &BTreeMap<String, GraphNode>,
     node_to_community: HashMap<String, usize>,
@@ -2149,7 +1174,7 @@ fn namespace_node(namespace: &str) -> GraphNode {
         file_path: None,
         line_start: None,
         line_end: None,
-        language: Some("csharp".to_string()),
+        language: None,
         community: None,
         confidence: "EXTRACTED".to_string(),
         metadata: BTreeMap::new(),
@@ -2197,9 +1222,10 @@ fn symbol_label(kind: &str, name: &str) -> String {
 }
 
 fn should_consider_reference(ident: &str, self_name: &str) -> bool {
+    let ident_lower = ident.to_ascii_lowercase();
     ident != self_name
         && ident.len() > 2
-        && !CS_KEYWORDS.contains(&ident)
+        && !is_common_code_stop_token(&ident_lower)
         && ident.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
@@ -2267,170 +1293,6 @@ fn community_label(
         .unwrap_or_else(|| "Community".to_string())
 }
 
-fn disambiguate_duplicate_community_labels(
-    communities: &mut [GraphCommunity],
-    all_nodes: &BTreeMap<String, GraphNode>,
-) {
-    let mut counts = BTreeMap::<String, usize>::new();
-    for community in communities.iter() {
-        *counts.entry(community.label.clone()).or_default() += 1;
-    }
-
-    for community in communities.iter_mut() {
-        if counts.get(&community.label).copied().unwrap_or(0) <= 1 {
-            continue;
-        }
-        if let Some(suffix) = community_label_suffix(&community.label, &community.nodes, all_nodes)
-        {
-            community.label = format!("{} :: {}", community.label, suffix);
-        }
-    }
-}
-
-fn file_count_for_nodes(nodes: &[String], all_nodes: &BTreeMap<String, GraphNode>) -> usize {
-    nodes
-        .iter()
-        .filter_map(|node_id| all_nodes.get(node_id))
-        .filter_map(|node| node.file_path.as_deref())
-        .collect::<BTreeSet<_>>()
-        .len()
-}
-
-fn community_label_suffix(
-    label: &str,
-    nodes: &[String],
-    all_nodes: &BTreeMap<String, GraphNode>,
-) -> Option<String> {
-    let mut file_counts = BTreeMap::<String, usize>::new();
-    for node_id in nodes {
-        let Some(node) = all_nodes.get(node_id) else {
-            continue;
-        };
-        if let Some(file_path) = &node.file_path {
-            *file_counts.entry(file_path.clone()).or_default() += 1;
-        }
-    }
-    if let Some((file_path, _)) = file_counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-    {
-        let suffix = path_suffix_for_label(label, &file_path);
-        if !suffix.is_empty() {
-            return Some(suffix);
-        }
-    }
-
-    nodes
-        .iter()
-        .filter_map(|node_id| all_nodes.get(node_id))
-        .find(|node| !is_file_node(node))
-        .map(|node| node.label.clone())
-}
-
-fn community_scope_prefix(label: &str) -> Option<String> {
-    let prefix = label
-        .split(" :: ")
-        .next()
-        .unwrap_or(label)
-        .trim()
-        .replace('\\', "/");
-    if prefix.contains('/') {
-        Some(prefix)
-    } else {
-        None
-    }
-}
-
-fn path_matches_scope(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn path_suffix_for_label(label: &str, file_path: &str) -> String {
-    let label_parts = label.split('/').collect::<Vec<_>>();
-    let file_parts = file_path.split('/').collect::<Vec<_>>();
-    let mut common = 0usize;
-    while common < label_parts.len()
-        && common < file_parts.len()
-        && label_parts[common] == file_parts[common]
-    {
-        common += 1;
-    }
-    let suffix = if common < file_parts.len() {
-        file_parts[common..].join("/")
-    } else {
-        file_parts
-            .iter()
-            .rev()
-            .take(2)
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    if suffix.len() <= 120 {
-        suffix
-    } else {
-        file_parts
-            .iter()
-            .rev()
-            .take(3)
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("/")
-    }
-}
-
-fn is_file_node(node: &GraphNode) -> bool {
-    node.node_type == "file"
-}
-
-fn sorted_counts(counts: BTreeMap<String, usize>) -> Vec<CountItem> {
-    let mut items = counts
-        .into_iter()
-        .map(|(name, count)| CountItem { name, count })
-        .collect::<Vec<_>>();
-    items.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-    items
-}
-
-fn node_degree_json_for_community(node: &GraphNode, degree: usize, community: usize) -> Value {
-    json!({
-        "id": node.id,
-        "label": node.label,
-        "type": node.node_type,
-        "degree": degree,
-        "file_path": node.file_path,
-        "line_start": node.line_start,
-        "community": community,
-    })
-}
-
-fn summarize_node(node: &GraphNode, incoming: usize, outgoing: usize, degree: usize) -> String {
-    let connectivity = match degree {
-        0 => "isolated",
-        1 => "minimally connected",
-        2..=4 => "lightly connected",
-        5..=19 => "moderately connected",
-        _ => "highly connected",
-    };
-    format!(
-        "`{}` is a {} node that is {} ({} total edges: {} incoming, {} outgoing).",
-        node.label, node.node_type, connectivity, degree, incoming, outgoing
-    )
-}
-
-fn top_level_dir(path: &str) -> &str {
-    path.split('/').next().unwrap_or(path)
-}
-
 fn round2(value: f32) -> f32 {
     (value * 100.0).round() / 100.0
 }
@@ -2447,211 +1309,76 @@ fn cohesion_from_count(node_count: usize, actual_edges: usize) -> f32 {
     }
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn is_common_code_stop_token(token: &str) -> bool {
+    COMMON_CODE_STOP_TOKENS.contains(&token)
 }
 
-fn cypher_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
-fn neo4j_label(value: &str) -> String {
-    let mut out = value
-        .chars()
-        .filter_map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                Some(ch)
-            } else if ch == '_' {
-                Some(ch)
-            } else {
-                None
-            }
-        })
-        .collect::<String>();
-    if out.is_empty()
-        || !out
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic())
-    {
-        out.insert_str(0, "Node");
-    }
-    out
-}
-
-fn neo4j_relation(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else {
-            out.push('_');
-        }
-    }
-    while out.contains("__") {
-        out = out.replace("__", "_");
-    }
-    let out = out.trim_matches('_').to_string();
-    if out.is_empty() {
-        "RELATED_TO".to_string()
-    } else {
-        out
-    }
-}
-
-const CS_KEYWORDS: &[&str] = &[
-    "abstract",
-    "as",
+const COMMON_CODE_STOP_TOKENS: &[&str] = &[
+    "args",
+    "async",
+    "await",
     "base",
-    "bool",
     "break",
-    "byte",
     "case",
     "catch",
-    "char",
-    "checked",
     "class",
     "const",
     "continue",
-    "decimal",
     "default",
-    "delegate",
     "do",
-    "double",
     "else",
     "enum",
+    "error",
     "event",
-    "explicit",
-    "extern",
+    "export",
     "false",
+    "field",
+    "file",
     "finally",
-    "fixed",
-    "float",
     "for",
-    "foreach",
-    "goto",
+    "from",
+    "function",
+    "get",
     "if",
-    "implicit",
-    "in",
-    "int",
+    "impl",
+    "import",
+    "init",
     "interface",
-    "internal",
-    "is",
-    "lock",
-    "long",
+    "let",
+    "macro",
+    "method",
+    "mod",
+    "module",
+    "mut",
     "namespace",
     "new",
+    "none",
     "null",
-    "object",
-    "operator",
-    "out",
-    "override",
+    "package",
+    "param",
     "params",
-    "private",
-    "protected",
-    "public",
-    "readonly",
-    "ref",
+    "property",
     "return",
-    "sbyte",
-    "sealed",
-    "short",
-    "sizeof",
-    "stackalloc",
+    "self",
+    "set",
     "static",
-    "string",
     "struct",
+    "super",
     "switch",
     "this",
     "throw",
+    "trait",
     "true",
     "try",
-    "typeof",
-    "uint",
-    "ulong",
-    "unchecked",
-    "unsafe",
-    "ushort",
+    "type",
+    "undefined",
+    "use",
     "using",
     "var",
-    "virtual",
     "void",
-    "volatile",
     "while",
-    "get",
-    "set",
-    "init",
+    "yield",
     "value",
-];
-
-const FEATURE_STOP_TOKENS: &[&str] = &[
-    "asset",
-    "assets",
-    "activity",
-    "base",
-    "btn",
-    "build",
-    "button",
-    "client",
-    "code",
-    "com",
-    "common",
-    "component",
-    "components",
-    "container",
-    "core",
-    "csharp",
-    "csharpframework",
-    "custom",
-    "data",
-    "fix",
-    "framework",
-    "game",
-    "gameview",
-    "gen",
-    "generate",
-    "generated",
-    "group",
-    "handler",
-    "helper",
-    "hot",
-    "hotfix",
-    "icon",
-    "info",
-    "item",
-    "items",
-    "list",
-    "logic",
-    "lua",
-    "lua2csharp",
-    "lua2csharpcode",
-    "main",
-    "manager",
-    "module",
-    "modules",
-    "node",
-    "page",
-    "pages",
-    "panel",
-    "popup",
-    "runtime",
-    "script",
-    "scripts",
-    "simple",
-    "ui",
-    "util",
-    "utils",
-    "view",
-    "views",
 ];
 
 #[cfg(test)]
@@ -2660,7 +1387,7 @@ mod tests {
     use crate::types::{FileEntry, Symbol};
 
     #[test]
-    fn builds_graph_with_path_and_explain() {
+    fn builds_graph_with_path_and_stats() {
         let mut files = BTreeMap::new();
         files.insert(
             "Services/UserService.cs".to_string(),
@@ -2704,11 +1431,30 @@ mod tests {
                 content: "class UserRepository {}".to_string(),
             },
         );
-        let graph = CodeGraph::build(&files, &HashMap::new());
-        assert!(graph.stats().nodes >= 4);
-        let explain = graph.explain("UserService", 10).expect("node exists");
-        assert_eq!(explain.node.label, "UserService");
+        let deps = HashMap::from([(
+            "Services/UserService.cs".to_string(),
+            vec!["Data/UserRepository.cs".to_string()],
+        )]);
+        let graph = CodeGraph::build(&files, &deps);
+        assert!(graph.nodes.len() >= 4);
+        assert!(!graph.communities.is_empty());
         let path = graph.shortest_path("UserService", "UserRepository", 5);
         assert!(path.found);
+        let service_id = graph.file_graph.id("Services/UserService.cs").unwrap();
+        let repository_id = graph.file_graph.id("Data/UserRepository.cs").unwrap();
+        let allowed = vec![true; graph.file_graph.paths.len()];
+        let mut teleport = vec![0.0; graph.file_graph.paths.len()];
+        teleport[service_id] = 1.0;
+        let rank = graph
+            .file_graph
+            .personalized_page_rank(&teleport, &allowed, 0.85, 1e-7);
+        assert!(rank[service_id] > rank[repository_id]);
+        assert!(rank[repository_id] > 0.0);
+        assert_eq!(
+            graph
+                .file_graph
+                .weighted_shortest_path(service_id, repository_id, &allowed),
+            vec![service_id, repository_id]
+        );
     }
 }

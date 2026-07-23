@@ -16,11 +16,11 @@ Write generated wiki files under the target repo's `.codedb-mcp/deepwiki` direct
 ## Workflow
 
 1. Ensure `codedb-mcp` is configured and healthy for the repo. If not, use the `codedb-mcp` skill first.
-2. Call `codedb_status`, `codedb_tree` or `codedb_ls`, and `codedb_analyze` to understand size, languages, and graph shape.
-3. Call `codedb_module_map` before page planning. Treat its output as a module atlas: dependency cohesion, cross-folder roots, c-TF-IDF-like terms, entry points, key symbols, and semantic neighbors.
-4. Build an initial page plan from business/domain signals, not folder names alone. Use `codedb_search`, `codedb_find`, `codedb_deps`, `codedb_callers`, and `codedb_graph` to verify or challenge module-map candidates.
-5. Treat `codedb_communities` as a low-level hint, not the source of truth. Split or merge modules based on module-map evidence, code relationships, and the agent's domain reasoning.
-6. Use `codedb_bundle` for repeated outlines, reads, dependency checks, and searches.
+2. Call `codedb_status`, `codedb_tree`, `codedb_ls`, `codedb_glob`, or `codedb_flow` to understand size, languages, source roots, and high-level evidence.
+3. Use `codedb_module_atlas` only when a broad dependency-connected module/file inventory is useful for planning or visualization.
+4. Build an initial page plan from exact repository evidence, not folder names alone. Use `codedb_search`, `codedb_find`, `codedb_deps`, `codedb_callers`, `codedb_callpath`, `codedb_outline`, and `codedb_symbol` to verify or challenge candidate boundaries.
+5. Split or merge modules based on dependencies, callers, callpaths, entry points, and cited file evidence.
+6. Keep lookups atomic. Consume each outline, connected range, read, dependency check, or search before choosing the next exact evidence operation.
 7. Write concise pages with code citations: module responsibility, key entry points, main flows, dependencies, extension points, and risks.
 
 ## Page Shape
@@ -34,8 +34,8 @@ Write generated wiki files under the target repo's `.codedb-mcp/deepwiki` direct
 ## Evidence Rules
 
 - Prefer `codedb_callers` for "who uses this symbol" questions.
-- Prefer `codedb_deps` and `codedb_graph` for module relationships.
-- Prefer `codedb_module_map` for DeepWiki page planning. It is designed for business-module discovery, while `codedb_communities` is raw graph clustering.
+- Prefer `codedb_deps`, `codedb_callers`, and `codedb_callpath` for module relationships.
+- Prefer `codedb_module_atlas` only for broad dependency-connected inventory; page boundaries still need focused evidence from deps, callers, outlines, symbols, and reads.
 - Prefer `codedb_outline` before reading full files.
 - Prefer `codedb_search regex=true` plus `rg` only when validating exact raw text counts.
 - Record uncertainty explicitly when code evidence is weak or a module boundary is inferred.

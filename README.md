@@ -8,7 +8,7 @@
   <img alt="Rust MCP" src="https://img.shields.io/badge/Rust-MCP-000000?logo=rust">
   <img alt="tree-sitter indexing" src="https://img.shields.io/badge/tree--sitter-indexing-2f6f9f">
   <img alt="local first" src="https://img.shields.io/badge/local--first-.codedb--mcp-3b82f6">
-  <img alt="Minish Model2Vec" src="https://img.shields.io/badge/Minish-Model2Vec-7c3aed">
+  <img alt="graph first" src="https://img.shields.io/badge/retrieval-graph--first-7c3aed">
 </p>
 
 <p>English | <a href="README.zh-CN.md">简体中文</a></p>
@@ -28,7 +28,7 @@
 
 ## Project Overview
 
-`codebase-mcp` turns a local repository into a persistent MCP code intelligence service. It keeps tree-sitter indexed source data, symbols, references, dependencies, graph metadata, lexical indexes, and vector search data under the target repo's `.codedb-mcp` directory.
+`codebase-mcp` turns a local repository into a persistent MCP code intelligence service. It keeps tree-sitter indexed source data, symbols, references, dependencies, graph metadata, and exact lexical indexes under the target repo's `.codedb-mcp` directory.
 
 Warm MCP calls are designed to be millisecond-level inside a persistent server process. See [Benchmark Snapshot](#benchmark-snapshot) and [MCP Tool Benchmark Matrix](#mcp-tool-benchmark-matrix) for warm latency and `rg` comparisons.
 
@@ -36,7 +36,7 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 
 | Area | What It Provides |
 |---|---|
-| Fast MCP tools | Indexed exact/regex search, symbol/word-trigram/vector search, answer-oriented context/explore, outlines, definitions, callers, dependencies, fuzzy file lookup, query pipelines, and 100-call bundles. |
+| Fast MCP tools | Indexed exact/regex and symbol/word-trigram search, graph-atlas flow/context, outlines, definitions, callers, dependencies, fuzzy file lookup, and query pipelines. |
 | Module discovery | Dependency-connected file components plus dependency-weighted label propagation, with terms and paths used as explainable labels and evidence. |
 | Code Module Atlas | A packaged meet-blog-style 3D viewer with one star per source file, module/file lists, dependency edges, and file focus/details. |
 | DeepWiki | Local repository documentation generated from MCP evidence and the active agent's reasoning, with business-module-first pages and cited source files. |
@@ -47,14 +47,14 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 
 The server keeps a tree-sitter indexed, project-local code database under `.codedb-mcp` and exposes tools for:
 
-- fast exact/regex search, symbol/word-trigram search, and lazy vector search;
-- answer-oriented `codedb_context` / `codedb_explore` for architecture, flow, and feature-area questions under explicit output budgets;
+- fast exact/regex search and symbol/word-trigram search;
+- graph-first `codedb_flow` / `codedb_context`: an unscoped call returns the atlas, while `path_glob` projects structural roots, community boundaries, weighted bridges, and call/dependency evidence;
 - symbol outlines and definition lookup;
 - LSP-like callers anchored to a definition path and line;
 - direct and reverse file dependencies, including transitive walks;
-- fuzzy file lookup, path globbing, compact query pipelines, and 100-call bundles;
+- fuzzy file lookup, path globbing, and compact query pipelines;
 - version, status, freshness, and scan-scope diagnostics;
-- graph summaries, lazy Louvain communities, module planning, atlas export, and DeepWiki evidence gathering.
+- graph-backed flow evidence, module atlas export, and DeepWiki evidence gathering.
 
 ## Codex Token Observation
 
@@ -64,7 +64,7 @@ The `codedb-mcp` skill includes a lightweight Codex transcript observer:
 node skills\codedb-mcp\scripts\codex-observe.mjs --project u3dclient --since 24h --top 12
 ```
 
-It scans `~/.codex/sessions` line by line, filters sessions by project `cwd`, and reports model token counts, tool-output token estimates, codedb call totals, bundle child breakdowns, high-output calls, broad reads/searches, non-codedb source lookups, and missed `codedb_bundle` / `codedb_context` opportunities. It is a diagnostic script only; it does not modify transcripts or the MCP runtime.
+It scans `~/.codex/sessions` line by line, filters sessions by project `cwd`, and reports model token counts, tool-output token estimates, codedb call totals, high-output calls, broad reads/searches, non-codedb source lookups, and missed compact-context opportunities. It is a diagnostic script only; it does not modify transcripts or the MCP runtime.
 
 ## Code Module Atlas
 
@@ -86,13 +86,13 @@ npm run dev -- --port 5174 --strictPort
 
 The `skills/deepwiki` skill builds local DeepWiki-style documentation from MCP evidence and the active agent's reasoning. It starts from dependency-aware module candidates, then writes business-module-first pages with cited files, entry points, flows, dependencies, and risk notes. It does not require a separate model API.
 
-The intended distribution model is setup-guide first: give an agent `setup-for-agent.md`, let it create `.codedb-mcp`, use the default HuggingFace cache when it already exists, fall back to a second-drive cache when it does not, and then ask the human whether this specific agent should register the MCP server. The `codedb-mcp` skill is for using the tools after setup, not for installing them.
+The intended distribution model is setup-guide first: give an agent `setup-for-agent.md`, let it create `.codedb-mcp` and run an index check, then ask the human whether this specific agent should register the MCP server. No model download is required. The `codedb-mcp` skill is for using the tools after setup, not for installing them.
 
 ## Benchmark Snapshot
 
 Benchmark target: `u3dclient`.
 
-Benchmarks below were rerun on Windows. Index and warm tool timings were refreshed on 2026-06-02; the Codex feature-analysis token row for alliance rally / join-rally was refreshed on 2026-06-03 with the current skill behavior: no feature-call count limit and no forced bundle output clamp. Tool timings are warm in-process measurements from one loaded server-style process after the relevant lazy sidecars are loaded; they do not include process startup or cache-open time.
+The graph-only agent benchmarks below were rerun on Windows on 2026-07-23. The server treats `task` as an opaque label: repository selection uses file/symbol graphs, dependency communities, exact source handoffs, callpaths, and optional same-file connected ranges rather than a query model or task-keyword boosts. Effective tokens are `input - cached_input + output` from Codex JSON events. There is no source-call quota or forced output clamp.
 
 Current index status with the Unity C# benchmark config:
 
@@ -100,26 +100,33 @@ Current index status with the Unity C# benchmark config:
 - Chunks: 31,428.
 - Outlines: 18,852.
 - Graph: 19,746 nodes, 162,823 edges, and 1,356 cached communities.
-- Vector search: Model2Vec `minishlab/potion-code-16M` file embeddings are built lazily on first natural-language search and queried with flat cosine scan.
 - Storage: `u3dclient\.codedb-mcp`.
-- Cache v23 sidecars: generation-named compact `index.*.bin`, `fingerprints.*.bin`, offset-addressed `outlines.*.bin` / `outlines_index.*.bin`, lazy `word_index.bin`/`word_hits.bin`, lazy `text_search_index.bin`, lazy `callers.bin`, lazy `deps.*.bin`, optional legacy `embeddings.bin`, and manifest-last commits.
+- Cache v28 sidecars: generation-named compact `index.*.bin`, `fingerprints.*.bin`, offset-addressed `outlines.*.bin` / `outlines_index.*.bin`, lazy `word_index.bin`/`word_hits.bin`, lazy `text_search_index.bin`, lazy `callers.bin`, lazy `deps.*.bin`, persistent `graph.bin`, and manifest-last commits.
 
-Codex feature-analysis token benchmark:
+Startup-to-main-interface trace, one completed MCP/no-MCP pair with the same English prompt and model:
 
-The runs below used the same custom Codex model, the same `u3dclient` repository, and the same Chinese prompts. `codedb-mcp enabled` used the default `codedb-mcp` skill workflow and MCP server. `codedb-mcp disabled` temporarily hid the project codedb MCP server and codedb skill directories, leaving Codex to inspect source through ordinary shell-based lookup. `contextplus` was disabled by prompt in both variants. Each row is one real `codex exec` run, measured from Codex self-reported tokens.
-
-| Prompt | codedb-mcp enabled | codedb-mcp disabled | Token savings | Runtime change |
+| Variant | Effective tokens | Time | Source-tool calls | Tool output chars |
 |---|---:|---:|---:|---:|
-| World-map marching logic | 92,639 tokens / 272.5s | 231,810 tokens / 617.8s | 139,171 tokens saved, 60.0% | 55.9% faster |
-| Hero attributes and power calculation | 114,436 tokens / 348.0s | 173,576 tokens / 379.9s | 59,140 tokens saved, 34.1% | 8.4% faster |
-| Alliance rally and join-rally logic | 128,865 tokens / 300.4s | 185,448 tokens / 485.2s | 56,583 tokens saved, 30.5% | 38.1% faster |
-| **Total** | **335,940 tokens / 920.9s** | **590,834 tokens / 1,482.9s** | **254,894 tokens saved, 43.1%** | **37.9% faster** |
+| codedb-mcp | 122,851 | 414.6s | 41 MCP calls | 244,291 |
+| shell / `rg` | 224,922 | 732.8s | 47 commands | 742,368 |
+
+For this lifecycle trace, codedb-mcp reduced effective tokens by 45.4%, elapsed time by 43.4%, and tool-output characters by 67.1%. The answer connected launch, the AOT/hot-update state handoff, framework initialization, login/full-data readiness, city/scene transition, the exact main-panel open, and the final `OnShow` readiness body.
+
+Broader feature-analysis reference runs used the same English prompts and model. MCP rows are completed non-regressing runs from the graph-only series; the RG controls were run together with codedb disabled. They demonstrate current quality and cost, not a deterministic SLA: repeated wide runs still show agent-level convergence variance.
+
+| Scenario | codedb-mcp | shell / `rg` | Effective-token change | Tool-output change |
+|---|---:|---:|---:|---:|
+| World-map marching | 228,915 tokens / 796.4s / 161 calls / 479,094 chars | 253,905 tokens / 787.5s / 102 commands / 1,023,944 chars | 9.8% lower | 53.2% lower |
+| Hero attributes and power | 207,282 tokens / 569.6s / 129 calls / 514,907 chars | 227,248 tokens / 656.9s / 104 commands / 668,652 chars | 8.8% lower | 23.0% lower |
+| Alliance rally/create/join | 171,449 tokens / 454.0s / 113 calls / 397,873 chars | 196,057 tokens / 619.1s / 37 commands / 851,689 chars | 12.6% lower | 53.3% lower |
+
+Accuracy review found the completed MCP answers materially covered the requested end-to-end behavior and distinguished active runtime code from comments/legacy paths. The main remaining issue is call count and convergence variance on broad multi-branch questions. A final consolidated rerun with the same model could not complete because the Codex account began rejecting `gpt-5.6-sol` as unsupported; those failed runs are excluded rather than reported as zero-token wins.
 
 Index and cache baseline:
 
 | Scenario | Time | Peak WS / private | Notes |
 |---|---:|---:|---|
-| Cold rebuild | 13.818s | 226.9 / 220.2 MB | tree-sitter declaration parse, source-on-demand dependencies, lazy search sidecars, lazy embeddings, compact cache save |
+| Cold rebuild | 13.818s | 226.9 / 220.2 MB | historical pre-v28 result; rerun pending for the graph-only cache |
 | Cache-hit index open | 0.741s | 107.8 / 106.1 MB | unchanged files/config, manifest cache hit |
 | Status open | 0.454s | 14.4 / 8.1 MB | count/status command with existing cache |
 | Trigram text sidecar size | 107.7 MB | n/a | sorted trigram lookup plus contiguous file-id postings |
@@ -145,9 +152,9 @@ The table is intentionally three columns so it fits GitHub README pages without 
 | `codedb_outline`<br>One-file symbol outline | sampled files 0.088-0.351ms; 100-call p95 0.214ms after first load | none |
 | `codedb_symbol`<br>Symbol definition lookup | 2.021ms | regex approximates text only |
 | `codedb_text_search`<br>Trigram full-text and regex search | same-query warm exact `PoolManager` 0.202ms, `Joystick` 0.442ms; scoped `NetworkListenerManager` 0.103ms; Alliance regex 0.148ms | equivalent `rg`: 5.007s, 5.859s, 77.011ms, and 103.702ms; codedb is about 24,840x / 13,250x / 748x / 701x faster on these warm text routes |
-| `codedb_search`<br>Fixed symbol/word-trigram/vector fusion | scoped exact `PoolManager` 1.328ms; symbol-aware `PoolManager` 22.255ms; business phrase search 36.226ms | no exact `rg` equivalent; regex route delegates to `codedb_text_search` |
-| `codedb_context`<br>Ranked answer context without source dump | `PoolManager` 6.573ms; business phrase 29.670ms after vector load; output about 1.5k-2.0k tokens in sampled runs | replaces broad search/outline/deps setup loops |
-| `codedb_explore`<br>Budgeted source-context excerpts | `PoolManager` 7.050ms with `max_chars=10000`; business phrase 29.037ms with `max_chars=12000`; sampled output about 2.5k-3.0k tokens | replaces repeated read calls; output is capped by `max_chars` |
+| `codedb_search`<br>Symbol/word-trigram lexical ranking | historical timings pending graph-only rerun | regex route delegates to `codedb_text_search` |
+| `codedb_context`<br>Graph atlas or scoped graph evidence | historical timings pending graph-only rerun | replaces broad search/outline/deps setup loops |
+| `codedb_context`<br>Budgeted source-context excerpts | `PoolManager` 7.050ms with `max_chars=10000`; business phrase 29.037ms with `max_chars=12000`; sampled output about 2.5k-3.0k tokens | replaces repeated read calls; output is capped by `max_chars` |
 | `codedb_word`<br>Exact identifier inverted index | 101.526ms including lazy word sidecar access | partial word grep only |
 | `codedb_callers`<br>Definition-anchored references | `PoolManager` 12.722ms avg, 8ms steady samples; `Joystick` 17.968ms | no semantic anchor |
 | `codedb_hot`<br>Recently modified indexed files | 2.116ms | none |
@@ -156,27 +163,19 @@ The table is intentionally three columns so it fits GitHub README pages without 
 | `codedb_edit`<br>Read-only compatibility stub | trivial error response | none |
 | `codedb_changes`<br>Files changed since sequence | 7.849ms | none |
 | `codedb_snapshot`<br>JSON snapshot of files/symbols/deps | 1.213s | none |
-| `codedb_bundle`<br>Up to 100 tools in one request | fast metadata/deps/outline/read 100-op stress wall 0.825s; mixed search/callers/deps/outline 1.776s; heavy regex 12.373s | no MCP batching |
 | `codedb_remote`<br>Remote compatibility stub | trivial error response | none |
 | `codedb_projects`<br>Projects loaded in server process | 0.013ms | none |
 | `codedb_find`<br>Fuzzy file/path lookup | validation samples 20-26ms; matrix sample 47.150ms | no fuzzy ranking |
 | `codedb_query`<br>find/search/filter/limit/outline pipeline | validation samples 9-60ms; matrix sample 63.546ms | no equivalent single tool |
 | `codedb_glob`<br>Glob over indexed paths | Alliance `.cs` glob 4.465ms | `rg --files -g` 52.961ms; codedb is 11.9x faster |
 | `codedb_ls`<br>Immediate indexed directory children | 1.421ms | partial file list only |
-| `codedb_graph`<br>Graph summary/export | first lazy graph summary 2.032s | none |
-| `codedb_explain`<br>Explain graph node and edges | 7.035ms after graph data is present | none |
-| `codedb_path`<br>Shortest graph path | 120.446ms after graph data is present | none |
-| `codedb_communities`<br>Lazy Louvain communities | 270.886ms with cached communities | none |
-| `codedb_module_map`<br>DeepWiki module planning | 6.643s | none |
 | `codedb_module_atlas`<br>Module/file atlas JSON export | warm export 7.278s; full sampled export 7.960s, peak 286.2 / 289.1 MB, 18,852 file points, 1,742 modules | none |
-| `codedb_analyze`<br>Graph stats and suggested questions | 37.419ms after graph data is present | none |
-| `codedb_export`<br>Graph JSON/GraphML/Cypher export | 973.305ms to write a 100-node JSON export | none |
 
 Java smoke benchmark on `gameserver`:
 
 | Scenario | Files | Chunks | Symbols | Time | Peak memory |
 |---|---:|---:|---:|---:|---:|
-| Cold build after config/model-path change | 6,940 | 13,966 | 245,238 | 3.939s | 212.7 / 212.4 MB |
+| Historical cold build before graph-only cache v28 | 6,940 | 13,966 | 245,238 | 3.939s | 212.7 / 212.4 MB |
 | Cache-hit index open | 6,940 | 13,966 | 245,238 | 0.394s | 73.7 / 69.3 MB |
 
 Multi-language smoke coverage includes C#, Java, Rust, Python, Lua, TypeScript, C, and C++ parser paths: 8 files, 8 chunks, 14 symbols, 0.069s, peak 2.0 / 0.5 MB.
@@ -185,13 +184,12 @@ Rust smoke check on this repository: 32 indexed files, 1,183 chunks, 2,214 symbo
 ## Recommended Setup Flow
 
 1. Give the target agent `setup-for-agent.md`.
-2. The agent creates `<repo-root>\.codedb-mcp` and `<repo-root>\.codedb-mcp\models`.
-3. On Windows, the agent checks the default HuggingFace hub cache first. If `minishlab/potion-code-16M` already has a valid snapshot there, config points to that snapshot. If the hub cache exists but the model is missing, the agent downloads to `C:\Users\<user>\.cache\huggingface\hub\codedb-mcp\models\potion-code-16M`. If the default hub cache does not exist, it uses the second available drive, such as `D:\codedb-mcp-cache\models\potion-code-16M`.
-4. The agent writes `<repo-root>\.codedb-mcp\codedb-mcp.toml` from the demo config, writes the model as an absolute path, and shows the human which languages are configured.
-5. The human can edit `extensions`, `root_paths`, `include_paths`, `exclude_paths`, `skip_dirs`, and the model path before first indexing.
-6. The agent runs an index check.
-7. The agent asks whether this specific agent should register MCP. If yes, it uses its own MCP mechanism.
-8. Restart or reload the agent MCP session and check `/mcp`.
+2. The agent creates `<repo-root>\.codedb-mcp`.
+3. The agent writes `<repo-root>\.codedb-mcp\codedb-mcp.toml` from the demo config and shows the human the scan scope.
+4. The human can edit `extensions`, `root_paths`, `include_paths`, `exclude_paths`, and `skip_dirs` before first indexing.
+5. The agent runs an index check; no model download is required.
+6. The agent asks whether this specific agent should register MCP. If yes, it uses its own MCP mechanism.
+7. Restart or reload the agent MCP session and check `/mcp`.
 
 The MCP command shape is:
 
@@ -203,26 +201,26 @@ This project intentionally keeps installation explicit: setup prepares local pro
 
 ## What It Does
 
-- Exposes local MCP tools for trigram text search, hybrid semantic search, outlines, symbols, typed callers, dependencies, file discovery, graph analysis, DeepWiki module planning, module atlas export, batching, and exports.
+- Exposes local MCP tools for trigram text search, lexical symbol search, outlines, symbols, typed callers, dependencies, graph-backed flow evidence, atomic connected ranges, and module atlas export.
 - Indexes configured source languages through one explicit config file: `<repo-root>/.codedb-mcp/codedb-mcp.toml`.
 - Stores generated data inside the target repo under `.codedb-mcp`. Delete that directory to remove local cache and generated wiki/index data.
 - Uses a unified tree-sitter parser layer, not Roslyn/JDT. C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, and C++ all emit the same `FileEntry`/`Symbol` model. C#/Java typed callers and dependencies remain the strongest path because their namespace/package import rules are implemented on top of that shared AST output.
-- Uses Minish ecosystem pieces: `model2vec-rs` with explicit-path `minishlab/potion-code-16M`, file-level semantic units, word/trigram lexical hits, exact identifier indexes, and on-demand flat-cosine vectors for natural-language search.
-- Builds a graphify-style code graph, computes Louvain communities lazily for `codedb_communities`, and exposes Rust-native `codedb_module_map`/`codedb_module_atlas` outputs from a dependency-connected file graph with label propagation, dependency cohesion, cross-folder evidence, semantic-neighbor probes, key symbols, and c-TF-IDF-like labels.
+- Uses BM25/word-trigram lexical hits and exact identifier indexes for explicit search; broad natural-language flow selection is performed by the agent over the graph atlas rather than by a query model.
+- Builds graph-backed evidence for flow/callpath tools and exposes `codedb_module_atlas` output from a dependency-connected file graph with label propagation, dependency cohesion, key symbols, and c-TF-IDF-like labels.
 - Uses a filesystem-event queue in MCP mode and applies queued changes every 5s by default, so large edit bursts avoid full source-tree scans.
 
 ## Technology Architecture
 
 1. **Explicit project-local config**: all behavior comes from `.codedb-mcp/codedb-mcp.toml`. There are no environment-variable switches for indexing behavior.
-2. **Project-local storage**: cache payloads, manifests, Louvain caches, and DeepWiki output live under `.codedb-mcp`. Deleting that directory removes all generated data for the repo.
+2. **Project-local storage**: cache payloads, manifests, and generated output live under `.codedb-mcp`. Deleting that directory removes all generated data for the repo.
 3. **Scanner**: walks the repo with explicit extensions, max file size, project `.gitignore` behavior, scan roots, include paths, exclude globs, and skip dirs. Nested Git worktrees/submodules under the target root are scanned as normal source directories. Unity runtime scans can be limited to `Assets`, `Packages`, and `Library/PackageCache` while excluding `**/Editor/**`.
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, Lua `require()` imports, and graph nodes, but not Roslyn/JDT-level semantic binding.
-6. **Search indexes**: cold indexing builds chunk metadata, symbol-definition chunk hits, and dependency references. `codedb_text_search` adds a codedb-style trigram sidecar with sorted lookup entries and contiguous file-id postings for fast exact/regex text search. `codedb_search` fuses symbol hits, word/trigram text hits, and lazy Model2Vec vectors without a cold lexical-ranker build. Exact identifier hits and Model2Vec file embeddings are generated lazily when callers or natural-language search actually need them.
-7. **Memory-shaped incremental cache**: cache v23 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, word-index hits, caller results, embeddings, forward/reverse dependencies, graph objects, and Louvain results are no longer all resident by default. Tools read exact lines, offset-addressed outlines, trigram postings, word hits, caller sidecars, embeddings, dependencies, or graph data on demand. Watcher refreshes are event-queued, parse only changed files, reuse old dependency sidecars, and let lazy search sidecars rebuild on demand when their source fingerprint changes.
-8. **Graph layer**: builds a graphify-style code graph lazily. Small repos keep file, namespace/package, symbol, dependency, and reference edges; large repos keep graph construction behind graph/community/module tools while symbol data stays in outline/search/callers indexes. Louvain communities and subcommunities are computed lazily on first request and cached under `.codedb-mcp`.
-9. **Module atlas layer**: `codedb_module_map` and `codedb_module_atlas` run in Rust. They first split files by dependency-connected components, then do dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary clustering basis. `codedb_module_atlas` exports Embedding Atlas-ready JSON.
-10. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index, and batch-capable tools plus `codedb_bundle` reduce MCP round trips.
+6. **Search indexes**: cold indexing builds chunk metadata, symbol-definition hits, and dependency references. `codedb_text_search` adds a codedb-style trigram sidecar with sorted lookup entries and contiguous file-id postings for fast exact/regex text search. `codedb_search` uses BM25 plus exact symbol/word evidence; it does not load a query model.
+7. **Memory-shaped incremental cache**: cache v28 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, word-index hits, caller results, forward/reverse dependencies, and graph objects are not all resident by default. Tools read exact lines, offset-addressed outlines, trigram postings, word hits, caller sidecars, dependencies, or graph data on demand. Watcher refreshes are event-queued, parse only changed files, reuse old dependency sidecars, and let lazy search sidecars rebuild when their source fingerprint changes.
+8. **Graph layer**: builds a graphify-style code graph lazily for graph-backed flow, callpath fallback, dependency evidence, and atlas metadata. Symbol data stays in outline/search/callers indexes.
+9. **Module atlas layer**: `codedb_module_atlas` first splits files by dependency-connected components, then does dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary grouping rule. It exports Embedding Atlas-ready JSON.
+10. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index and expose atomic graph/source operations for progressive evidence gathering.
 11. **Setup guide and skills package**: `setup-for-agent.md` owns installation guidance. `skills/codedb-mcp` is standalone for tool usage and includes the executable, config template, MCP reference, and tool guidance. `skills/deepwiki` builds local DeepWiki-style docs from MCP evidence plus the active agent's reasoning. `skills/code-module-atlas` calls `codedb_module_atlas` and packages the local meet-blog-style module/file graph webpage.
 
 ## Configuration
@@ -246,9 +244,6 @@ root_paths = []
 include_paths = ["Library/PackageCache"]
 exclude_paths = []
 
-[embedding]
-model = "C:/Users/<user>/.cache/huggingface/hub/codedb-mcp/models/potion-code-16M"
-
 [logging]
 enabled = false
 file = ".codedb-mcp/codedb-mcp.log"
@@ -260,7 +255,7 @@ enabled = true
 dir = ".codedb-mcp"
 ```
 
-There are no environment-variable toggles. Edit the config file explicitly. `root_paths` can limit scanning to source roots such as `Assets`, `Packages`, and `Library/PackageCache`; `include_paths` adds extra roots even when a parent is skipped; `exclude_paths` accepts globs such as `**/Editor/**` for Unity runtime-only scans. `respect_gitignore=true` reads project `.gitignore` files, but nested Git worktrees/submodules inside the target root are still indexed unless excluded by `skip_dirs`, `exclude_paths`, or file extension rules. The model path is explicit and absolute; on Windows the setup guide uses the default HuggingFace cache when present, otherwise it falls back to the second available drive. `[logging]` is disabled by default; when enabled, MCP tool calls and file-watch digest batches are written through a bounded non-blocking queue and background writer. Tool lines include `elapsed_ms`, `status`, and `failure_reason` for failures. Watcher digest lines include queued event counts, changed/deleted counts, digest status, elapsed time, and cache stats. `codedb_bundle` logs only its child tools with `mode=bundle`; queue overflow drops log lines instead of slowing indexing or MCP.
+There are no environment-variable toggles. Edit the config file explicitly. `root_paths` can limit scanning to source roots such as `Assets`, `Packages`, and `Library/PackageCache`; `include_paths` adds extra roots even when a parent is skipped; `exclude_paths` accepts globs such as `**/Editor/**` for Unity runtime-only scans. `respect_gitignore=true` reads project `.gitignore` files, but nested Git worktrees/submodules inside the target root are still indexed unless excluded by `skip_dirs`, `exclude_paths`, or file extension rules. `[logging]` is disabled by default; when enabled, MCP tool calls and file-watch digest batches are written through a bounded non-blocking queue and background writer. Tool lines include `elapsed_ms`, `status`, and `failure_reason` for failures. Watcher digest lines include queued event counts, changed/deleted counts, digest status, elapsed time, and cache stats. Queue overflow drops log lines instead of slowing indexing or MCP.
 
 ## Build And CLI
 
@@ -284,7 +279,7 @@ target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml s
 target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_status "{}"
 ```
 
-MCP mode answers the protocol handshake before the initial index finishes, then builds the default project index in the background. Early tool calls may wait for that first build. Watching is enabled by default through `[watch] enabled = true` and `poll_interval_seconds = 5`; filesystem events are queued and applied as one serialized batch on each tick. The same tick checks the config file hash. If scan scope, extensions, include/exclude paths, max file size, gitignore behavior, storage, or model settings change while MCP is running, codedb-mcp keeps serving the old index, performs one full background reindex, then atomically swaps to the new index and rebuilds watcher roots. Parse or reindex failure keeps the old index. Cache commits are manifest-last and generation-based: if the process is killed mid-index, the previous manifest still points to the previous usable cache, partial new sidecars are ignored, and stale unreferenced generation files are cleaned on the next startup. Lazy sidecars such as text search, word hits, and callers are source-validated and rebuilt on demand instead of synchronously deleted during reload. Use `--no-watch` for static benchmark runs.
+MCP mode answers the protocol handshake before the initial index finishes, then builds the default project index in the background. Early tool calls may wait for that first build. Watching is enabled by default through `[watch] enabled = true` and `poll_interval_seconds = 5`; filesystem events are queued and applied as one serialized batch on each tick. The same tick checks the config file hash. If scan scope, extensions, include/exclude paths, max file size, gitignore behavior, or storage settings change while MCP is running, codedb-mcp keeps serving the old index, performs one full background reindex, then atomically swaps to the new index and rebuilds watcher roots. Parse or reindex failure keeps the old index. Cache commits are manifest-last and generation-based: if the process is killed mid-index, the previous manifest still points to the previous usable cache, partial new sidecars are ignored, and stale unreferenced generation files are cleaned on the next startup. Lazy sidecars such as text search, word hits, and callers are source-validated and rebuilt on demand instead of synchronously deleted during reload. Use `--no-watch` for static benchmark runs.
 
 ## Batch Examples
 
@@ -344,26 +339,17 @@ MCP mode answers the protocol handshake before the initial index finishes, then 
 }
 ```
 
-`codedb_communities` uses lazy Louvain clustering:
+`codedb_module_atlas` exports dependency-connected module/file atlas JSON:
 
 ```powershell
-target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_communities "{`"community_limit`":10}"
-target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_communities "{`"community_id`":0,`"children`":true,`"community_limit`":20}"
-```
-
-Overview calls return community IDs, labels, member counts, and cohesion. Add `children=true` or `subcommunities=true` with a `community_id` to split only that community's subgraph; child clusters are cached in `.codedb-mcp/louvain-subcommunities.bin`.
-
-`codedb_module_map` is the preferred DeepWiki planning call. It uses the Rust dependency-connected module graph, then adds dependency cohesion, cross-folder roots, semantic-neighbor probes, entry points, key symbols, and c-TF-IDF-like labels:
-
-```powershell
-target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_module_map "{`"path_prefix`":`"Assets/Scripts`",`"limit`":40,`"min_files`":2,`"semantic_neighbors`":5}"
+target\release\codebase-mcp.exe --config u3dclient\.codedb-mcp\codedb-mcp.toml --root u3dclient tool codedb_module_atlas "{`"path_prefix`":`"Assets/Scripts`",`"limit`":40,`"min_files`":2}"
 ```
 
 ## Skills
 
 The `skills/` directory is intended to be copied as a standalone package.
 
-- `setup-for-agent.md`: installation guide for agents. It reuses the default HuggingFace cache when present, falls back to the second Windows drive when absent, and writes project-local config with an absolute model path.
+- `setup-for-agent.md`: installation guide for agents. It writes project-local scan/storage config and runs an index check without downloading a model.
 - `skills/codedb-mcp`: includes `assets/codebase-mcp.exe`, a config template, MCP registration reference, tool guidance, and `scripts/codex-observe.mjs` for Codex transcript token diagnostics. It does not own setup.
 - `skills/deepwiki`: creates DeepWiki-style local documentation using local `codedb_*` tools plus the active agent's reasoning. It emphasizes business module boundaries over folder-only or community-only grouping.
 - `skills/code-module-atlas`: creates a local 3D module/file atlas webpage by calling `codedb_module_atlas`, then adapting the bundled meet-blog-style viewer. Generated repo-specific JSON stays ignored.

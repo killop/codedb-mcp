@@ -10,7 +10,6 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 ignore = "0.4"
-model2vec-rs = "0.2"
 memmap2 = "0.9"
 notify = "8"
 parking_lot = "0.12"

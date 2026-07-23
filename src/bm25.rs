@@ -56,6 +56,10 @@ impl Bm25Index {
         builder.finish()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.doc_count == 0
+    }
+
     pub fn query(
         &self,
         query: &str,
@@ -222,10 +226,11 @@ impl Bm25Index {
     fn term_score(&self, doc_id: usize, term_freq: u32, idf: f32) -> f32 {
         let k1 = 1.5f32;
         let b = 0.75f32;
+        let delta = 0.5f32;
         let freq = term_freq as f32;
         let doc_len = self.doc_lens.get(doc_id).copied().unwrap_or_default() as f32;
         let denom = freq + k1 * (1.0 - b + b * doc_len / self.avg_doc_len.max(1.0));
-        idf * (freq * (k1 + 1.0)) / denom
+        idf * ((freq * (k1 + 1.0)) / denom + delta)
     }
 
     pub fn write_postings(&self, path: &Path) -> Result<()> {

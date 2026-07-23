@@ -2,17 +2,12 @@ use crate::event_log::EventLogConfig;
 use crate::indexer::{DiagnosticsOptions, IndexOptions, StorageOptions};
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub scan: ScanConfig,
-    #[serde(default)]
-    pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
@@ -43,12 +38,6 @@ pub struct ScanConfig {
     pub exclude_paths: Vec<String>,
     #[serde(default = "default_skip_dirs")]
     pub skip_dirs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EmbeddingConfig {
-    #[serde(default = "default_embedding_model")]
-    pub model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,7 +95,6 @@ impl AppConfig {
                 .filter(|item| !item.is_empty())
                 .collect(),
             max_file_bytes: self.scan.max_file_bytes,
-            embedding_model: self.embedding.model.clone(),
             respect_gitignore: self.scan.respect_gitignore,
             root_paths: normalize_config_paths(&self.scan.root_paths),
             include_paths: self
@@ -165,14 +153,6 @@ impl Default for ScanConfig {
     }
 }
 
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            model: default_embedding_model(),
-        }
-    }
-}
-
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
@@ -226,7 +206,7 @@ fn default_root_paths() -> Vec<String> {
 }
 
 fn default_include_paths() -> Vec<String> {
-    vec!["Library/PackageCache".to_string()]
+    Vec::new()
 }
 
 fn default_exclude_paths() -> Vec<String> {
@@ -249,14 +229,12 @@ fn default_skip_dirs() -> Vec<String> {
         "coverage",
         "out",
         ".codedb-mcp",
-        "library",
         "temp",
         "logs",
         "obj",
         "bin",
         "build",
         "builds",
-        "usersettings",
     ]
     .into_iter()
     .map(str::to_string)
@@ -277,92 +255,6 @@ fn default_max_file_bytes() -> u64 {
 
 fn default_watch_poll_interval_seconds() -> u64 {
     5
-}
-
-fn default_embedding_model() -> String {
-    default_embedding_model_path()
-}
-
-#[cfg(windows)]
-fn default_embedding_model_path() -> String {
-    if let Some(path) = default_hf_embedding_model_path() {
-        return path_to_config_string(&path);
-    }
-    let drives = (b'C'..=b'Z')
-        .filter_map(|letter| {
-            let root = format!("{}:/", letter as char);
-            Path::new(&root).exists().then_some(letter as char)
-        })
-        .collect::<Vec<_>>();
-    let drive = drives
-        .get(1)
-        .or_else(|| drives.first())
-        .copied()
-        .unwrap_or('C');
-    format!("{drive}:/codedb-mcp-cache/models/potion-code-16M")
-}
-
-#[cfg(windows)]
-fn default_hf_embedding_model_path() -> Option<PathBuf> {
-    let hub = default_hf_hub_dir()?;
-    if let Some(snapshot) = existing_hf_model_snapshot(&hub) {
-        return Some(snapshot);
-    }
-    hub.exists().then(|| {
-        hub.join("codedb-mcp")
-            .join("models")
-            .join("potion-code-16M")
-    })
-}
-
-#[cfg(windows)]
-fn default_hf_hub_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".cache")
-            .join("huggingface")
-            .join("hub"),
-    )
-}
-
-#[cfg(windows)]
-fn existing_hf_model_snapshot(hub: &Path) -> Option<PathBuf> {
-    let repo = hub.join("models--minishlab--potion-code-16M");
-    let refs_main = repo.join("refs").join("main");
-    if let Ok(commit) = fs::read_to_string(&refs_main) {
-        let snapshot = repo.join("snapshots").join(commit.trim());
-        if is_model_dir(&snapshot) {
-            return Some(snapshot);
-        }
-    }
-    let snapshots = repo.join("snapshots");
-    let mut entries = fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && is_model_dir(path))
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries.into_iter().next()
-}
-
-#[cfg(windows)]
-fn is_model_dir(path: &Path) -> bool {
-    path.join("tokenizer.json").exists()
-        && path.join("model.safetensors").exists()
-        && (path.join("config.json").exists()
-            || path.join("config_sentence_transformers.json").exists())
-}
-
-#[cfg(windows)]
-fn path_to_config_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-#[cfg(not(windows))]
-fn default_embedding_model_path() -> String {
-    ".codedb-mcp/models/potion-code-16M".to_string()
 }
 
 fn default_storage_dir() -> String {

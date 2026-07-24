@@ -31,6 +31,9 @@ pub fn analyze_source(language: &str, content: &str) -> ParsedSource {
         symbols: Vec::new(),
     };
     visit(tree.root_node(), &mut context);
+    if language == "csharp" {
+        recover_csharp_member_declarations(content, &mut context.symbols);
+    }
     normalize_symbol_ranges(&mut context.symbols, lines.len().max(1));
 
     ParsedSource {
@@ -119,7 +122,11 @@ struct ParseContext<'a> {
 fn visit(node: Node<'_>, context: &mut ParseContext<'_>) {
     collect_namespace_or_import(node, context);
     let skip_children = if let Some(symbol) = symbol_from_node(node, context) {
-        let skip_children = skip_symbol_children(symbol.kind.as_str());
+        // A recoverable parse error can make one method node swallow later
+        // sibling declarations. Walk errored symbol nodes so tree-sitter's
+        // recovered declaration children remain indexable; valid bodies stay
+        // atomic and are still skipped.
+        let skip_children = skip_symbol_children(symbol.kind.as_str()) && !node.has_error();
         context.symbols.push(symbol);
         skip_children
     } else {
@@ -418,10 +425,13 @@ fn symbol_name_node(node: Node<'_>) -> Option<Node<'_>> {
 
 fn first_variable_declarator_name(node: Node<'_>) -> Option<Node<'_>> {
     if matches!(node.kind(), "variable_declarator" | "variable_declaration") {
-        return node
+        if let Some(name) = node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("declarator"))
-            .and_then(find_identifier_like);
+            .and_then(find_identifier_like)
+        {
+            return Some(name);
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -490,6 +500,275 @@ fn normalize_symbol_ranges(symbols: &mut Vec<Symbol>, line_count: usize) {
         }
         symbols[idx].line_end = end;
     }
+}
+
+fn recover_csharp_member_declarations(content: &str, symbols: &mut Vec<Symbol>) {
+    let active = mask_comments("csharp", content);
+    let lines = active.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    let mut depth_before = Vec::with_capacity(lines.len());
+    let mut depth_after = Vec::with_capacity(lines.len());
+    let mut depth = 0usize;
+    for line in &lines {
+        depth_before.push(depth);
+        let (opens, closes) = csharp_brace_counts(line);
+        depth = depth.saturating_add(opens).saturating_sub(closes);
+        depth_after.push(depth);
+    }
+    let containers = symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind.as_str(),
+                "class" | "interface" | "struct" | "record"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for container in containers {
+        let container_start = container.line_start.saturating_sub(1).min(lines.len() - 1);
+        let container_end = container.line_end.saturating_sub(1).min(lines.len() - 1);
+        let member_depth = depth_before[container_start].saturating_add(1);
+        let container_indent = leading_indent_width(lines[container_start]);
+        let member_indent = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.line_start > container.line_start
+                    && symbol.line_start <= container.line_end
+                    && !matches!(
+                        symbol.kind.as_str(),
+                        "class" | "interface" | "struct" | "record"
+                    )
+            })
+            .filter_map(|symbol| lines.get(symbol.line_start.saturating_sub(1)))
+            .map(|line| leading_indent_width(line))
+            .filter(|indent| *indent > container_indent)
+            .min()
+            .unwrap_or(container_indent.saturating_add(4));
+        for idx in container_start..=container_end {
+            if depth_before[idx] != member_depth
+                && leading_indent_width(lines[idx]) != member_indent
+            {
+                continue;
+            }
+            let Some(name) = csharp_member_declaration_name(lines[idx], &container.name) else {
+                continue;
+            };
+            let line_start = idx + 1;
+            if symbols.iter().any(|symbol| {
+                symbol.name == name
+                    && symbol.line_start <= line_start
+                    && line_start <= symbol.line_end.max(symbol.line_start)
+                    && matches!(symbol.kind.as_str(), "method" | "constructor")
+            }) {
+                continue;
+            }
+            let line_end = csharp_member_end_line(
+                &lines,
+                &depth_before,
+                &depth_after,
+                idx,
+                container_end,
+                member_depth,
+            );
+            symbols.push(Symbol {
+                kind: if name == container.name {
+                    "constructor".into()
+                } else {
+                    "method".into()
+                },
+                name,
+                line_start,
+                line_end,
+                detail: lines[idx].trim().to_string(),
+            });
+        }
+    }
+}
+
+fn csharp_member_declaration_name(line: &str, container_name: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return None;
+    }
+    let (open, _) = csharp_declaration_parameter_range(trimmed)?;
+    let prefix = trimmed.get(..open)?.trim_end();
+    if prefix.ends_with('.') || prefix.ends_with(':') || prefix.contains('=') {
+        return None;
+    }
+    let identifiers = identifier_words(prefix);
+    let name = identifiers.last()?.clone();
+    let name_start = prefix.rfind(&name)?;
+    if prefix
+        .get(..name_start)
+        .and_then(|before| before.chars().next_back())
+        .is_some_and(|ch| matches!(ch, '.' | ':'))
+    {
+        return None;
+    }
+    if matches!(
+        name.as_str(),
+        "if" | "for" | "foreach" | "while" | "switch" | "catch" | "using" | "lock"
+    ) || identifiers
+        .iter()
+        .any(|identifier| identifier == "delegate" || identifier == "return" || identifier == "new")
+    {
+        return None;
+    }
+    if name != container_name && identifiers.len() < 2 {
+        return None;
+    }
+    Some(name)
+}
+
+fn csharp_declaration_parameter_range(line: &str) -> Option<(usize, usize)> {
+    let mut candidates = Vec::new();
+    for (open, ch) in line.char_indices() {
+        if ch != '(' {
+            continue;
+        }
+        let Some(close) = matching_paren_end(line, open) else {
+            continue;
+        };
+        let suffix = line.get(close + 1..)?.trim_start();
+        if suffix.is_empty()
+            || suffix.starts_with('{')
+            || suffix.starts_with(';')
+            || suffix.starts_with("=>")
+            || suffix.starts_with("where ")
+        {
+            candidates.push((open, close));
+        }
+    }
+    candidates.into_iter().next()
+}
+
+fn matching_paren_end(line: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in line.get(open..)?.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn csharp_member_end_line(
+    lines: &[&str],
+    _depth_before: &[usize],
+    _depth_after: &[usize],
+    start: usize,
+    container_end: usize,
+    _member_depth: usize,
+) -> usize {
+    let declaration = lines[start];
+    if declaration.contains("=>") || (declaration.contains(')') && declaration.contains(';')) {
+        return start + 1;
+    }
+    let mut body_started = false;
+    let mut local_depth = 0usize;
+    for idx in start..=container_end {
+        let (opens, closes) = csharp_brace_counts(lines[idx]);
+        if opens > 0 {
+            body_started = true;
+        }
+        if body_started {
+            local_depth = local_depth.saturating_add(opens).saturating_sub(closes);
+        }
+        if body_started && local_depth == 0 {
+            return idx + 1;
+        }
+    }
+    start + 1
+}
+
+fn leading_indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn csharp_brace_counts(line: &str) -> (usize, usize) {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        match ch {
+            '{' => opens += 1,
+            '}' => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
+fn identifier_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 fn node_text(node: Node<'_>, content: &str) -> Option<String> {
@@ -772,4 +1051,25 @@ fn clean_lua_symbol_name(value: impl AsRef<str>) -> Option<String> {
         text = suffix;
     }
     clean_symbol_name(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csharp_fields_are_indexed_for_receiver_and_shared_state_resolution() {
+        let parsed = analyze_source(
+            "csharp",
+            "public class Flow { private IService service; private object _task; public void Run() {} }",
+        );
+        let fields = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "field")
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&"service"), "{fields:?}");
+        assert!(fields.contains(&"_task"), "{fields:?}");
+    }
 }

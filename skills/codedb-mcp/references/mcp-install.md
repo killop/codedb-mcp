@@ -22,60 +22,27 @@ args = [
   "<repo-root>",
 ]
 
-[mcp_servers.codedb-mcp.tools.codedb_status]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_context]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_flow]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_tree]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_text_search]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_search]
+[mcp_servers.codedb-mcp.tools.codedb_graph_query]
 approval_mode = "approve"
 
 [mcp_servers.codedb-mcp.tools.codedb_symbol]
 approval_mode = "approve"
 
-[mcp_servers.codedb-mcp.tools.codedb_word]
+[mcp_servers.codedb-mcp.tools.codedb_outline]
 approval_mode = "approve"
 
 [mcp_servers.codedb-mcp.tools.codedb_read]
 approval_mode = "approve"
 
-[mcp_servers.codedb-mcp.tools.codedb_outline]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_callers]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_callpath]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_deps]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_find]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_glob]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_ls]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_query]
-approval_mode = "approve"
-
-[mcp_servers.codedb-mcp.tools.codedb_diagnostics]
+[mcp_servers.codedb-mcp.tools.codedb_status]
 approval_mode = "approve"
 ```
+
+Use `codedb_graph_query` for both structural discovery and evidence-chain
+continuation. Community/File metrics replace the flow-atlas wrapper; callers,
+call paths, and dependencies are expressed as graph patterns. Composite and
+administrative/compatibility operations remain internal or CLI-only so the MCP
+tool surface stays atomic and graph-language-first.
 
 Use `--no-watch` only when the host agent or benchmark needs a static index:
 

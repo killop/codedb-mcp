@@ -6,6 +6,7 @@ mod config;
 mod config_watcher;
 mod event_log;
 mod graph;
+mod graph_query;
 mod indexer;
 mod language;
 mod mcp;

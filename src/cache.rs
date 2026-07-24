@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u32 = 28;
+const CACHE_VERSION: u32 = 32;
 const MANIFEST_FILE: &str = "manifest.json";
 const FINGERPRINTS_FILE: &str = "fingerprints.bin";
 const PAYLOAD_FILE: &str = "index.bin";

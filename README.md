@@ -36,7 +36,7 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 
 | Area | What It Provides |
 |---|---|
-| Fast MCP tools | Indexed exact/regex and symbol/word-trigram search, graph-atlas flow/context, outlines, definitions, callers, dependencies, fuzzy file lookup, and query pipelines. |
+| Fast MCP tools | One declarative property-graph language for clustering, dependencies, callers, call paths, state, and control evidence, plus exact bodies/outlines/ranges. |
 | Module discovery | Dependency-connected file components plus dependency-weighted label propagation, with terms and paths used as explainable labels and evidence. |
 | Code Module Atlas | A packaged meet-blog-style 3D viewer with one star per source file, module/file lists, dependency edges, and file focus/details. |
 | DeepWiki | Local repository documentation generated from MCP evidence and the active agent's reasoning, with business-module-first pages and cited source files. |
@@ -45,16 +45,15 @@ Warm MCP calls are designed to be millisecond-level inside a persistent server p
 
 ## MCP Tools
 
-The server keeps a tree-sitter indexed, project-local code database under `.codedb-mcp` and exposes tools for:
+The server keeps a tree-sitter indexed, project-local code database under `.codedb-mcp` and exposes five atomic MCP tools:
 
-- fast exact/regex search and symbol/word-trigram search;
-- graph-first `codedb_flow` / `codedb_context`: an unscoped call returns the atlas, while `path_glob` projects structural roots, community boundaries, weighted bridges, and call/dependency evidence;
-- symbol outlines and definition lookup;
-- LSP-like callers anchored to a definition path and line;
-- direct and reverse file dependencies, including transitive walks;
-- fuzzy file lookup, path globbing, and compact query pipelines;
-- version, status, freshness, and scan-scope diagnostics;
-- graph-backed flow evidence, module atlas export, and DeepWiki evidence gathering.
+- `codedb_graph_query`, a Cypher-like `MATCH / SHORTEST / WHERE / RETURN / ORDER BY / LIMIT` language with scalar/property comparisons, communities, rankable file metrics, typed directed edges, finite paths, call-site arguments, parameter bindings, branch effects, guards, and shared-state joins;
+- `codedb_symbol` for one exact definition/body;
+- `codedb_outline` for one exact file;
+- `codedb_read` for one exact source range;
+- `codedb_status` for explicit health/freshness checks.
+
+Caller, call-path, dependency, flow-atlas, lexical, composite, and administrative wrappers remain CLI/internal. `codedb_bundle` is not exposed.
 
 ## Codex Token Observation
 
@@ -92,16 +91,17 @@ The intended distribution model is setup-guide first: give an agent `setup-for-a
 
 Benchmark target: `u3dclient`.
 
-The graph-only agent benchmarks below were rerun on Windows on 2026-07-23. The server treats `task` as an opaque label: repository selection uses file/symbol graphs, dependency communities, exact source handoffs, callpaths, and optional same-file connected ranges rather than a query model or task-keyword boosts. Effective tokens are `input - cached_input + output` from Codex JSON events. There is no source-call quota or forced output clamp.
+The agent benchmarks below are the last completed pre-property-query baseline from Windows on 2026-07-23. They remain historical controls and are not presented as results for the new `codedb_graph_query` planner; the consolidated MCP/RG rerun is pending. MCP has no natural-language task router, source-call quota, or forced output clamp; the agent submits explicit graph patterns.
 
 Current index status with the Unity C# benchmark config:
 
-- Indexed runtime files: 18,852.
-- Chunks: 31,428.
-- Outlines: 18,852.
-- Graph: 19,746 nodes, 162,823 edges, and 1,356 cached communities.
+- Indexed runtime files: 16,153.
+- Chunks: 27,772.
+- Outlines: 16,153.
+- Indexed symbols: 375,816.
+- Graph: 17,018 nodes, 98,804 edges, and 1,259 cached communities.
 - Storage: `u3dclient\.codedb-mcp`.
-- Cache v28 sidecars: generation-named compact `index.*.bin`, `fingerprints.*.bin`, offset-addressed `outlines.*.bin` / `outlines_index.*.bin`, lazy `word_index.bin`/`word_hits.bin`, lazy `text_search_index.bin`, lazy `callers.bin`, lazy `deps.*.bin`, persistent `graph.bin`, and manifest-last commits.
+- Cache v32 sidecars: generation-named compact `index.*.bin`, `fingerprints.*.bin`, offset-addressed `outlines.*.bin` / `outlines_index.*.bin`, lazy `word_index.bin`/`word_hits.bin`, lazy `text_search_index.bin`, lazy `callers.bin`, lazy `deps.*.bin`, persistent `graph.bin`, and manifest-last commits. v32 rebuilds C# field facts used by receiver and shared-state resolution.
 
 Startup-to-main-interface trace, one completed MCP/no-MCP pair with the same English prompt and model:
 
@@ -145,6 +145,7 @@ The table is intentionally three columns so it fits GitHub README pages without 
 
 | Tool / Purpose | MCP benchmark | rg comparison |
 |---|---|---|
+| `codedb_graph_query`<br>Typed property-graph evidence chains | property-query benchmark rerun pending; correctness smoke covers shortest call/dispatch paths, call-site guards, argument-to-parameter binding, branch `PREVENTS/REACHES`, and shared-state producer joins | no equivalent single `rg` command |
 | `codedb_index`<br>Build/rebuild local index | cold rebuild 13.818s; peak 226.9 / 220.2 MB | none |
 | `codedb_status`<br>Health, counts, scan state | one-shot status open 0.454s; cache hit | none |
 | `codedb_version`<br>Server/package version | trivial response; no project index load | none |
@@ -201,11 +202,11 @@ This project intentionally keeps installation explicit: setup prepares local pro
 
 ## What It Does
 
-- Exposes local MCP tools for trigram text search, lexical symbol search, outlines, symbols, typed callers, dependencies, graph-backed flow evidence, atomic connected ranges, and module atlas export.
+- Exposes one read-only graph query language plus exact symbols, outlines, atomic source ranges, and status. Callers, dependencies, call paths, clustering, shared state, and control flow are graph patterns rather than separate MCP wrappers.
 - Indexes configured source languages through one explicit config file: `<repo-root>/.codedb-mcp/codedb-mcp.toml`.
 - Stores generated data inside the target repo under `.codedb-mcp`. Delete that directory to remove local cache and generated wiki/index data.
 - Uses a unified tree-sitter parser layer, not Roslyn/JDT. C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, and C++ all emit the same `FileEntry`/`Symbol` model. C#/Java typed callers and dependencies remain the strongest path because their namespace/package import rules are implemented on top of that shared AST output.
-- Uses BM25/word-trigram lexical hits and exact identifier indexes for explicit search; broad natural-language flow selection is performed by the agent over the graph atlas rather than by a query model.
+- Uses BM25/word-trigram lexical hits and exact identifier indexes for explicit CLI/internal search; MCP discovery is structural through `Community`/`File` graph queries rather than a query model.
 - Builds graph-backed evidence for flow/callpath tools and exposes `codedb_module_atlas` output from a dependency-connected file graph with label propagation, dependency cohesion, key symbols, and c-TF-IDF-like labels.
 - Uses a filesystem-event queue in MCP mode and applies queued changes every 5s by default, so large edit bursts avoid full source-tree scans.
 
@@ -217,8 +218,8 @@ This project intentionally keeps installation explicit: setup prepares local pro
 4. **Unified language layer**: extension dispatch selects a tree-sitter grammar for C#, Java, Rust, Python, Lua, JavaScript, TypeScript/TSX, C, or C++. The parser emits the same `FileEntry`/`Symbol` model for every language and visits declarations without descending into large method bodies.
 5. **Code-aware references**: C#/Java namespace/package imports, qualified names, aliases, static using, annotations, and attribute suffixes feed typed callers and dependency edges. Rust and the other non C#/Java languages currently provide indexed search, outlines, imports/includes/use declarations, Lua `require()` imports, and graph nodes, but not Roslyn/JDT-level semantic binding.
 6. **Search indexes**: cold indexing builds chunk metadata, symbol-definition hits, and dependency references. `codedb_text_search` adds a codedb-style trigram sidecar with sorted lookup entries and contiguous file-id postings for fast exact/regex text search. `codedb_search` uses BM25 plus exact symbol/word evidence; it does not load a query model.
-7. **Memory-shaped incremental cache**: cache v28 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, word-index hits, caller results, forward/reverse dependencies, and graph objects are not all resident by default. Tools read exact lines, offset-addressed outlines, trigram postings, word hits, caller sidecars, dependencies, or graph data on demand. Watcher refreshes are event-queued, parse only changed files, reuse old dependency sidecars, and let lazy search sidecars rebuild when their source fingerprint changes.
-8. **Graph layer**: builds a graphify-style code graph lazily for graph-backed flow, callpath fallback, dependency evidence, and atlas metadata. Symbol data stays in outline/search/callers indexes.
+7. **Memory-shaped incremental cache**: cache v32 follows the bounded-content-cache lesson from `justrach/codedb`: full file bodies, chunk preview text, repeated chunk file paths, repeated language/kind strings, word-index hits, caller results, forward/reverse dependencies, and graph objects are not all resident by default. Tools read exact lines, offset-addressed outlines, trigram postings, word hits, caller sidecars, dependencies, or graph data on demand. Watcher refreshes are event-queued, parse only changed files, reuse old dependency sidecars, and let lazy search sidecars rebuild when their source fingerprint changes.
+8. **Graph layer**: combines dependency communities and rankable file metrics with lazy semantic providers for precise calls, interface dispatch, call sites, arguments, parameter bindings, conditions, control actions, preprocessor guards, and shared-state reads/writes. The read-only Cypher-like planner separates matching, recursive expansion, filtering, projection, comparison, and ordering; `MATCH SHORTEST` uses bidirectional connector search.
 9. **Module atlas layer**: `codedb_module_atlas` first splits files by dependency-connected components, then does dependency-weighted label propagation inside each component. Path and token terms are used for naming, evidence, and oversized-component splitting, not as the primary grouping rule. It exports Embedding Atlas-ready JSON.
 10. **MCP runtime**: implemented with the Rust `rmcp` SDK over stdio. Tools operate against a warm in-process index and expose atomic graph/source operations for progressive evidence gathering.
 11. **Setup guide and skills package**: `setup-for-agent.md` owns installation guidance. `skills/codedb-mcp` is standalone for tool usage and includes the executable, config template, MCP reference, and tool guidance. `skills/deepwiki` builds local DeepWiki-style docs from MCP evidence plus the active agent's reasoning. `skills/code-module-atlas` calls `codedb_module_atlas` and packages the local meet-blog-style module/file graph webpage.

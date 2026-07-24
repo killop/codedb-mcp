@@ -2,6 +2,11 @@ use crate::cache::{
     CachedCallerEntry, CachedCallerHit, CachedDepsSnapshot, CachedFileEntry, ProjectCache,
 };
 use crate::event_log::{self, ToolLogContext};
+use crate::graph_query::{
+    self, Direction as GraphDirection, NodePattern as GraphNodePattern, QueryEdge as PropertyEdge,
+    QueryNode as PropertyNode, QueryProvider, RelationshipPattern as GraphRelationshipPattern,
+    Scalar as GraphScalar,
+};
 use crate::indexer::{
     ChangedFile, Codebase, IndexOptions, build_globset, hash_content, normalize_rel_path,
     strip_strings_and_line_comment,
@@ -74,6 +79,12 @@ const SYMBOL_BODY_QUALIFIED_TAIL_CALL_LEAD_LIMIT: usize = 8;
 const SYMBOL_BODY_FLOW_HANDOFF_PREVIEW_LIMIT: usize = 2;
 const SYMBOL_BODY_FLOW_HANDOFF_PREVIEW_MAX_LINES: usize = 18;
 const SYMBOL_BODY_FLOW_HANDOFF_PREVIEW_MAX_CHARS: usize = 360;
+#[allow(dead_code)]
+const SYMBOL_BODY_DISPATCH_PREVIEW_LIMIT: usize = 6;
+#[allow(dead_code)]
+const SYMBOL_BODY_DISPATCH_PREVIEW_MAX_LINES: usize = 30;
+#[allow(dead_code)]
+const SYMBOL_BODY_DISPATCH_PREVIEW_MAX_CHARS: usize = 700;
 const SYMBOL_BODY_DATA_TYPE_LEAD_LIMIT: usize = 5;
 const SYMBOL_BODY_DATA_TYPE_MIN_SCORE: usize = 40;
 const SYMBOL_BODY_DATA_TYPE_REF_HITS_PER_LEAD: usize = 1;
@@ -618,7 +629,7 @@ fn format_cached_status(
     status: &crate::cache::CachedStatusSnapshot,
 ) -> String {
     format!(
-        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  retrieval: graph atlas + scoped dependency/call projection\n  scan: ready\n  extensions: {}\n  cache: hit\n  storage: {}\n",
+        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  retrieval: property graph query + lazy semantic expansion\n  scan: ready\n  extensions: {}\n  cache: hit\n  storage: {}\n",
         status.seq,
         status.files,
         status.files,
@@ -933,6 +944,7 @@ fn dispatch_index_tool(index: &Codebase, name: &str, args: &Value) -> Result<Str
         "codedb_word" => handle_word(index, args),
         "codedb_callers" => handle_callers(index, args),
         "codedb_callpath" => handle_callpath(index, args),
+        "codedb_graph_query" => handle_graph_query(index, args),
         "codedb_diagnostics" => handle_diagnostics(args),
         "codedb_hot" => Ok(handle_hot(index, args)),
         "codedb_deps" => handle_deps(index, args),
@@ -1091,6 +1103,25 @@ fn handle_outline(index: &Codebase, args: &Value) -> Result<String> {
         "{} ({}, {} lines, {} bytes)\n",
         file.path, file.language, file.line_count, file.byte_size
     ));
+    if !get_bool(args, "include_connected_ranges")
+        && file
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                matches!(
+                    symbol.kind.as_str(),
+                    "method" | "function" | "constructor" | "procedure" | "macro" | "property"
+                )
+            })
+            .take(2)
+            .count()
+            >= 2
+    {
+        out.push_str(&format!(
+            "same-file atomicity: if the answer needs two or more listed members, rerun codedb_outline path={} compact=true include_connected_ranges=true before opening individual symbol bodies.\n",
+            file.path
+        ));
+    }
     for symbol in &file.symbols {
         if compact {
             out.push_str(&format!(
@@ -1204,7 +1235,7 @@ fn append_outline_connected_member_ranges(
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "  L{line_start}-L{line_end} members=[{names}] -> codedb_read path={} line_start={line_start} line_end={line_end} compact=true connected_range=true include_symbol_leads=false\n",
+            "  L{line_start}-L{line_end} members=[{names}] -> codedb_read path={} line_start={line_start} line_end={line_end} compact=true connected_range=true include_symbol_leads=true\n",
             file.path
         ));
     }
@@ -1389,9 +1420,6 @@ fn handle_symbol(index: &Codebase, args: &Value) -> Result<String> {
             );
             if !expand_body_evidence {
                 append_symbol_body_ordered_leads(index, file, symbol, &body, &mut out, false)?;
-                append_symbol_body_continuation_chains(
-                    index, file, symbol, &body, false, &mut out,
-                )?;
                 let literal_source =
                     symbol_body_literal_source(file, symbol, &active_content, &body);
                 append_symbol_body_literal_bridge_leads(index, file, &literal_source, &mut out);
@@ -1424,11 +1452,334 @@ fn handle_symbol(index: &Codebase, args: &Value) -> Result<String> {
                     false,
                 )?;
             } else {
-                out.push_str("progressive follow-up: deterministic corridor paths above are compact navigation; the current body is exact evidence. At a branch, choose only the requested frontier. Prefer callpath when its endpoint is known; add expand=true only when the needed corridor bodies or deeper references are still missing.\n");
+                out.push_str("graph follow-up: use codedb_graph_query with this exact symbol and typed CALLS/DISPATCHES_TO/HAS_CALLSITE edges when another evidence phase is required; do not reopen forwarding wrappers one by one.\n");
             }
         }
     }
     Ok(out)
+}
+
+fn symbol_dispatch_candidates(
+    index: &Codebase,
+    file: &FileEntry,
+    symbol: &Symbol,
+) -> Vec<SymbolTarget> {
+    let Some(enclosing) = enclosing_type_symbol(file, symbol) else {
+        return Vec::new();
+    };
+    if !matches!(enclosing.kind.as_str(), "interface" | "trait") {
+        return Vec::new();
+    }
+    let parameter_count = signature_parameter_count(&symbol.detail);
+    let mut candidates = index
+        .symbols_named(&symbol.name)
+        .into_iter()
+        .filter(|(candidate_file, candidate_symbol)| {
+            is_context_handoff_source_symbol(candidate_symbol)
+                && (candidate_file.path != file.path
+                    || candidate_symbol.line_start != symbol.line_start)
+                && parameter_count.is_none_or(|count| {
+                    signature_accepts_argument_count(&candidate_symbol.detail, count)
+                })
+                && enclosing_type_symbol(candidate_file, candidate_symbol).is_some_and(
+                    |candidate_enclosing| {
+                        raw_identifiers(&candidate_enclosing.detail)
+                            .into_iter()
+                            .any(|identifier| identifier == enclosing.name)
+                    },
+                )
+        })
+        .map(|(candidate_file, candidate_symbol)| {
+            target_from_symbol(candidate_file, candidate_symbol)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line_start.cmp(&right.line_start))
+    });
+    candidates.dedup_by(|left, right| {
+        left.path == right.path && left.line_start == right.line_start && left.name == right.name
+    });
+    candidates
+}
+
+fn symbol_target_dispatch_candidates(index: &Codebase, target: &SymbolTarget) -> Vec<SymbolTarget> {
+    let Some(file) = index.file(&target.path) else {
+        return Vec::new();
+    };
+    let Some(symbol) = symbol_for_target(file, target) else {
+        return Vec::new();
+    };
+    symbol_dispatch_candidates(index, file, symbol)
+}
+
+#[allow(dead_code)]
+fn append_dispatch_candidates(
+    index: &Codebase,
+    source: &Symbol,
+    candidates: &[SymbolTarget],
+    indent: &str,
+    out: &mut String,
+) {
+    for candidate in candidates.iter().take(SYMBOL_BODY_DISPATCH_PREVIEW_LIMIT) {
+        out.push_str(&format!(
+            "{indent}{} -> {}:{} ({})\n{indent}  follow-up: codedb_symbol name={} path={} body=true max_results=1\n",
+            source.name,
+            candidate.path,
+            candidate.line_start,
+            candidate.kind,
+            candidate.name,
+            candidate.path
+        ));
+        if let Some(snippet) = compact_symbol_target_snippet_limited(
+            index,
+            candidate,
+            SYMBOL_BODY_DISPATCH_PREVIEW_MAX_LINES,
+            SYMBOL_BODY_DISPATCH_PREVIEW_MAX_CHARS,
+        ) {
+            out.push_str(&format!("{indent}  exact branch preview: {}\n", snippet));
+        }
+        if !append_dispatch_candidate_contracted_leaf(index, candidate, indent, out) {
+            append_parameter_control_evidence(index, candidate, &format!("{indent}  "), out);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn append_dispatch_candidate_contracted_leaf(
+    index: &Codebase,
+    candidate: &SymbolTarget,
+    indent: &str,
+    out: &mut String,
+) -> bool {
+    let Some(file) = index.file(&candidate.path) else {
+        return false;
+    };
+    let Some(symbol) = symbol_for_target(file, candidate) else {
+        return false;
+    };
+    let Ok(content) = index.file_content(file) else {
+        return false;
+    };
+    let active_content = mask_comments(file.language.as_str(), &content);
+    let body = source_line_slice(
+        &active_content,
+        symbol.line_start,
+        symbol.line_end.max(symbol.line_start),
+    );
+    if !is_short_flow_wrapper_body(&body) {
+        return false;
+    }
+    let Ok(chain) = continue_symbol_target(index, candidate.clone(), 0) else {
+        return false;
+    };
+    let Some(terminal) = chain.steps.last() else {
+        return false;
+    };
+    out.push_str(&format!(
+        "{indent}  contracted implementation leaf: {}:{} {}",
+        chain.source.path, chain.source.line_start, chain.source.name
+    ));
+    for step in &chain.steps {
+        out.push_str(&format!(
+            " -> {}:{} {}",
+            step.path, step.line_start, step.name
+        ));
+    }
+    out.push('\n');
+    if let Some(snippet) = compact_symbol_target_snippet_limited(
+        index,
+        terminal,
+        SYMBOL_BODY_DISPATCH_PREVIEW_MAX_LINES,
+        SYMBOL_BODY_DISPATCH_PREVIEW_MAX_CHARS,
+    ) {
+        out.push_str(&format!("{indent}    exact leaf preview: {snippet}\n"));
+    }
+    append_parameter_control_evidence(index, terminal, &format!("{indent}    "), out);
+    true
+}
+
+#[allow(dead_code)]
+fn append_parameter_control_evidence(
+    index: &Codebase,
+    target: &SymbolTarget,
+    indent: &str,
+    out: &mut String,
+) {
+    let Some(file) = index.file(&target.path) else {
+        return;
+    };
+    let Some(symbol) = symbol_for_target(file, target) else {
+        return;
+    };
+    let Some(parameters) = signature_parameters(&symbol.detail) else {
+        return;
+    };
+    let parameter_names = parameters
+        .iter()
+        .filter_map(|parameter| {
+            let declaration = parameter.split('=').next().unwrap_or(parameter);
+            raw_identifiers(declaration).into_iter().next_back()
+        })
+        .collect::<BTreeSet<_>>();
+    if parameter_names.is_empty() {
+        return;
+    }
+    let Ok(content) = index.file_content(file) else {
+        return;
+    };
+    let active_content = mask_comments(file.language.as_str(), &content);
+    let body = source_line_slice(
+        &active_content,
+        symbol.line_start,
+        symbol.line_end.max(symbol.line_start),
+    );
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut tracked = parameter_names
+        .iter()
+        .map(|parameter| (parameter.clone(), parameter.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::<String>::new();
+    let mut seen = BTreeSet::<(usize, String)>::new();
+    for (offset, line) in lines.iter().enumerate() {
+        let code_line = strip_strings_and_line_comment(line);
+        let mut roots = tracked
+            .iter()
+            .filter(|(name, _)| line_contains_identifier_token(&code_line, name))
+            .map(|(_, root)| root.clone())
+            .collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            continue;
+        }
+        let line_number = symbol.line_start + offset;
+        if let Some(alias) = assignment_target_identifier(&code_line)
+            && !roots.contains(&alias)
+        {
+            let root = roots.iter().next().cloned().unwrap_or_default();
+            if !root.is_empty() {
+                tracked.insert(alias, root);
+            }
+        }
+        let trimmed = code_line.trim_start();
+        let condition = trimmed.starts_with("if")
+            || trimmed.starts_with("else if")
+            || trimmed.starts_with("while")
+            || trimmed.starts_with("switch")
+            || trimmed.starts_with("match ");
+        let control = condition
+            || trimmed.starts_with("return ")
+            || assignment_operator_position(&code_line).is_some();
+        if !control {
+            continue;
+        }
+        roots.retain(|root| !root.is_empty());
+        let roots_text = roots.into_iter().collect::<Vec<_>>().join(", ");
+        let mut row = format!(
+            "[{roots_text}] L{line_number} {}",
+            compact_inline_text(&code_line, 220)
+        );
+        let action = lines.iter().enumerate().skip(offset).take(5).find_map(
+            |(candidate_offset, candidate)| {
+                let candidate_code = strip_strings_and_line_comment(candidate);
+                let candidate_trimmed = candidate_code.trim();
+                let is_action = candidate_trimmed == "continue;"
+                    || candidate_trimmed == "break;"
+                    || candidate_trimmed.starts_with("return ")
+                    || candidate_trimmed.starts_with("throw ")
+                    || candidate_trimmed.starts_with("yield ")
+                    || candidate_trimmed.contains(" continue;")
+                    || candidate_trimmed.contains(" break;");
+                is_action.then(|| (candidate_offset, candidate_trimmed.to_string()))
+            },
+        );
+        if let Some((action_offset, action)) = &action {
+            row.push_str(&format!(
+                " => L{} {}",
+                symbol.line_start + *action_offset,
+                compact_inline_text(action, 120)
+            ));
+        }
+        if condition && let Some((action_offset, _)) = action {
+            let condition_false = tracked.iter().any(|(name, _)| {
+                line_contains_identifier_token(&code_line, name)
+                    && identifier_condition_is_negated(&code_line, name)
+            });
+            let predicate_state = if condition_false { "false" } else { "true" };
+            if let Some((append_offset, append_line)) = lines
+                .iter()
+                .enumerate()
+                .skip(action_offset.saturating_add(1))
+                .take(24)
+                .find_map(|(candidate_offset, candidate)| {
+                    let candidate_code = strip_strings_and_line_comment(candidate);
+                    collection_append_shape(&candidate_code)
+                        .then(|| (candidate_offset, candidate_code.trim().to_string()))
+                })
+            {
+                row.push_str(&format!(
+                    " | admission consequence: parameter-derived condition {predicate_state} is excluded before L{} {} | the opposite branch can continue toward that append",
+                    symbol.line_start + append_offset,
+                    compact_inline_text(&append_line, 140)
+                ));
+            }
+        }
+        if seen.insert((line_number, row.clone())) {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "{indent}parameter/control evidence (source order; no task keywords):\n"
+    ));
+    for row in rows.into_iter().take(8) {
+        out.push_str(&format!("{indent}  {row}\n"));
+    }
+}
+
+fn identifier_condition_is_negated(line: &str, identifier: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(relative) = line.get(from..).and_then(|tail| tail.find(identifier)) {
+        let start = from + relative;
+        let end = start + identifier.len();
+        let before_ok = line
+            .get(..start)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_none_or(|ch| !is_identifier_char(ch));
+        let after_ok = line
+            .get(end..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_none_or(|ch| !is_identifier_char(ch));
+        if before_ok && after_ok {
+            let prefix = line.get(..start).unwrap_or_default().trim_end();
+            let suffix = line.get(end..).unwrap_or_default().trim_start();
+            if prefix.ends_with('!')
+                || prefix.ends_with("not")
+                || suffix.starts_with("== false")
+                || suffix.starts_with("is false")
+            {
+                return true;
+            }
+        }
+        from = end.max(from + 1);
+    }
+    false
+}
+
+#[allow(dead_code)]
+fn collection_append_shape(line: &str) -> bool {
+    [
+        ".Add(",
+        ".add(",
+        ".append(",
+        ".push(",
+        ".insert(",
+        ".push_back(",
+    ]
+    .into_iter()
+    .any(|shape| line.contains(shape))
 }
 
 fn append_symbol_activity_summary(
@@ -1808,6 +2159,7 @@ struct BodySymbolLead {
     target: SymbolTarget,
 }
 
+#[allow(dead_code)]
 struct BodySymbolContinuationChain {
     source: SymbolTarget,
     steps: Vec<SymbolTarget>,
@@ -1950,7 +2302,6 @@ fn append_symbol_body_leads(
             ));
         }
         append_symbol_body_lead_previews(index, &leads, out)?;
-        append_symbol_body_continuation_chains(index, file, symbol, body, true, out)?;
         append_same_file_callee_exact_reference_leads(index, file, &leads, out)?;
     }
     append_symbol_body_data_type_leads(index, file, symbol, body, out)?;
@@ -2258,7 +2609,7 @@ fn append_symbol_body_evidence_card(
         symbol.kind,
         symbol.name
     ));
-    out.push_str("closure: this body is sufficient phase evidence. Direct calls in it already prove those handoffs; choose only the one next lifecycle phase still missing, not every callee. If this is the requested final callback/readiness body, stop tool use and answer now; do not probe guessed sibling lifecycle names or restart upstream verification.\n");
+    out.push_str("closure: this complete body is exact local evidence. Direct calls prove handoffs only; use typed graph paths, argument bindings, dispatch edges, and control facts for cross-body semantics. A preprocessor guard applies only to the call edge carrying it.\n");
     let mut selected = evidence
         .qualified
         .iter()
@@ -2339,13 +2690,24 @@ fn symbol_body_qualified_tail_call_leads(
         .deps_for(&file.path)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let mut by_target = BTreeMap::<(String, usize, String), BodyFlowHandoffLead>::new();
+    let receiver_types = qualified_receiver_type_hints(index, file, symbol, body);
+    let mut by_target = BTreeMap::<(usize, String, usize, String), BodyFlowHandoffLead>::new();
     for (offset, line) in body.lines().enumerate() {
         let code_line = strip_strings_and_line_comment(line);
         for token in qualified_call_tokens(&code_line) {
-            let Some((target, score)) =
-                resolve_qualified_call_target(index, file, symbol, &deps, &code_line, &token, true)
-            else {
+            let receiver_type = qualified_token_receiver(&token)
+                .and_then(|receiver| receiver_types.get(receiver))
+                .map(String::as_str);
+            let Some((target, score)) = resolve_qualified_call_target(
+                index,
+                file,
+                symbol,
+                &deps,
+                &code_line,
+                &token,
+                true,
+                receiver_type,
+            ) else {
                 continue;
             };
             let lead = BodyFlowHandoffLead {
@@ -2355,16 +2717,12 @@ fn symbol_body_qualified_tail_call_leads(
                 target,
             };
             let key = (
+                lead.line,
                 lead.target.path.clone(),
                 lead.target.line_start,
                 lead.target.name.clone(),
             );
-            match by_target.get(&key) {
-                Some(current) if current.line >= lead.line => {}
-                _ => {
-                    by_target.insert(key, lead);
-                }
-            }
+            by_target.insert(key, lead);
         }
     }
     let mut leads = by_target.into_values().collect::<Vec<_>>();
@@ -2462,6 +2820,7 @@ fn resolve_qualified_call_target(
     line: &str,
     token: &str,
     allow_unique_without_qualifier: bool,
+    receiver_type: Option<&str>,
 ) -> Option<(SymbolTarget, usize)> {
     let member = token.rsplit('.').next()?;
     let call_arity = call_argument_count(line, token);
@@ -2469,9 +2828,9 @@ fn resolve_qualified_call_target(
         .symbols_named(member)
         .into_iter()
         .filter(|(candidate_file, candidate_symbol)| {
-            candidate_file.path != source_file.path
-                && is_context_handoff_source_symbol(candidate_symbol)
-                && (candidate_symbol.line_start != source_symbol.line_start
+            is_context_handoff_source_symbol(candidate_symbol)
+                && (candidate_file.path != source_file.path
+                    || candidate_symbol.line_start != source_symbol.line_start
                     || candidate_symbol.name != source_symbol.name)
         })
         .collect::<Vec<_>>();
@@ -2488,6 +2847,13 @@ fn resolve_qualified_call_target(
             unique_fallback
                 || qualified_call_qualifier_matches(index, token, candidate_file, candidate_symbol)
                     > 0
+                || receiver_type.is_some_and(|receiver_type| {
+                    qualified_call_receiver_type_matches(
+                        receiver_type,
+                        candidate_file,
+                        candidate_symbol,
+                    ) > 0
+                })
         })
         .map(|(candidate_file, candidate_symbol)| {
             let score = qualified_call_candidate_score(
@@ -2498,6 +2864,7 @@ fn resolve_qualified_call_target(
                 candidate_file,
                 candidate_symbol,
                 call_arity,
+                receiver_type,
             );
             (score, target_from_symbol(candidate_file, candidate_symbol))
         })
@@ -2618,9 +2985,15 @@ fn qualified_call_candidate_score(
     candidate_file: &FileEntry,
     candidate_symbol: &Symbol,
     call_arity: Option<usize>,
+    receiver_type: Option<&str>,
 ) -> usize {
     let qualifier_matches =
         qualified_call_qualifier_matches(index, token, candidate_file, candidate_symbol);
+    let receiver_type_matches = receiver_type
+        .map(|receiver_type| {
+            qualified_call_receiver_type_matches(receiver_type, candidate_file, candidate_symbol)
+        })
+        .unwrap_or_default();
     let arity_bonus = match (
         call_arity,
         signature_parameter_count(&candidate_symbol.detail),
@@ -2628,11 +3001,131 @@ fn qualified_call_candidate_score(
         (Some(call_arity), Some(parameter_count)) if call_arity == parameter_count => 90,
         _ => 0,
     };
-    qualifier_matches * 40
+    receiver_type_matches * 120
+        + qualifier_matches * 40
         + usize::from(deps.contains(&candidate_file.path)) * 30
         + usize::from(same_path_family(&source_file.path, &candidate_file.path)) * 15
         + symbol_kind_lead_weight(candidate_symbol)
         + arity_bonus
+}
+
+fn qualified_token_receiver(token: &str) -> Option<&str> {
+    let normalized = token.strip_prefix("::").unwrap_or(token);
+    normalized.split(['.', ':']).find(|part| !part.is_empty())
+}
+
+fn qualified_receiver_type_hints(
+    index: &Codebase,
+    file: &FileEntry,
+    symbol: &Symbol,
+    body: &str,
+) -> BTreeMap<String, String> {
+    let receivers = body
+        .lines()
+        .flat_map(|line| {
+            let code_line = strip_strings_and_line_comment(line);
+            qualified_call_tokens(&code_line)
+                .into_iter()
+                .chain(qualified_member_tokens(&code_line))
+                .filter_map(|token| qualified_token_receiver(&token).map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter(|receiver| !matches!(receiver.as_str(), "this" | "base" | "self" | "super"))
+        .collect::<BTreeSet<_>>();
+    if receivers.is_empty() {
+        return BTreeMap::new();
+    }
+    let Ok(content) = index.file_content(file) else {
+        return BTreeMap::new();
+    };
+    receivers
+        .into_iter()
+        .filter_map(|receiver| {
+            declared_receiver_type(index, &content, symbol, &receiver)
+                .map(|receiver_type| (receiver, receiver_type))
+        })
+        .collect()
+}
+
+fn declared_receiver_type(
+    index: &Codebase,
+    content: &str,
+    source_symbol: &Symbol,
+    receiver: &str,
+) -> Option<String> {
+    let mut found = None;
+    for line in content
+        .lines()
+        .take(source_symbol.line_end.max(source_symbol.line_start))
+    {
+        let code_line = strip_strings_and_line_comment(line);
+        let mut from = 0usize;
+        while let Some(relative) = code_line.get(from..).and_then(|tail| tail.find(receiver)) {
+            let start = from + relative;
+            let end = start + receiver.len();
+            let before = code_line
+                .get(..start)
+                .and_then(|prefix| prefix.chars().next_back());
+            let after = code_line
+                .get(end..)
+                .and_then(|suffix| suffix.chars().next());
+            if before.is_some_and(is_identifier_char)
+                || after.is_some_and(is_identifier_char)
+                || matches!(before, Some('.') | Some(':'))
+            {
+                from = end.max(from + 1);
+                continue;
+            }
+            let prefix = code_line.get(..start).unwrap_or_default();
+            let candidate = raw_identifiers(prefix).into_iter().next_back();
+            if let Some(candidate) = candidate
+                && candidate != receiver
+                && index
+                    .symbols_named(&candidate)
+                    .into_iter()
+                    .any(|(_, symbol)| {
+                        matches!(
+                            symbol.kind.as_str(),
+                            "class" | "interface" | "struct" | "record" | "trait" | "type_alias"
+                        )
+                    })
+            {
+                found = Some(candidate);
+            }
+            from = end.max(from + 1);
+        }
+    }
+    found
+}
+
+fn qualified_call_receiver_type_matches(
+    receiver_type: &str,
+    candidate_file: &FileEntry,
+    candidate_symbol: &Symbol,
+) -> usize {
+    let Some(enclosing) = enclosing_type_symbol(candidate_file, candidate_symbol) else {
+        return 0;
+    };
+    if enclosing.name == receiver_type {
+        return 3;
+    }
+    usize::from(
+        raw_identifiers(&enclosing.detail)
+            .into_iter()
+            .any(|identifier| identifier == receiver_type),
+    )
+}
+
+fn enclosing_type_symbol<'a>(file: &'a FileEntry, symbol: &Symbol) -> Option<&'a Symbol> {
+    file.symbols
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind.as_str(),
+                "class" | "interface" | "struct" | "record" | "trait" | "impl" | "module"
+            ) && candidate.line_start <= symbol.line_start
+        })
+        .max_by_key(|candidate| candidate.line_start)
 }
 
 fn call_argument_count(line: &str, token: &str) -> Option<usize> {
@@ -4360,6 +4853,7 @@ fn path_has_family_suffix(base: &str, candidate: &str) -> bool {
         .is_some_and(|separator| matches!(separator, '.' | '_' | '-'))
 }
 
+#[allow(dead_code)]
 fn append_symbol_body_continuation_chains(
     index: &Codebase,
     file: &FileEntry,
@@ -4370,7 +4864,10 @@ fn append_symbol_body_continuation_chains(
 ) -> Result<()> {
     let mut chains = collect_symbol_body_continuation_chains(index, file, symbol, body)?;
     if !include_bodies {
-        chains.retain(|chain| !chain.steps.is_empty());
+        chains.retain(|chain| {
+            !chain.steps.is_empty()
+                || !symbol_target_dispatch_candidates(index, &chain.source).is_empty()
+        });
     }
     if chains.is_empty() {
         return Ok(());
@@ -4406,6 +4903,7 @@ fn append_symbol_body_continuation_chains(
             out.push_str(&format!(" // {}", last.detail));
         }
         out.push('\n');
+        append_continuation_terminal_evidence(index, &chain, include_bodies, out);
         if !include_bodies {
             continue;
         }
@@ -4446,6 +4944,40 @@ fn append_symbol_body_continuation_chains(
     Ok(())
 }
 
+#[allow(dead_code)]
+fn append_continuation_terminal_evidence(
+    index: &Codebase,
+    chain: &BodySymbolContinuationChain,
+    include_bodies: bool,
+    out: &mut String,
+) {
+    let terminal = chain.steps.last().unwrap_or(&chain.source);
+    let dispatch_candidates = symbol_target_dispatch_candidates(index, terminal);
+    if !dispatch_candidates.is_empty() {
+        let Some(file) = index.file(&terminal.path) else {
+            return;
+        };
+        let Some(symbol) = symbol_for_target(file, terminal) else {
+            return;
+        };
+        out.push_str("    terminal dispatch branches (mutually exclusive graph branches; use construction/assignment evidence to choose the active implementation):\n");
+        append_dispatch_candidates(index, symbol, &dispatch_candidates, "      ", out);
+        return;
+    }
+    if include_bodies || chain.steps.is_empty() {
+        return;
+    }
+    if let Some(snippet) = compact_symbol_target_snippet_limited(
+        index,
+        terminal,
+        SYMBOL_BODY_DISPATCH_PREVIEW_MAX_LINES,
+        SYMBOL_BODY_DISPATCH_PREVIEW_MAX_CHARS,
+    ) {
+        out.push_str(&format!("    terminal exact body preview: {snippet}\n"));
+    }
+}
+
+#[allow(dead_code)]
 fn collect_symbol_body_continuation_chains(
     index: &Codebase,
     file: &FileEntry,
@@ -4460,67 +4992,71 @@ fn collect_symbol_body_continuation_chains(
     ) else {
         return Ok(chains);
     };
-    {
-        let mut visited = BTreeSet::<(String, usize, String)>::new();
-        visited.insert((
-            lead.target.path.clone(),
-            lead.target.line_start,
-            lead.target.name.clone(),
-        ));
-        let source = lead.target.clone();
-        let mut current = source.clone();
-        let mut score = lead.score;
-        let mut steps = Vec::new();
-        loop {
-            let Some(file) = index.file(&current.path) else {
-                break;
-            };
-            let Some(symbol) = symbol_for_target(file, &current) else {
-                break;
-            };
-            let symbol_end = symbol.line_end.max(symbol.line_start);
-            let span = symbol_end.saturating_sub(symbol.line_start) + 1;
-            if span > CONTEXT_SYMBOL_HANDOFF_MAX_SOURCE_LINES {
-                break;
-            }
-            let content = index.file_content(file)?;
-            let active_content = mask_comments(file.language.as_str(), &content);
-            let body = source_line_slice(&active_content, symbol.line_start, symbol_end);
-            let next = symbol_body_verified_call_leads(index, file, symbol, &body)
-                .into_iter()
-                .filter(|next| {
-                    !visited.contains(&(
-                        next.target.path.clone(),
-                        next.target.line_start,
-                        next.target.name.clone(),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            let Some(next) = deterministic_symbol_call_lead(&file.path, next) else {
-                break;
-            };
-            let key = (
-                next.target.path.clone(),
-                next.target.line_start,
-                next.target.name.clone(),
-            );
-            visited.insert(key);
-            score = score.saturating_add(next.score);
-            current = next.target.clone();
-            steps.push(next.target);
-        }
-        let chain_key = symbol_body_continuation_chain_key(&source, &steps);
-        if seen_chains.insert(chain_key) {
-            chains.push(BodySymbolContinuationChain {
-                source,
-                steps,
-                score,
-            });
-        }
+    let chain = continue_symbol_target(index, lead.target, lead.score)?;
+    let chain_key = symbol_body_continuation_chain_key(&chain.source, &chain.steps);
+    if seen_chains.insert(chain_key) {
+        chains.push(chain);
     }
     Ok(chains)
 }
 
+#[allow(dead_code)]
+fn continue_symbol_target(
+    index: &Codebase,
+    source: SymbolTarget,
+    initial_score: usize,
+) -> Result<BodySymbolContinuationChain> {
+    let mut visited = BTreeSet::<(String, usize, String)>::new();
+    visited.insert((source.path.clone(), source.line_start, source.name.clone()));
+    let mut current = source.clone();
+    let mut score = initial_score;
+    let mut steps = Vec::new();
+    loop {
+        let Some(file) = index.file(&current.path) else {
+            break;
+        };
+        let Some(symbol) = symbol_for_target(file, &current) else {
+            break;
+        };
+        let symbol_end = symbol.line_end.max(symbol.line_start);
+        let span = symbol_end.saturating_sub(symbol.line_start) + 1;
+        if span > CONTEXT_SYMBOL_HANDOFF_MAX_SOURCE_LINES {
+            break;
+        }
+        let content = index.file_content(file)?;
+        let active_content = mask_comments(file.language.as_str(), &content);
+        let body = source_line_slice(&active_content, symbol.line_start, symbol_end);
+        let next = symbol_body_verified_call_leads(index, file, symbol, &body)
+            .into_iter()
+            .filter(|next| {
+                !visited.contains(&(
+                    next.target.path.clone(),
+                    next.target.line_start,
+                    next.target.name.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let Some(next) = deterministic_symbol_call_lead(&file.path, next) else {
+            break;
+        };
+        let key = (
+            next.target.path.clone(),
+            next.target.line_start,
+            next.target.name.clone(),
+        );
+        visited.insert(key);
+        score = score.saturating_add(next.score);
+        current = next.target.clone();
+        steps.push(next.target);
+    }
+    Ok(BodySymbolContinuationChain {
+        source,
+        steps,
+        score,
+    })
+}
+
+#[allow(dead_code)]
 fn symbol_body_verified_call_leads(
     index: &Codebase,
     file: &FileEntry,
@@ -4528,12 +5064,16 @@ fn symbol_body_verified_call_leads(
     body: &str,
 ) -> Vec<BodySymbolLead> {
     let mut by_target = BTreeMap::<(String, usize, String), BodySymbolLead>::new();
+    let mut resolved_qualified_names = BTreeSet::<String>::new();
     for (order, edge) in callpath_edges_from_body(index, file, symbol, body, None, false)
         .into_iter()
         .filter(|edge| matches!(edge.relation.as_str(), "qualified_call" | "direct_call"))
         .filter(|edge| symbol_target_is_executable(index, &edge.target))
         .enumerate()
     {
+        if edge.relation == "qualified_call" {
+            resolved_qualified_names.insert(edge.target.name.clone());
+        }
         let key = (
             edge.target.path.clone(),
             edge.target.line_start,
@@ -4556,7 +5096,11 @@ fn symbol_body_verified_call_leads(
     for lead in symbol_body_leads(index, file, symbol, body, usize::MAX)
         .into_iter()
         .filter(|lead| symbol_target_is_executable(index, &lead.target))
-        .filter(|lead| body_contains_direct_call(body, &lead.target.name))
+        .filter(|lead| body_contains_direct_call(body, &lead.target.name, &symbol.name))
+        .filter(|lead| {
+            !resolved_qualified_names.contains(&lead.target.name)
+                || body_contains_unqualified_call(body, &lead.target.name, &symbol.name)
+        })
     {
         let key = (
             lead.target.path.clone(),
@@ -4568,6 +5112,18 @@ fn symbol_body_verified_call_leads(
     by_target.into_values().collect()
 }
 
+#[allow(dead_code)]
+fn body_contains_unqualified_call(body: &str, name: &str, source_symbol_name: &str) -> bool {
+    body.lines().enumerate().any(|(offset, line)| {
+        if offset == 0 && name == source_symbol_name {
+            return false;
+        }
+        let code_line = strip_strings_and_line_comment(line);
+        identifier_call_receiver_kinds(&code_line, name).0
+    })
+}
+
+#[allow(dead_code)]
 fn deterministic_symbol_call_lead(
     source_path: &str,
     leads: Vec<BodySymbolLead>,
@@ -4588,13 +5144,18 @@ fn deterministic_symbol_call_lead(
         .flatten()
 }
 
-fn body_contains_direct_call(body: &str, name: &str) -> bool {
-    body.lines().any(|line| {
+#[allow(dead_code)]
+fn body_contains_direct_call(body: &str, name: &str, source_symbol_name: &str) -> bool {
+    body.lines().enumerate().any(|(offset, line)| {
+        if offset == 0 && name == source_symbol_name {
+            return false;
+        }
         let code_line = strip_strings_and_line_comment(line);
         !identifier_call_argument_counts(&code_line, name).is_empty()
     })
 }
 
+#[allow(dead_code)]
 fn symbol_target_is_executable(index: &Codebase, target: &SymbolTarget) -> bool {
     index
         .file(&target.path)
@@ -4607,6 +5168,7 @@ fn symbol_target_is_executable(index: &Codebase, target: &SymbolTarget) -> bool 
         })
 }
 
+#[allow(dead_code)]
 fn symbol_body_continuation_chain_key(source: &SymbolTarget, steps: &[SymbolTarget]) -> String {
     let mut key = format!("{}:{}:{}", source.path, source.line_start, source.name);
     for step in steps {
@@ -4692,6 +5254,7 @@ fn symbol_body_ordered_leads(
     let mut leads = Vec::new();
     for (order, identifier) in source_code_identifiers(body).into_iter().enumerate() {
         if identifier.len() < 3
+            || identifier == symbol.name
             || !is_data_type_lead_identifier(&identifier)
             || !seen_names.insert(identifier.clone())
         {
@@ -6447,7 +7010,7 @@ fn handle_read_one(index: &Codebase, args: &Value) -> Result<String> {
             members.join(", ")
         ));
     }
-    if get_bool(args, "include_symbol_leads") {
+    if connected_range || get_bool(args, "include_symbol_leads") {
         append_read_symbol_leads(
             index,
             file,
@@ -6456,6 +7019,7 @@ fn handle_read_one(index: &Codebase, args: &Value) -> Result<String> {
             end,
             has_explicit_range,
             requested_span,
+            connected_range,
             &mut out,
         )?;
     }
@@ -6470,6 +7034,7 @@ fn append_read_symbol_leads(
     end: usize,
     has_explicit_range: bool,
     requested_span: usize,
+    connected_range: bool,
     out: &mut String,
 ) -> Result<()> {
     if !has_explicit_range {
@@ -6489,6 +7054,11 @@ fn append_read_symbol_leads(
         })
         .collect::<Vec<_>>();
     if symbols.is_empty() || (!wide_range && symbols.len() > READ_SYMBOL_LEAD_MAX_SYMBOLS) {
+        return Ok(());
+    }
+    if connected_range {
+        append_connected_range_handoff_frontier(index, file, content, &symbols, out);
+        append_connected_range_incoming_frontier(index, file, &symbols, out)?;
         return Ok(());
     }
     symbols.sort_by(|left, right| {
@@ -6515,17 +7085,31 @@ fn append_read_symbol_leads(
             "  {}:L{} {} ({})\n",
             file.path, symbol.line_start, symbol.name, symbol.kind
         ));
-        section.push_str(&format!(
-            "    follow-up: codedb_symbol name={} path={} body=true max_results=1\n",
-            symbol.name, file.path
-        ));
-        for lead in symbol_body_flow_handoff_leads(
-            index,
-            file,
-            symbol,
-            &body,
-            READ_SYMBOL_LEAD_HANDOFF_LIMIT,
-        ) {
+        if !connected_range {
+            section.push_str(&format!(
+                "    follow-up: codedb_symbol name={} path={} body=true max_results=1\n",
+                symbol.name, file.path
+            ));
+        }
+        let evidence = symbol_body_primary_evidence(index, file, symbol, &body);
+        let mut leads = evidence
+            .qualified
+            .into_iter()
+            .chain(evidence.flow)
+            .collect::<Vec<_>>();
+        leads.sort_by(|left, right| {
+            left.line
+                .cmp(&right.line)
+                .then_with(|| left.target.path.cmp(&right.target.path))
+                .then_with(|| left.target.line_start.cmp(&right.target.line_start))
+        });
+        leads.dedup_by(|left, right| {
+            left.line == right.line
+                && left.target.path == right.target.path
+                && left.target.line_start == right.target.line_start
+                && left.target.name == right.target.name
+        });
+        for lead in leads.into_iter().take(READ_SYMBOL_LEAD_HANDOFF_LIMIT) {
             section.push_str(&format!(
                 "    handoff candidate: L{} {} -> {}:{} ({}) // {}\n",
                 lead.line,
@@ -6539,6 +7123,197 @@ fn append_read_symbol_leads(
     }
     out.push_str(&section);
     Ok(())
+}
+
+fn append_connected_range_handoff_frontier(
+    index: &Codebase,
+    file: &FileEntry,
+    content: &str,
+    symbols: &[&Symbol],
+    out: &mut String,
+) {
+    let mut symbols = symbols.to_vec();
+    symbols.sort_by_key(|symbol| symbol.line_start);
+    let mut frontier = BTreeMap::<(usize, String), (&Symbol, BodyFlowHandoffLead, usize)>::new();
+    for symbol in symbols {
+        let symbol_end = symbol.line_end.max(symbol.line_start);
+        let body = source_line_slice(content, symbol.line_start, symbol_end);
+        let evidence = symbol_body_primary_evidence(index, file, symbol, &body);
+        for lead in evidence.qualified.into_iter().chain(evidence.flow) {
+            if lead.target.path == file.path {
+                continue;
+            }
+            let boundary_score = flow_handoff_line_score(&lead.text);
+            let rank = lead.score.saturating_add(boundary_score * 4);
+            let key = (symbol.line_start, lead.target.path.clone());
+            match frontier.get(&key) {
+                Some((_, current, current_rank))
+                    if *current_rank > rank
+                        || (*current_rank == rank && current.line <= lead.line) => {}
+                _ => {
+                    frontier.insert(key, (symbol, lead, rank));
+                }
+            }
+        }
+    }
+    if frontier.is_empty() {
+        return;
+    }
+    let mut frontier = frontier.into_values().collect::<Vec<_>>();
+    frontier.sort_by(|left, right| {
+        left.0
+            .line_start
+            .cmp(&right.0.line_start)
+            .then_with(|| left.1.line.cmp(&right.1.line))
+            .then_with(|| left.1.target.path.cmp(&right.1.target.path))
+    });
+    out.push_str("connected range cross-file handoff frontier (one strongest graph/data-flow boundary per member and target file; no task keywords are used):\n");
+    for (symbol, lead, _) in frontier {
+        let boundary_score = flow_handoff_line_score(&lead.text);
+        let boundary = if boundary_score >= 55 {
+            "value/control boundary"
+        } else {
+            "direct handoff"
+        };
+        out.push_str(&format!(
+            "  {} L{} -> L{} {}: {} -> {}:{} ({}) // {}\n",
+            symbol.name,
+            symbol.line_start,
+            lead.line,
+            boundary,
+            lead.target.name,
+            lead.target.path,
+            lead.target.line_start,
+            lead.target.kind,
+            compact_inline_text(&lead.text, 180)
+        ));
+        if boundary_score >= 55 {
+            out.push_str("    required before interpreting the returned/selected data: ");
+        } else {
+            out.push_str("    follow-up when the callee contract matters: ");
+        }
+        out.push_str(&format!(
+            "codedb_symbol name={} path={} body=true max_results=1\n",
+            lead.target.name, lead.target.path
+        ));
+    }
+}
+
+#[allow(dead_code)]
+fn append_contracted_leaf_corridor(index: &Codebase, target: &SymbolTarget, out: &mut String) {
+    let Ok(chain) = continue_symbol_target(index, target.clone(), 0) else {
+        return;
+    };
+    let terminal = chain.steps.last().unwrap_or(&chain.source);
+    let dispatch_candidates = symbol_target_dispatch_candidates(index, terminal);
+    if chain.steps.is_empty() && dispatch_candidates.is_empty() {
+        return;
+    }
+    out.push_str("    contracted leaf corridor (degree-1 forwarding path; no task keywords): ");
+    out.push_str(&format!(
+        "{}:{} {}",
+        chain.source.path, chain.source.line_start, chain.source.name
+    ));
+    for step in &chain.steps {
+        out.push_str(&format!(
+            " -> {}:{} {}",
+            step.path, step.line_start, step.name
+        ));
+    }
+    out.push('\n');
+    append_continuation_terminal_evidence(index, &chain, false, out);
+}
+
+fn append_connected_range_incoming_frontier(
+    index: &Codebase,
+    file: &FileEntry,
+    symbols: &[&Symbol],
+    out: &mut String,
+) -> Result<()> {
+    let mut incoming = Vec::<(&Symbol, SearchHit, Option<String>)>::new();
+    let mut content_by_path = HashMap::<String, String>::new();
+    for symbol in symbols {
+        if symbol.name.len() < 4 || index.symbols_named(&symbol.name).len() != 1 {
+            continue;
+        }
+        let mut by_source_file = BTreeMap::<String, SearchHit>::new();
+        for hit in reference_candidates(index, &symbol.name)? {
+            if hit.path == file.path
+                || !hit.scope.as_ref().is_some_and(|scope| {
+                    matches!(
+                        scope.kind.as_str(),
+                        "method" | "function" | "constructor" | "macro"
+                    )
+                })
+            {
+                continue;
+            }
+            let code_line = strip_strings_and_line_comment(&hit.text);
+            if identifier_call_argument_counts(&code_line, &symbol.name).is_empty() {
+                continue;
+            }
+            by_source_file
+                .entry(hit.path.clone())
+                .and_modify(|current| {
+                    if hit.line < current.line {
+                        *current = hit.clone();
+                    }
+                })
+                .or_insert(hit);
+        }
+        for hit in by_source_file.into_values() {
+            if !content_by_path.contains_key(&hit.path)
+                && let Some(source_file) = index.file(&hit.path)
+            {
+                content_by_path.insert(hit.path.clone(), index.file_content(source_file)?);
+            }
+            let guard = content_by_path
+                .get(&hit.path)
+                .and_then(|content| preprocessor_guard_at_line(content, hit.line));
+            incoming.push((symbol, hit, guard));
+        }
+    }
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    incoming.sort_by(|left, right| {
+        left.0
+            .line_start
+            .cmp(&right.0.line_start)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.line.cmp(&right.1.line))
+    });
+    out.push_str("connected range incoming call frontier (exact external callers; guards apply only at the shown call site):\n");
+    for (symbol, hit, guard) in incoming {
+        let guard = guard.unwrap_or_else(|| "no enclosing preprocessor guard".to_string());
+        out.push_str(&format!(
+            "  {} L{} <- {}:{} [{}] // {}\n",
+            symbol.name,
+            symbol.line_start,
+            hit.path,
+            hit.line,
+            guard,
+            compact_inline_text(&hit.text, 180)
+        ));
+    }
+    Ok(())
+}
+
+fn preprocessor_guard_at_line(content: &str, line: usize) -> Option<String> {
+    let mut stack = Vec::<String>::new();
+    for source_line in content.lines().take(line) {
+        let trimmed = source_line.trim();
+        if trimmed.starts_with("#if ") || trimmed == "#if" {
+            stack.push(trimmed.to_string());
+        } else if trimmed.starts_with("#elif ") || trimmed == "#else" {
+            if let Some(active) = stack.last_mut() {
+                *active = trimmed.to_string();
+            }
+        } else if trimmed == "#endif" {
+            stack.pop();
+        }
+    }
+    (!stack.is_empty()).then(|| stack.join(" && "))
 }
 
 fn handle_changes(index: &Codebase, args: &Value) -> String {
@@ -6567,7 +7342,7 @@ fn handle_changes(index: &Codebase, args: &Value) -> String {
 fn handle_status(index: &Codebase) -> String {
     let stats = index.stats();
     format!(
-        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  retrieval: graph atlas + scoped dependency/call projection\n  scan: {}\n  extensions: {}\n  cache: {}\n  storage: {}\n",
+        "codedb status:\n  seq: {}\n  files: {}\n  outlines: {}\n  chunks: {}\n  graph: {} nodes, {} edges, {} communities\n  retrieval: property graph query + lazy semantic expansion\n  scan: {}\n  extensions: {}\n  cache: {}\n  storage: {}\n",
         stats.seq,
         stats.files,
         stats.files,
@@ -7103,7 +7878,7 @@ fn handle_flow(index: &Codebase, args: &Value) -> Result<String> {
             "retrieval: graph atlas only; task text is an opaque label and is not analyzed.\n",
         );
         append_context_module_inventory(index, &mut out);
-        out.push_str("next: choose one listed leaf child and call codedb_flow with path_glob=\"<parent>/<child>/**\". Do not scope to the broad parent when a listed child covers the phase; use another leaf-scoped call for another lifecycle phase.\n");
+        out.push_str("next: choose one listed leaf child and call codedb_flow with path_glob=\"<parent>/<child>/**\". Do not scope to the broad parent when a listed child covers the phase. A broad path with no listed child group is itself a valid scope. Use another scoped call only for another requested lifecycle phase.\n");
         finalize_context_output(&mut out, max_chars);
         return Ok(out);
     }
@@ -7180,7 +7955,7 @@ fn append_context_flow_pack(
     );
     out.push_str("pack:\n");
     append_context_flow_quality(&quality, out);
-    out.push_str("completion rule: spine source bodies are already read. Answer once requested phases have active bodies, adjacent phases have direct handoffs or graph paths, and the final readiness callback has an active body; do not descend into generic loaders or re-prove direct calls.\n");
+    out.push_str("completion rule: spine source bodies are already read. Answer once every explicitly requested phase or variant has an active body, adjacent phases have direct handoffs or graph paths, and answer-critical filter/fallback/retry/branch semantics have the exact callee body. Direct calls prove handoffs only; do not descend into unrelated generic loaders or re-prove links. Preprocessor guards apply only to enclosed source.\n");
     append_context_flow_candidate_table(index, candidates, "", out)?;
     append_context_flow_spine_source(
         index,
@@ -8643,6 +9418,9 @@ struct ContextModuleInventoryRow {
     prefix: String,
     file_count: usize,
     degree: usize,
+    outgoing: usize,
+    incoming: usize,
+    representatives: Vec<String>,
     depth: usize,
     score: f32,
 }
@@ -8658,6 +9436,9 @@ struct ContextModuleInventoryLeafGroup {
 struct ContextModuleInventoryLeafChild {
     name: String,
     file_count: usize,
+    outgoing: usize,
+    incoming: usize,
+    representatives: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -8675,16 +9456,28 @@ fn append_context_module_inventory(index: &Codebase, out: &mut String) {
     }
     let broad_rows = select_context_module_inventory_broad_rows(&rows);
     let focused_rows = select_context_module_inventory_focused_rows(&rows, &broad_rows);
-    let leaf_groups = select_context_module_inventory_leaf_groups(&rows);
+    let leaf_groups = select_context_module_inventory_leaf_groups(&rows, &broad_rows);
     out.push_str("module inventory (selection only; follow exact prefixes/paths):\n");
     if !leaf_groups.is_empty() {
         out.push_str("  compact source prefix index (scope to parent/child/**, not the broad parent/**; use separate leaves for separate phases):\n");
     }
     for group in leaf_groups {
+        let show_representatives = broad_rows.iter().any(|broad| {
+            group.parent == broad.prefix || group.parent.starts_with(&(broad.prefix.clone() + "/"))
+        });
         let children = group
             .children
             .iter()
-            .map(|child| format!("{}({})", child.name, child.file_count))
+            .map(|child| {
+                let mut summary = format!(
+                    "{}({},o={},i={})",
+                    child.name, child.file_count, child.outgoing, child.incoming
+                );
+                if show_representatives && !child.representatives.is_empty() {
+                    summary.push_str(&format!(",r={}", child.representatives.join("|")));
+                }
+                summary
+            })
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!("    - {}: {}\n", group.parent, children));
@@ -8730,10 +9523,16 @@ fn context_module_inventory_rows(index: &Codebase) -> Vec<ContextModuleInventory
             continue;
         }
         let depth = path_component_count(&prefix);
-        let degree = paths
+        let outgoing = paths
             .iter()
-            .map(|path| index.deps_for(path).len() + index.reverse_deps_for(path).len())
+            .map(|path| index.deps_for(path).len())
             .sum::<usize>();
+        let incoming = paths
+            .iter()
+            .map(|path| index.reverse_deps_for(path).len())
+            .sum::<usize>();
+        let degree = outgoing + incoming;
+        let representatives = context_module_inventory_representative_paths(index, &paths);
         let score = ((file_count + 1) as f32).ln() * 8.0
             + ((degree + 1) as f32).ln() * 5.0
             + depth as f32 * 1.25
@@ -8743,6 +9542,9 @@ fn context_module_inventory_rows(index: &Codebase) -> Vec<ContextModuleInventory
             prefix,
             file_count,
             degree,
+            outgoing,
+            incoming,
+            representatives,
             depth,
             score,
         });
@@ -9104,6 +9906,7 @@ fn push_context_module_inventory_focused_rows(
 
 fn select_context_module_inventory_leaf_groups(
     rows: &[ContextModuleInventoryRow],
+    broad_rows: &[ContextModuleInventoryRow],
 ) -> Vec<ContextModuleInventoryLeafGroup> {
     let mut by_parent = BTreeMap::<String, Vec<ContextModuleInventoryRow>>::new();
     for row in rows
@@ -9149,6 +9952,34 @@ fn select_context_module_inventory_leaf_groups(
     let mut selected = Vec::new();
     let mut selected_parents = BTreeSet::new();
     let mut total_children = 0usize;
+    for broad in broad_rows {
+        let best_group = groups
+            .iter()
+            .filter(|group| {
+                group.parent == broad.prefix
+                    || group.parent.starts_with(&(broad.prefix.clone() + "/"))
+            })
+            .min_by(|left, right| {
+                let left_exact = left.parent == broad.prefix;
+                let right_exact = right.parent == broad.prefix;
+                right_exact
+                    .cmp(&left_exact)
+                    .then_with(|| {
+                        path_component_count(&left.parent).cmp(&path_component_count(&right.parent))
+                    })
+                    .then_with(|| right.score.total_cmp(&left.score))
+                    .then_with(|| left.parent.cmp(&right.parent))
+            })
+            .cloned();
+        if let Some(group) = best_group {
+            push_context_module_inventory_leaf_group(
+                group,
+                &mut selected,
+                &mut selected_parents,
+                &mut total_children,
+            );
+        }
+    }
     let mut rootish_groups = groups
         .iter()
         .filter(|group| path_component_count(&group.parent) <= 3)
@@ -9343,16 +10174,99 @@ fn select_context_module_inventory_leaf_children(
 fn context_module_inventory_leaf_children_from_rows(
     rows: &[ContextModuleInventoryRow],
 ) -> Vec<ContextModuleInventoryLeafChild> {
+    let mut rows = rows.to_vec();
+    rows.sort_by(|left, right| {
+        context_module_inventory_entry_score(right)
+            .total_cmp(&context_module_inventory_entry_score(left))
+            .then_with(|| {
+                context_module_inventory_focus_score(right)
+                    .total_cmp(&context_module_inventory_focus_score(left))
+            })
+            .then_with(|| left.prefix.cmp(&right.prefix))
+    });
     rows.iter()
         .filter_map(|row| {
             split_context_module_inventory_leaf(&row.prefix).map(|(_, name)| {
                 ContextModuleInventoryLeafChild {
                     name,
                     file_count: row.file_count,
+                    outgoing: row.outgoing,
+                    incoming: row.incoming,
+                    representatives: row.representatives.clone(),
                 }
             })
         })
         .collect()
+}
+
+fn context_module_inventory_entry_score(row: &ContextModuleInventoryRow) -> f32 {
+    let outgoing = (row.outgoing + 1) as f32;
+    let incoming = (row.incoming + 1) as f32;
+    outgoing.ln() * 7.0 - incoming.ln() * 4.0 + (outgoing / incoming).ln() * 3.0
+}
+
+fn context_module_inventory_representative_paths(
+    index: &Codebase,
+    paths: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut ranked = paths
+        .iter()
+        .map(|path| {
+            let outgoing = index.deps_for(path).len();
+            let incoming = index.reverse_deps_for(path).len();
+            let entry_score = ((outgoing + 1) as f32).ln() * 7.0
+                - ((incoming + 1) as f32).ln() * 4.0
+                + (((outgoing + 1) as f32) / ((incoming + 1) as f32)).ln() * 3.0;
+            let central_score = ((outgoing + incoming + 1) as f32).ln() * 6.0;
+            (path, entry_score, central_score, outgoing)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| right.2.total_cmp(&left.2))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    let mut selected = Vec::<String>::new();
+    if let Some((path, _, _, _)) = ranked.first() {
+        selected.push(context_module_inventory_representative_name(path));
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| right.1.total_cmp(&left.1))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    for (path, _, _, _) in &ranked {
+        let name = context_module_inventory_representative_name(path);
+        if selected.contains(&name) {
+            continue;
+        }
+        selected.push(name);
+        break;
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .3
+            .cmp(&left.3)
+            .then_with(|| right.2.total_cmp(&left.2))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    for (path, _, _, _) in ranked {
+        let name = context_module_inventory_representative_name(path);
+        if selected.contains(&name) {
+            continue;
+        }
+        selected.push(name);
+        break;
+    }
+    selected
+}
+
+fn context_module_inventory_representative_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 fn evenly_spaced_indices(len: usize, limit: usize) -> Vec<usize> {
@@ -12049,6 +12963,2539 @@ fn handle_callpath(index: &Codebase, args: &Value) -> Result<String> {
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
 
+fn handle_graph_query(index: &Codebase, args: &Value) -> Result<String> {
+    let statement = required_str(args, "query")?;
+    let query = graph_query::parse(&statement)?;
+    let mut provider = CodeGraphQueryProvider::new(index);
+    let result = graph_query::execute(&mut provider, &query)?;
+    serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "language": "codedb-cypher-subset-v2",
+        "query": statement,
+        "result": result,
+    }))
+    .map_err(Into::into)
+}
+
+struct CodeGraphQueryProvider<'a> {
+    index: &'a Codebase,
+    graph: Option<Arc<crate::graph::CodeGraph>>,
+    community_dependencies: Option<BTreeMap<(usize, usize), usize>>,
+    community_nodes: Option<BTreeMap<usize, PropertyNode>>,
+    file_nodes: HashMap<String, PropertyNode>,
+    active_content_cache: HashMap<String, Arc<String>>,
+    outgoing_cache: HashMap<String, Vec<CallpathEdge>>,
+    incoming_cache: HashMap<String, Vec<CallpathEdge>>,
+    control_cache: HashMap<String, ControlGraphFacts>,
+}
+
+impl<'a> CodeGraphQueryProvider<'a> {
+    fn new(index: &'a Codebase) -> Self {
+        Self {
+            index,
+            graph: None,
+            community_dependencies: None,
+            community_nodes: None,
+            file_nodes: HashMap::new(),
+            active_content_cache: HashMap::new(),
+            outgoing_cache: HashMap::new(),
+            incoming_cache: HashMap::new(),
+            control_cache: HashMap::new(),
+        }
+    }
+
+    fn graph(&mut self) -> Arc<crate::graph::CodeGraph> {
+        if let Some(graph) = &self.graph {
+            return graph.clone();
+        }
+        let graph = self.index.graph();
+        self.graph = Some(graph.clone());
+        graph
+    }
+
+    fn community_dependencies(&mut self) -> BTreeMap<(usize, usize), usize> {
+        if let Some(dependencies) = &self.community_dependencies {
+            return dependencies.clone();
+        }
+        let graph = self.graph();
+        let mut dependencies = BTreeMap::<(usize, usize), usize>::new();
+        for source in self.index.files.keys() {
+            let Some(source_community) = graph_file_community(graph.as_ref(), source) else {
+                continue;
+            };
+            for target in self.index.deps_for(source) {
+                let Some(target_community) = graph_file_community(graph.as_ref(), &target) else {
+                    continue;
+                };
+                if source_community != target_community {
+                    *dependencies
+                        .entry((source_community, target_community))
+                        .or_default() += 1;
+                }
+            }
+        }
+        self.community_dependencies = Some(dependencies.clone());
+        dependencies
+    }
+
+    fn file_node(&mut self, path: &str) -> Option<PropertyNode> {
+        if let Some(node) = self.file_nodes.get(path) {
+            return Some(node.clone());
+        }
+        let graph = self.graph();
+        let file = self.index.file(path)?;
+        let node = property_file_node(self.index, graph.as_ref(), file);
+        self.file_nodes.insert(path.to_string(), node.clone());
+        Some(node)
+    }
+
+    fn community_nodes(&mut self) -> BTreeMap<usize, PropertyNode> {
+        if let Some(nodes) = &self.community_nodes {
+            return nodes.clone();
+        }
+        let graph = self.graph();
+        let nodes = property_community_nodes(graph.as_ref());
+        self.community_nodes = Some(nodes.clone());
+        nodes
+    }
+
+    fn community_node(&mut self, community: usize) -> Option<PropertyNode> {
+        self.community_nodes().get(&community).cloned()
+    }
+
+    fn seed_value_nodes(&mut self, expression: &str) -> Result<Vec<PropertyNode>> {
+        let Some(anchor) = raw_identifiers(expression).into_iter().next_back() else {
+            return Ok(Vec::new());
+        };
+        let mut values = Vec::new();
+        for hit in reference_candidates(self.index, &anchor)? {
+            let Some(scope) = hit.scope else {
+                continue;
+            };
+            let Some(file) = self.index.file(&hit.path) else {
+                continue;
+            };
+            let Some(symbol) = file.symbols.iter().find(|symbol| {
+                symbol.line_start == scope.start
+                    && symbol.line_end == scope.end
+                    && symbol.name == scope.name
+                    && is_context_handoff_source_symbol(symbol)
+            }) else {
+                continue;
+            };
+            let owner = target_from_symbol(file, symbol);
+            let key = format!("calls:{}", symbol_target_key(&owner));
+            let mut resolved = BTreeSet::<(usize, String)>::new();
+            for call in cached_callpath_edges(
+                self.index,
+                &key,
+                &owner,
+                None,
+                false,
+                &mut self.active_content_cache,
+                &mut self.outgoing_cache,
+            )? {
+                if call.line != Some(hit.line) {
+                    continue;
+                }
+                let callsite = property_resolved_callsite_node(self.index, &owner, &call);
+                if let (Some(line), Some(name)) = (
+                    graph_integer_property(&callsite, "line"),
+                    graph_string_property(&callsite, "name"),
+                ) {
+                    resolved.insert((line as usize, name.to_string()));
+                }
+                values.extend(
+                    property_callsite_values(&callsite)
+                        .into_iter()
+                        .filter(|value| {
+                            graph_string_property(value, "expression") == Some(expression)
+                        }),
+                );
+            }
+            for callsite in unresolved_qualified_callsite_nodes_on_line(
+                self.index, &owner, hit.line, &hit.text, &resolved,
+            ) {
+                values.extend(
+                    property_callsite_values(&callsite)
+                        .into_iter()
+                        .filter(|value| {
+                            graph_string_property(value, "expression") == Some(expression)
+                        }),
+                );
+            }
+        }
+        values.sort_by(|left, right| left.id.cmp(&right.id));
+        values.dedup_by(|left, right| left.id == right.id);
+        Ok(values)
+    }
+
+    fn symbol_from_node(&self, node: &PropertyNode) -> Option<SymbolTarget> {
+        let path = graph_string_property(node, "path")?;
+        let name = graph_string_property(node, "name")?;
+        let line_start = graph_integer_property(node, "line_start")? as usize;
+        self.index.file(path)?;
+        Some(SymbolTarget {
+            name: name.to_string(),
+            kind: graph_string_property(node, "kind")
+                .unwrap_or("symbol")
+                .to_string(),
+            path: path.to_string(),
+            line_start,
+            detail: graph_string_property(node, "detail")
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+
+    fn shared_state_from_node(&self, node: &PropertyNode) -> Option<SymbolTarget> {
+        if !node.labels.iter().any(|label| label == "SharedState") {
+            return None;
+        }
+        self.symbol_from_node(node)
+    }
+
+    fn expand_symbol(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        let Some(source) = self.symbol_from_node(node) else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        let outgoing = matches!(
+            relationship.direction,
+            GraphDirection::Outgoing | GraphDirection::Either
+        );
+        let incoming = matches!(
+            relationship.direction,
+            GraphDirection::Incoming | GraphDirection::Either
+        );
+
+        if graph_relation_requested(relationship, "CALLS") {
+            if outgoing {
+                let key = format!("calls:{}", symbol_target_key(&source));
+                for edge in cached_callpath_edges(
+                    self.index,
+                    &key,
+                    &source,
+                    None,
+                    false,
+                    &mut self.active_content_cache,
+                    &mut self.outgoing_cache,
+                )? {
+                    if !matches!(edge.relation.as_str(), "qualified_call" | "direct_call") {
+                        continue;
+                    }
+                    let target_node = property_symbol_node(self.index, &edge.target);
+                    result.push((
+                        property_call_edge(self.index, &source, &edge.target, &edge),
+                        target_node,
+                    ));
+                }
+            }
+            if incoming {
+                let key = format!("calls:{}", symbol_target_key(&source));
+                for edge in cached_callpath_incoming_edges(
+                    self.index,
+                    &key,
+                    &source,
+                    None,
+                    false,
+                    &mut self.active_content_cache,
+                    &mut self.incoming_cache,
+                    &mut self.outgoing_cache,
+                )? {
+                    if !matches!(edge.relation.as_str(), "qualified_call" | "direct_call") {
+                        continue;
+                    }
+                    let caller = edge.target.clone();
+                    let caller_node = property_symbol_node(self.index, &caller);
+                    result.push((
+                        property_call_edge(self.index, &caller, &source, &edge),
+                        caller_node,
+                    ));
+                }
+            }
+        }
+
+        if graph_relation_requested(relationship, "REFERENCES") {
+            if outgoing {
+                let key = format!("refs:{}", symbol_target_key(&source));
+                for edge in cached_callpath_edges(
+                    self.index,
+                    &key,
+                    &source,
+                    None,
+                    true,
+                    &mut self.active_content_cache,
+                    &mut self.outgoing_cache,
+                )? {
+                    let target_node = property_symbol_node(self.index, &edge.target);
+                    result.push((
+                        property_reference_edge(self.index, &source, &edge.target, &edge),
+                        target_node,
+                    ));
+                }
+            }
+            if incoming {
+                for edge in incoming_reference_edges(self.index, &source)? {
+                    let caller = edge.target.clone();
+                    result.push((
+                        property_reference_edge(self.index, &caller, &source, &edge),
+                        property_symbol_node(self.index, &caller),
+                    ));
+                }
+            }
+        }
+
+        if graph_relation_requested(relationship, "DISPATCHES_TO") {
+            if outgoing {
+                for target in symbol_target_dispatch_candidates(self.index, &source) {
+                    result.push((
+                        property_edge(&source, &target, "DISPATCHES_TO", BTreeMap::new()),
+                        property_symbol_node(self.index, &target),
+                    ));
+                }
+            }
+            if incoming {
+                for (file, symbol) in self.index.symbols_named(&source.name) {
+                    if !matches!(symbol.kind.as_str(), "method" | "function" | "property") {
+                        continue;
+                    }
+                    let interface = target_from_symbol(file, symbol);
+                    if symbol_target_dispatch_candidates(self.index, &interface)
+                        .into_iter()
+                        .any(|candidate| {
+                            symbol_target_key(&candidate) == symbol_target_key(&source)
+                        })
+                    {
+                        result.push((
+                            property_edge(&interface, &source, "DISPATCHES_TO", BTreeMap::new()),
+                            property_symbol_node(self.index, &interface),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if outgoing
+            && (graph_relation_requested(relationship, "READS")
+                || graph_relation_requested(relationship, "WRITES"))
+        {
+            for access in symbol_shared_state_accesses(self.index, &source)? {
+                if !graph_relation_requested(relationship, access.relation) {
+                    continue;
+                }
+                result.push((
+                    property_state_access_edge(&source, &access),
+                    property_shared_state_node(self.index, &access.state),
+                ));
+            }
+        }
+
+        if incoming && graph_relation_requested(relationship, "CONTAINS") {
+            if let Some(file_node) = self.file_node(&source.path) {
+                result.push((
+                    property_file_contains_edge(&source.path, &source),
+                    file_node,
+                ));
+            }
+        }
+
+        if outgoing && graph_relation_requested(relationship, "HAS_PARAMETER") {
+            let facts = self.control_facts(&source)?;
+            for parameter in &facts.parameters {
+                result.push((
+                    virtual_property_edge(
+                        &symbol_target_key(&source),
+                        &parameter.node.id,
+                        "HAS_PARAMETER",
+                        BTreeMap::new(),
+                    ),
+                    parameter.node.clone(),
+                ));
+            }
+        }
+
+        if outgoing && graph_relation_requested(relationship, "HAS_CALLSITE") {
+            let key = format!("calls:{}", symbol_target_key(&source));
+            let mut resolved = BTreeSet::<(usize, String)>::new();
+            for call in cached_callpath_edges(
+                self.index,
+                &key,
+                &source,
+                None,
+                false,
+                &mut self.active_content_cache,
+                &mut self.outgoing_cache,
+            )? {
+                if !matches!(call.relation.as_str(), "qualified_call" | "direct_call") {
+                    continue;
+                }
+                let callsite = property_resolved_callsite_node(self.index, &source, &call);
+                if let (Some(line), Some(name)) = (
+                    graph_integer_property(&callsite, "line"),
+                    graph_string_property(&callsite, "name"),
+                ) {
+                    resolved.insert((line as usize, name.to_string()));
+                }
+                result.push((
+                    virtual_property_edge(
+                        &symbol_target_key(&source),
+                        &callsite.id,
+                        "HAS_CALLSITE",
+                        BTreeMap::new(),
+                    ),
+                    callsite,
+                ));
+            }
+            for callsite in unresolved_qualified_callsite_nodes(self.index, &source, &resolved)? {
+                result.push((
+                    virtual_property_edge(
+                        &symbol_target_key(&source),
+                        &callsite.id,
+                        "HAS_CALLSITE",
+                        BTreeMap::new(),
+                    ),
+                    callsite,
+                ));
+            }
+        }
+
+        graph_sort_and_dedup(&mut result);
+        Ok(result)
+    }
+
+    fn control_facts(&mut self, owner: &SymbolTarget) -> Result<ControlGraphFacts> {
+        let key = symbol_target_key(owner);
+        if let Some(facts) = self.control_cache.get(&key) {
+            return Ok(facts.clone());
+        }
+        let facts = build_control_graph_facts(self.index, owner)?;
+        self.control_cache.insert(key, facts.clone());
+        Ok(facts)
+    }
+
+    fn expand_control_node(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        let Some(owner) = graph_owner_target(node) else {
+            return Ok(Vec::new());
+        };
+        let facts = self.control_facts(&owner)?;
+        let mut result = Vec::new();
+        let outgoing = matches!(
+            relationship.direction,
+            GraphDirection::Outgoing | GraphDirection::Either
+        );
+        let incoming = matches!(
+            relationship.direction,
+            GraphDirection::Incoming | GraphDirection::Either
+        );
+
+        if node.labels.iter().any(|label| label == "Parameter") {
+            if outgoing && graph_relation_requested(relationship, "USED_IN") {
+                for condition in &facts.conditions {
+                    for use_edge in &condition.parameter_uses {
+                        if use_edge.parameter_id == node.id {
+                            result.push((
+                                virtual_property_edge(
+                                    &node.id,
+                                    &condition.node.id,
+                                    "USED_IN",
+                                    use_edge.properties.clone(),
+                                ),
+                                condition.node.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if incoming && graph_relation_requested(relationship, "HAS_PARAMETER") {
+                result.push((
+                    virtual_property_edge(
+                        &symbol_target_key(&owner),
+                        &node.id,
+                        "HAS_PARAMETER",
+                        BTreeMap::new(),
+                    ),
+                    property_symbol_node(self.index, &owner),
+                ));
+            }
+        } else if node.labels.iter().any(|label| label == "Condition") {
+            if outgoing {
+                if let Some(condition) = facts
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.node.id == node.id)
+                {
+                    for branch in &condition.branches {
+                        if graph_relation_requested(relationship, branch.relation) {
+                            result.push((
+                                virtual_property_edge(
+                                    &node.id,
+                                    &branch.action.id,
+                                    branch.relation,
+                                    BTreeMap::new(),
+                                ),
+                                branch.action.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if incoming && graph_relation_requested(relationship, "USED_IN") {
+                if let Some(condition) = facts
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.node.id == node.id)
+                {
+                    for use_edge in &condition.parameter_uses {
+                        if let Some(parameter) = facts
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.node.id == use_edge.parameter_id)
+                        {
+                            result.push((
+                                virtual_property_edge(
+                                    &parameter.node.id,
+                                    &node.id,
+                                    "USED_IN",
+                                    use_edge.properties.clone(),
+                                ),
+                                parameter.node.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if node.labels.iter().any(|label| label == "ControlAction") {
+            if outgoing {
+                for condition in &facts.conditions {
+                    for branch in &condition.branches {
+                        if branch.action.id != node.id {
+                            continue;
+                        }
+                        for effect in &branch.effects {
+                            if graph_relation_requested(relationship, effect.relation) {
+                                result.push((
+                                    virtual_property_edge(
+                                        &node.id,
+                                        &effect.callsite.id,
+                                        effect.relation,
+                                        BTreeMap::new(),
+                                    ),
+                                    effect.callsite.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if incoming {
+                for condition in &facts.conditions {
+                    for branch in &condition.branches {
+                        if branch.action.id == node.id
+                            && graph_relation_requested(relationship, branch.relation)
+                        {
+                            result.push((
+                                virtual_property_edge(
+                                    &condition.node.id,
+                                    &node.id,
+                                    branch.relation,
+                                    BTreeMap::new(),
+                                ),
+                                condition.node.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if node.labels.iter().any(|label| label == "CallSite") {
+            if outgoing && graph_relation_requested(relationship, "TARGET") {
+                if let Some(target) = graph_callsite_target(node) {
+                    result.push((
+                        virtual_property_edge(
+                            &node.id,
+                            &symbol_target_key(&target),
+                            "TARGET",
+                            BTreeMap::new(),
+                        ),
+                        property_symbol_node(self.index, &target),
+                    ));
+                }
+            }
+            if outgoing && graph_relation_requested(relationship, "ARGUMENT") {
+                for value in property_callsite_values(node) {
+                    let index = graph_integer_property(&value, "index").unwrap_or_default();
+                    result.push((
+                        virtual_property_edge(
+                            &node.id,
+                            &value.id,
+                            "ARGUMENT",
+                            BTreeMap::from([("index".to_string(), GraphScalar::Integer(index))]),
+                        ),
+                        value,
+                    ));
+                }
+            }
+            if incoming {
+                if graph_relation_requested(relationship, "HAS_CALLSITE") {
+                    result.push((
+                        virtual_property_edge(
+                            &symbol_target_key(&owner),
+                            &node.id,
+                            "HAS_CALLSITE",
+                            BTreeMap::new(),
+                        ),
+                        property_symbol_node(self.index, &owner),
+                    ));
+                }
+                for condition in &facts.conditions {
+                    for branch in &condition.branches {
+                        for effect in &branch.effects {
+                            if effect.callsite.id == node.id
+                                && graph_relation_requested(relationship, effect.relation)
+                            {
+                                result.push((
+                                    virtual_property_edge(
+                                        &branch.action.id,
+                                        &node.id,
+                                        effect.relation,
+                                        BTreeMap::new(),
+                                    ),
+                                    branch.action.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if node.labels.iter().any(|label| label == "Value") {
+            if outgoing && graph_relation_requested(relationship, "BINDS_TO") {
+                if let Some(target) = graph_value_target(node) {
+                    let facts = self.control_facts(&target)?;
+                    let index = graph_integer_property(node, "index").unwrap_or_default();
+                    if let Some(parameter) = facts.parameters.iter().find(|parameter| {
+                        graph_integer_property(&parameter.node, "index") == Some(index)
+                    }) {
+                        result.push((
+                            virtual_property_edge(
+                                &node.id,
+                                &parameter.node.id,
+                                "BINDS_TO",
+                                BTreeMap::from([(
+                                    "index".to_string(),
+                                    GraphScalar::Integer(index),
+                                )]),
+                            ),
+                            parameter.node.clone(),
+                        ));
+                    }
+                }
+            }
+            if incoming && graph_relation_requested(relationship, "ARGUMENT") {
+                if let Some(callsite) = property_value_callsite(node) {
+                    let index = graph_integer_property(node, "index").unwrap_or_default();
+                    result.push((
+                        virtual_property_edge(
+                            &callsite.id,
+                            &node.id,
+                            "ARGUMENT",
+                            BTreeMap::from([("index".to_string(), GraphScalar::Integer(index))]),
+                        ),
+                        callsite,
+                    ));
+                }
+            }
+        }
+        graph_sort_and_dedup(&mut result);
+        Ok(result)
+    }
+
+    fn expand_shared_state(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        let Some(state) = self.shared_state_from_node(node) else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        if matches!(
+            relationship.direction,
+            GraphDirection::Incoming | GraphDirection::Either
+        ) {
+            for access in incoming_shared_state_accesses(self.index, &state)? {
+                if !graph_relation_requested(relationship, access.relation) {
+                    continue;
+                }
+                result.push((
+                    property_state_access_edge(&access.owner, &access),
+                    property_symbol_node(self.index, &access.owner),
+                ));
+            }
+        }
+        graph_sort_and_dedup(&mut result);
+        Ok(result)
+    }
+
+    fn expand_file(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        let Some(path) = graph_string_property(node, "path") else {
+            return Ok(Vec::new());
+        };
+        let graph = self.graph();
+        let Some(file) = self.index.file(path) else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        let outgoing = matches!(
+            relationship.direction,
+            GraphDirection::Outgoing | GraphDirection::Either
+        );
+        let incoming = matches!(
+            relationship.direction,
+            GraphDirection::Incoming | GraphDirection::Either
+        );
+        if outgoing && graph_relation_requested(relationship, "CONTAINS") {
+            for symbol in &file.symbols {
+                let target = target_from_symbol(file, symbol);
+                result.push((
+                    property_file_contains_edge(path, &target),
+                    property_symbol_node(self.index, &target),
+                ));
+            }
+        }
+        if incoming
+            && graph_relation_requested(relationship, "CONTAINS")
+            && let Some(community) = graph_file_community(graph.as_ref(), path)
+        {
+            if let Some(community_node) = self.community_node(community) {
+                result.push((
+                    virtual_property_edge(
+                        &community_node.id,
+                        &format!("file:{path}"),
+                        "CONTAINS",
+                        BTreeMap::new(),
+                    ),
+                    community_node,
+                ));
+            }
+        }
+        if graph_relation_requested(relationship, "DEPENDS_ON") {
+            if outgoing {
+                for target_path in self.index.deps_for(path) {
+                    if let Some(target_file) = self.file_node(&target_path) {
+                        result.push((
+                            property_file_dependency_edge(path, &target_path),
+                            target_file,
+                        ));
+                    }
+                }
+            }
+            if incoming {
+                for source_path in self.index.reverse_deps_for(path) {
+                    if let Some(source_file) = self.file_node(&source_path) {
+                        result.push((
+                            property_file_dependency_edge(&source_path, path),
+                            source_file,
+                        ));
+                    }
+                }
+            }
+        }
+        graph_sort_and_dedup(&mut result);
+        Ok(result)
+    }
+
+    fn expand_community(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        let Some(community) = graph_integer_property(node, "id").map(|value| value as usize) else {
+            return Ok(Vec::new());
+        };
+        let graph = self.graph();
+        let outgoing = matches!(
+            relationship.direction,
+            GraphDirection::Outgoing | GraphDirection::Either
+        );
+        let incoming = matches!(
+            relationship.direction,
+            GraphDirection::Incoming | GraphDirection::Either
+        );
+        let mut result = Vec::new();
+
+        if outgoing && graph_relation_requested(relationship, "CONTAINS") {
+            for (id, path) in graph.file_graph.paths.iter().enumerate() {
+                if graph.file_graph.community(id) != Some(community) {
+                    continue;
+                }
+                let Some(file_node) = self.file_node(path) else {
+                    continue;
+                };
+                result.push((
+                    virtual_property_edge(&node.id, &file_node.id, "CONTAINS", BTreeMap::new()),
+                    file_node,
+                ));
+            }
+        }
+
+        if graph_relation_requested(relationship, "DEPENDS_ON") {
+            for ((source, target), count) in self.community_dependencies() {
+                if outgoing && source == community {
+                    if let Some(target_node) = self.community_node(target) {
+                        result.push((
+                            virtual_property_edge(
+                                &node.id,
+                                &target_node.id,
+                                "DEPENDS_ON",
+                                BTreeMap::from([(
+                                    "file_edges".to_string(),
+                                    GraphScalar::Integer(count as i64),
+                                )]),
+                            ),
+                            target_node,
+                        ));
+                    }
+                }
+                if incoming && target == community {
+                    if let Some(source_node) = self.community_node(source) {
+                        result.push((
+                            virtual_property_edge(
+                                &source_node.id,
+                                &node.id,
+                                "DEPENDS_ON",
+                                BTreeMap::from([(
+                                    "file_edges".to_string(),
+                                    GraphScalar::Integer(count as i64),
+                                )]),
+                            ),
+                            source_node,
+                        ));
+                    }
+                }
+            }
+        }
+
+        graph_sort_and_dedup(&mut result);
+        Ok(result)
+    }
+}
+
+fn incoming_reference_edges(index: &Codebase, target: &SymbolTarget) -> Result<Vec<CallpathEdge>> {
+    let Some(target_file) = index.file(&target.path) else {
+        return Ok(Vec::new());
+    };
+    let Some(target_symbol) = symbol_for_target(target_file, target) else {
+        return Ok(Vec::new());
+    };
+    let unique_name = index.symbols_named(&target.name).len() == 1;
+    let mut edges = Vec::new();
+    for hit in reference_candidates(index, &target.name)? {
+        let Some(scope) = hit.scope else {
+            continue;
+        };
+        if hit.path == target.path && scope.start == target.line_start && scope.name == target.name
+        {
+            continue;
+        }
+        let Some(file) = index.file(&hit.path) else {
+            continue;
+        };
+        let Some(symbol) = file.symbols.iter().find(|symbol| {
+            symbol.line_start == scope.start
+                && symbol.line_end == scope.end
+                && symbol.name == scope.name
+                && is_context_handoff_source_symbol(symbol)
+        }) else {
+            continue;
+        };
+        let qualified = qualified_member_tokens(&hit.text).into_iter().any(|token| {
+            token.rsplit('.').next() == Some(target.name.as_str())
+                && qualified_call_qualifier_matches(index, &token, target_file, target_symbol) > 0
+        });
+        if !qualified && !unique_name && file.path != target.path {
+            continue;
+        }
+        edges.push(CallpathEdge {
+            target: target_from_symbol(file, symbol),
+            relation: if qualified {
+                "member_reference".to_string()
+            } else {
+                "symbol_reference".to_string()
+            },
+            line: Some(hit.line),
+            text: Some(hit.text),
+        });
+    }
+    edges.sort_by(|left, right| {
+        symbol_target_key(&left.target).cmp(&symbol_target_key(&right.target))
+    });
+    edges.dedup_by(|left, right| {
+        symbol_target_key(&left.target) == symbol_target_key(&right.target)
+    });
+    Ok(edges)
+}
+
+impl QueryProvider for CodeGraphQueryProvider<'_> {
+    fn seed_nodes(&mut self, pattern: &GraphNodePattern) -> Result<Vec<PropertyNode>> {
+        let label = pattern.label.as_deref();
+        let mut nodes = Vec::new();
+        match label {
+            Some("File" | "EntryFile" | "BoundaryFile" | "SinkFile") => {
+                let paths = self.index.files.keys().cloned().collect::<Vec<_>>();
+                nodes.extend(paths.into_iter().filter_map(|path| self.file_node(&path)));
+            }
+            Some("Community") => {
+                nodes.extend(self.community_nodes().into_values());
+            }
+            Some("SharedState") => {
+                for file in self.index.files.values() {
+                    for symbol in &file.symbols {
+                        if is_shared_state_symbol(symbol) {
+                            nodes.push(property_shared_state_node(
+                                self.index,
+                                &target_from_symbol(file, symbol),
+                            ));
+                        }
+                    }
+                }
+            }
+            Some("Value") => {
+                let Some(GraphScalar::String(expression)) = pattern.properties.get("expression")
+                else {
+                    return Err(anyhow!(
+                        "Value nodes require an exact expression predicate or an anchored CallSite"
+                    ));
+                };
+                nodes.extend(self.seed_value_nodes(expression)?);
+            }
+            Some("Parameter" | "Condition" | "ControlAction" | "CallSite") => {
+                let owner_name =
+                    pattern
+                        .properties
+                        .get("owner_name")
+                        .and_then(|value| match value {
+                            GraphScalar::String(value) => Some(value.as_str()),
+                            _ => None,
+                        });
+                if owner_name.is_none() {
+                    return Err(anyhow!(
+                        "{label:?} nodes must be reached from an anchored Symbol or constrained with owner_name"
+                    ));
+                }
+                let owners = if let Some(owner_name) = owner_name {
+                    self.index
+                        .symbols_named(owner_name)
+                        .into_iter()
+                        .filter(|(_, symbol)| is_context_handoff_source_symbol(symbol))
+                        .map(|(file, symbol)| target_from_symbol(file, symbol))
+                        .collect::<Vec<_>>()
+                } else {
+                    self.index
+                        .files
+                        .values()
+                        .flat_map(|file| {
+                            file.symbols
+                                .iter()
+                                .filter(|symbol| is_context_handoff_source_symbol(symbol))
+                                .map(|symbol| target_from_symbol(file, symbol))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for owner in owners {
+                    let facts = self.control_facts(&owner)?;
+                    match label {
+                        Some("Parameter") => nodes
+                            .extend(facts.parameters.into_iter().map(|parameter| parameter.node)),
+                        Some("Condition") => nodes
+                            .extend(facts.conditions.into_iter().map(|condition| condition.node)),
+                        Some("ControlAction") => {
+                            nodes.extend(facts.conditions.into_iter().flat_map(|condition| {
+                                condition.branches.into_iter().map(|branch| branch.action)
+                            }))
+                        }
+                        Some("CallSite") => {
+                            nodes.extend(facts.conditions.into_iter().flat_map(|condition| {
+                                condition.branches.into_iter().flat_map(|branch| {
+                                    branch.effects.into_iter().map(|effect| effect.callsite)
+                                })
+                            }))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("Symbol") | None => {
+                if let Some(GraphScalar::String(name)) = pattern.properties.get("name") {
+                    nodes.extend(self.index.symbols_named(name).into_iter().map(
+                        |(file, symbol)| {
+                            property_symbol_node(self.index, &target_from_symbol(file, symbol))
+                        },
+                    ));
+                } else {
+                    for file in self.index.files.values() {
+                        nodes.extend(file.symbols.iter().map(|symbol| {
+                            property_symbol_node(self.index, &target_from_symbol(file, symbol))
+                        }));
+                    }
+                }
+            }
+            Some(kind) => {
+                for file in self.index.files.values() {
+                    for symbol in &file.symbols {
+                        let node =
+                            property_symbol_node(self.index, &target_from_symbol(file, symbol));
+                        if node.labels.iter().any(|candidate| candidate == kind) {
+                            nodes.push(node);
+                        }
+                    }
+                }
+            }
+        }
+        nodes.retain(|node| graph_node_matches_pattern(node, pattern));
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(nodes)
+    }
+
+    fn expand(
+        &mut self,
+        node: &PropertyNode,
+        relationship: &GraphRelationshipPattern,
+    ) -> Result<Vec<(PropertyEdge, PropertyNode)>> {
+        if node.labels.iter().any(|label| label == "SharedState") {
+            self.expand_shared_state(node, relationship)
+        } else if node.labels.iter().any(|label| label == "Community") {
+            self.expand_community(node, relationship)
+        } else if node.labels.iter().any(|label| label == "File") {
+            self.expand_file(node, relationship)
+        } else if node.labels.iter().any(|label| {
+            matches!(
+                label.as_str(),
+                "Parameter" | "Condition" | "ControlAction" | "CallSite" | "Value"
+            )
+        }) {
+            self.expand_control_node(node, relationship)
+        } else if node.labels.iter().any(|label| label == "Symbol") {
+            self.expand_symbol(node, relationship)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ControlGraphFacts {
+    parameters: Vec<ControlParameterFact>,
+    conditions: Vec<ControlConditionFact>,
+}
+
+#[derive(Clone)]
+struct ControlParameterFact {
+    node: PropertyNode,
+}
+
+#[derive(Clone)]
+struct ControlConditionFact {
+    node: PropertyNode,
+    parameter_uses: Vec<ControlParameterUse>,
+    branches: Vec<ControlBranchFact>,
+}
+
+#[derive(Clone)]
+struct ControlParameterUse {
+    parameter_id: String,
+    properties: BTreeMap<String, GraphScalar>,
+}
+
+#[derive(Clone)]
+struct ControlBranchFact {
+    relation: &'static str,
+    action: PropertyNode,
+    effects: Vec<ControlEffectFact>,
+}
+
+#[derive(Clone)]
+struct ControlEffectFact {
+    relation: &'static str,
+    callsite: PropertyNode,
+}
+
+fn build_control_graph_facts(index: &Codebase, owner: &SymbolTarget) -> Result<ControlGraphFacts> {
+    let Some(file) = index.file(&owner.path) else {
+        return Ok(ControlGraphFacts::default());
+    };
+    let Some(symbol) = symbol_for_target(file, owner) else {
+        return Ok(ControlGraphFacts::default());
+    };
+    let Some(parameter_declarations) = signature_parameters(&symbol.detail) else {
+        return Ok(ControlGraphFacts::default());
+    };
+    let parameters = parameter_declarations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, declaration)| {
+            let declaration_without_default = declaration.split('=').next().unwrap_or(declaration);
+            let name = raw_identifiers(declaration_without_default)
+                .into_iter()
+                .next_back()?;
+            Some((name, index, declaration.clone()))
+        })
+        .collect::<Vec<_>>();
+    if parameters.is_empty() {
+        return Ok(ControlGraphFacts::default());
+    }
+
+    let parameter_facts = parameters
+        .iter()
+        .map(|(name, index, declaration)| ControlParameterFact {
+            node: control_property_node(
+                "Parameter",
+                format!("parameter:{}:{index}:{name}", symbol_target_key(owner)),
+                owner,
+                BTreeMap::from([
+                    ("name".to_string(), GraphScalar::String(name.clone())),
+                    ("index".to_string(), GraphScalar::Integer(*index as i64)),
+                    (
+                        "declaration".to_string(),
+                        GraphScalar::String(declaration.clone()),
+                    ),
+                ]),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let parameter_ids = parameter_facts
+        .iter()
+        .map(|parameter| {
+            (
+                graph_string_property(&parameter.node, "name")
+                    .unwrap_or_default()
+                    .to_string(),
+                parameter.node.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let content = index.file_content(file)?;
+    let active = mask_comments(file.language.as_str(), &content);
+    let body = source_line_slice(
+        &active,
+        symbol.line_start,
+        symbol.line_end.max(symbol.line_start),
+    );
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut depth = 0isize;
+    let mut depths = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let code = strip_strings_and_line_comment(line);
+        depths.push(depth);
+        depth += code.chars().filter(|ch| *ch == '{').count() as isize;
+        depth -= code.chars().filter(|ch| *ch == '}').count() as isize;
+    }
+
+    let mut tracked = parameters
+        .iter()
+        .map(|(name, _, _)| (name.clone(), name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut conditions = Vec::new();
+    for (offset, line) in lines.iter().enumerate() {
+        let code = strip_strings_and_line_comment(line);
+        let roots = tracked
+            .iter()
+            .filter(|(name, _)| line_contains_identifier_token(&code, name))
+            .map(|(_, root)| root.clone())
+            .collect::<BTreeSet<_>>();
+        if !roots.is_empty()
+            && let Some(alias) = assignment_target_identifier(&code)
+            && !tracked.contains_key(&alias)
+            && let Some(root) = roots.iter().next()
+        {
+            tracked.insert(alias, root.clone());
+        }
+
+        let trimmed = code.trim_start();
+        let is_condition = trimmed.starts_with("if")
+            || trimmed.starts_with("else if")
+            || trimmed.starts_with("while");
+        if !is_condition || roots.is_empty() {
+            continue;
+        }
+        let line_number = symbol.line_start + offset;
+        let aliases = tracked
+            .iter()
+            .filter(|(name, root)| {
+                roots.contains(*root) && line_contains_identifier_token(&code, name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let negated = aliases
+            .iter()
+            .any(|alias| identifier_condition_is_negated(&code, alias));
+        let condition_node = control_property_node(
+            "Condition",
+            format!("condition:{}:{line_number}", symbol_target_key(owner)),
+            owner,
+            BTreeMap::from([
+                ("line".to_string(), GraphScalar::Integer(line_number as i64)),
+                (
+                    "text".to_string(),
+                    GraphScalar::String(line.trim().to_string()),
+                ),
+                ("negated".to_string(), GraphScalar::Boolean(negated)),
+                (
+                    "aliases".to_string(),
+                    GraphScalar::String(aliases.iter().cloned().collect::<Vec<_>>().join(",")),
+                ),
+            ]),
+        );
+        let parameter_uses = roots
+            .iter()
+            .filter_map(|root| {
+                let parameter_id = parameter_ids.get(root)?.clone();
+                let via = aliases
+                    .iter()
+                    .filter(|alias| tracked.get(*alias) == Some(root))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Some(ControlParameterUse {
+                    parameter_id,
+                    properties: BTreeMap::from([("via".to_string(), GraphScalar::String(via))]),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let action =
+            lines
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(8)
+                .find_map(|(action_offset, candidate)| {
+                    control_action_kind(&strip_strings_and_line_comment(candidate))
+                        .map(|kind| (action_offset, kind, candidate.trim().to_string()))
+                });
+        let mut branches = Vec::new();
+        if let Some((action_offset, action_kind, action_text)) = action {
+            let action_line = symbol.line_start + action_offset;
+            let true_action = control_property_node(
+                "ControlAction",
+                format!(
+                    "action:{}:{action_line}:{action_kind}",
+                    symbol_target_key(owner)
+                ),
+                owner,
+                BTreeMap::from([
+                    ("line".to_string(), GraphScalar::Integer(action_line as i64)),
+                    (
+                        "kind".to_string(),
+                        GraphScalar::String(action_kind.to_string()),
+                    ),
+                    ("text".to_string(), GraphScalar::String(action_text)),
+                    (
+                        "branch".to_string(),
+                        GraphScalar::String("true".to_string()),
+                    ),
+                ]),
+            );
+            let false_action = control_property_node(
+                "ControlAction",
+                format!(
+                    "action:{}:{line_number}:fallthrough",
+                    symbol_target_key(owner)
+                ),
+                owner,
+                BTreeMap::from([
+                    ("line".to_string(), GraphScalar::Integer(line_number as i64)),
+                    (
+                        "kind".to_string(),
+                        GraphScalar::String("fallthrough".to_string()),
+                    ),
+                    (
+                        "text".to_string(),
+                        GraphScalar::String(
+                            "condition false; continue after guarded action".to_string(),
+                        ),
+                    ),
+                    (
+                        "branch".to_string(),
+                        GraphScalar::String("false".to_string()),
+                    ),
+                ]),
+            );
+            let calls =
+                subsequent_control_calls(owner, symbol, &lines, &depths, offset, action_offset);
+            branches.push(ControlBranchFact {
+                relation: "TRUE",
+                action: true_action,
+                effects: calls
+                    .iter()
+                    .cloned()
+                    .map(|callsite| ControlEffectFact {
+                        relation: "PREVENTS",
+                        callsite,
+                    })
+                    .collect(),
+            });
+            branches.push(ControlBranchFact {
+                relation: "FALSE",
+                action: false_action,
+                effects: calls
+                    .into_iter()
+                    .map(|callsite| ControlEffectFact {
+                        relation: "REACHES",
+                        callsite,
+                    })
+                    .collect(),
+            });
+        }
+        conditions.push(ControlConditionFact {
+            node: condition_node,
+            parameter_uses,
+            branches,
+        });
+    }
+    Ok(ControlGraphFacts {
+        parameters: parameter_facts,
+        conditions,
+    })
+}
+
+fn control_action_kind(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim();
+    if trimmed == "continue;" || trimmed.contains(" continue;") {
+        Some("continue")
+    } else if trimmed == "break;" || trimmed.contains(" break;") {
+        Some("break")
+    } else if trimmed.starts_with("return ") || trimmed == "return;" {
+        Some("return")
+    } else if trimmed.starts_with("throw ") {
+        Some("throw")
+    } else if trimmed.starts_with("yield ") {
+        Some("yield")
+    } else {
+        None
+    }
+}
+
+fn subsequent_control_calls(
+    owner: &SymbolTarget,
+    symbol: &Symbol,
+    lines: &[&str],
+    depths: &[isize],
+    condition_offset: usize,
+    action_offset: usize,
+) -> Vec<PropertyNode> {
+    let condition_depth = depths.get(condition_offset).copied().unwrap_or_default();
+    let mut calls = BTreeMap::<String, PropertyNode>::new();
+    for (offset, line) in lines.iter().enumerate().skip(action_offset + 1) {
+        if depths.get(offset).copied().unwrap_or_default() < condition_depth {
+            break;
+        }
+        let code = strip_strings_and_line_comment(line);
+        for token in qualified_call_tokens(&code) {
+            let name = token.rsplit('.').next().unwrap_or(&token).to_string();
+            let receiver = token
+                .rsplit_once('.')
+                .map(|(receiver, _)| receiver.to_string())
+                .unwrap_or_default();
+            let line_number = symbol.line_start + offset;
+            let id = format!(
+                "callsite:{}:{line_number}:{token}",
+                symbol_target_key(owner)
+            );
+            calls.entry(id.clone()).or_insert_with(|| {
+                control_property_node(
+                    "CallSite",
+                    id,
+                    owner,
+                    BTreeMap::from([
+                        ("name".to_string(), GraphScalar::String(name)),
+                        ("receiver".to_string(), GraphScalar::String(receiver)),
+                        ("line".to_string(), GraphScalar::Integer(line_number as i64)),
+                        (
+                            "text".to_string(),
+                            GraphScalar::String(line.trim().to_string()),
+                        ),
+                    ]),
+                )
+            });
+        }
+    }
+    calls.into_values().collect()
+}
+
+fn control_property_node(
+    label: &str,
+    id: String,
+    owner: &SymbolTarget,
+    mut properties: BTreeMap<String, GraphScalar>,
+) -> PropertyNode {
+    properties.insert(
+        "owner_name".to_string(),
+        GraphScalar::String(owner.name.clone()),
+    );
+    properties.insert(
+        "owner_path".to_string(),
+        GraphScalar::String(owner.path.clone()),
+    );
+    properties.insert(
+        "owner_line".to_string(),
+        GraphScalar::Integer(owner.line_start as i64),
+    );
+    properties.insert(
+        "owner_kind".to_string(),
+        GraphScalar::String(owner.kind.clone()),
+    );
+    properties.insert(
+        "owner_detail".to_string(),
+        GraphScalar::String(owner.detail.clone()),
+    );
+    PropertyNode {
+        id,
+        labels: vec![label.to_string()],
+        properties,
+    }
+}
+
+fn property_resolved_callsite_node(
+    index: &Codebase,
+    owner: &SymbolTarget,
+    call: &CallpathEdge,
+) -> PropertyNode {
+    let line = call.line.unwrap_or(owner.line_start);
+    let text = call.text.clone().unwrap_or_default();
+    let id = format!(
+        "callsite:{}:{line}:{}:{}",
+        symbol_target_key(owner),
+        call.target.name,
+        call.target.line_start
+    );
+    let mut properties = BTreeMap::from([
+        (
+            "name".to_string(),
+            GraphScalar::String(call.target.name.clone()),
+        ),
+        ("line".to_string(), GraphScalar::Integer(line as i64)),
+        ("text".to_string(), GraphScalar::String(text)),
+        (
+            "resolution".to_string(),
+            GraphScalar::String(call.relation.clone()),
+        ),
+        (
+            "target_name".to_string(),
+            GraphScalar::String(call.target.name.clone()),
+        ),
+        (
+            "target_kind".to_string(),
+            GraphScalar::String(call.target.kind.clone()),
+        ),
+        (
+            "target_path".to_string(),
+            GraphScalar::String(call.target.path.clone()),
+        ),
+        (
+            "target_line".to_string(),
+            GraphScalar::Integer(call.target.line_start as i64),
+        ),
+        (
+            "target_detail".to_string(),
+            GraphScalar::String(call.target.detail.clone()),
+        ),
+    ]);
+    if let Some(file) = index.file(&owner.path)
+        && let Ok(content) = index.file_content(file)
+    {
+        if let Some(guard) = preprocessor_guard_at_line(&content, line) {
+            properties.insert("guard".to_string(), GraphScalar::String(guard));
+            properties.insert("guarded".to_string(), GraphScalar::Boolean(true));
+        } else {
+            properties.insert("guarded".to_string(), GraphScalar::Boolean(false));
+        }
+    }
+    control_property_node("CallSite", id, owner, properties)
+}
+
+fn property_syntax_callsite_node(
+    index: &Codebase,
+    owner: &SymbolTarget,
+    token: &str,
+    line: usize,
+    text: &str,
+) -> PropertyNode {
+    let name = token.rsplit('.').next().unwrap_or(token);
+    let receiver = token
+        .rsplit_once('.')
+        .map(|(receiver, _)| receiver)
+        .unwrap_or_default();
+    let id = format!(
+        "callsite:{}:{line}:syntax:{token}",
+        symbol_target_key(owner)
+    );
+    let mut properties = BTreeMap::from([
+        ("name".to_string(), GraphScalar::String(name.to_string())),
+        (
+            "receiver".to_string(),
+            GraphScalar::String(receiver.to_string()),
+        ),
+        ("line".to_string(), GraphScalar::Integer(line as i64)),
+        ("text".to_string(), GraphScalar::String(text.to_string())),
+        (
+            "resolution".to_string(),
+            GraphScalar::String("syntax".to_string()),
+        ),
+    ]);
+    if let Some(file) = index.file(&owner.path)
+        && let Ok(content) = index.file_content(file)
+    {
+        if let Some(guard) = preprocessor_guard_at_line(&content, line) {
+            properties.insert("guard".to_string(), GraphScalar::String(guard));
+            properties.insert("guarded".to_string(), GraphScalar::Boolean(true));
+        } else {
+            properties.insert("guarded".to_string(), GraphScalar::Boolean(false));
+        }
+    }
+    control_property_node("CallSite", id, owner, properties)
+}
+
+fn unresolved_qualified_callsite_nodes_on_line(
+    index: &Codebase,
+    owner: &SymbolTarget,
+    line_number: usize,
+    text: &str,
+    resolved: &BTreeSet<(usize, String)>,
+) -> Vec<PropertyNode> {
+    let code = strip_strings_and_line_comment(text);
+    qualified_call_tokens(&code)
+        .into_iter()
+        .filter(|token| {
+            let name = token.rsplit('.').next().unwrap_or(token);
+            !resolved.contains(&(line_number, name.to_string()))
+        })
+        .map(|token| property_syntax_callsite_node(index, owner, &token, line_number, text.trim()))
+        .collect()
+}
+
+fn unresolved_qualified_callsite_nodes(
+    index: &Codebase,
+    owner: &SymbolTarget,
+    resolved: &BTreeSet<(usize, String)>,
+) -> Result<Vec<PropertyNode>> {
+    let Some(file) = index.file(&owner.path) else {
+        return Ok(Vec::new());
+    };
+    let Some(symbol) = symbol_for_target(file, owner) else {
+        return Ok(Vec::new());
+    };
+    let content = index.file_content(file)?;
+    let body = source_line_slice(
+        &content,
+        symbol.line_start,
+        symbol.line_end.max(symbol.line_start),
+    );
+    let mut callsites = Vec::new();
+    for (offset, line) in body.lines().enumerate() {
+        callsites.extend(unresolved_qualified_callsite_nodes_on_line(
+            index,
+            owner,
+            symbol.line_start + offset,
+            line,
+            resolved,
+        ));
+    }
+    callsites.sort_by(|left, right| left.id.cmp(&right.id));
+    callsites.dedup_by(|left, right| left.id == right.id);
+    Ok(callsites)
+}
+
+fn property_callsite_values(callsite: &PropertyNode) -> Vec<PropertyNode> {
+    let Some(text) = graph_string_property(callsite, "text") else {
+        return Vec::new();
+    };
+    let Some(name) = graph_string_property(callsite, "name") else {
+        return Vec::new();
+    };
+    let Some(owner) = graph_owner_target(callsite) else {
+        return Vec::new();
+    };
+    let target = graph_callsite_target(callsite);
+    call_argument_values(text, name)
+        .into_iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            let mut properties = BTreeMap::from([
+                ("index".to_string(), GraphScalar::Integer(index as i64)),
+                ("expression".to_string(), GraphScalar::String(expression)),
+                (
+                    "callsite_id".to_string(),
+                    GraphScalar::String(callsite.id.clone()),
+                ),
+                (
+                    "callsite_name".to_string(),
+                    GraphScalar::String(
+                        graph_string_property(callsite, "name")
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                ),
+                (
+                    "callsite_line".to_string(),
+                    GraphScalar::Integer(
+                        graph_integer_property(callsite, "line").unwrap_or_default(),
+                    ),
+                ),
+                (
+                    "callsite_text".to_string(),
+                    GraphScalar::String(text.to_string()),
+                ),
+                (
+                    "callsite_resolution".to_string(),
+                    GraphScalar::String(
+                        graph_string_property(callsite, "resolution")
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                ),
+            ]);
+            if let Some(target) = &target {
+                properties.insert(
+                    "target_name".to_string(),
+                    GraphScalar::String(target.name.clone()),
+                );
+                properties.insert(
+                    "target_kind".to_string(),
+                    GraphScalar::String(target.kind.clone()),
+                );
+                properties.insert(
+                    "target_path".to_string(),
+                    GraphScalar::String(target.path.clone()),
+                );
+                properties.insert(
+                    "target_line".to_string(),
+                    GraphScalar::Integer(target.line_start as i64),
+                );
+                properties.insert(
+                    "target_detail".to_string(),
+                    GraphScalar::String(target.detail.clone()),
+                );
+            }
+            control_property_node(
+                "Value",
+                format!("value:{}:{index}", callsite.id),
+                &owner,
+                properties,
+            )
+        })
+        .collect()
+}
+
+fn property_value_callsite(value: &PropertyNode) -> Option<PropertyNode> {
+    let owner = graph_owner_target(value)?;
+    let id = graph_string_property(value, "callsite_id")?.to_string();
+    let mut properties = BTreeMap::from([
+        (
+            "name".to_string(),
+            GraphScalar::String(
+                graph_string_property(value, "callsite_name")
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        ),
+        (
+            "line".to_string(),
+            GraphScalar::Integer(
+                graph_integer_property(value, "callsite_line").unwrap_or_default(),
+            ),
+        ),
+        (
+            "text".to_string(),
+            GraphScalar::String(
+                graph_string_property(value, "callsite_text")
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        ),
+        (
+            "resolution".to_string(),
+            GraphScalar::String(
+                graph_string_property(value, "callsite_resolution")
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        ),
+    ]);
+    if let Some(target) = graph_value_target(value) {
+        properties.insert("target_name".to_string(), GraphScalar::String(target.name));
+        properties.insert("target_kind".to_string(), GraphScalar::String(target.kind));
+        properties.insert("target_path".to_string(), GraphScalar::String(target.path));
+        properties.insert(
+            "target_line".to_string(),
+            GraphScalar::Integer(target.line_start as i64),
+        );
+        properties.insert(
+            "target_detail".to_string(),
+            GraphScalar::String(target.detail),
+        );
+    }
+    Some(control_property_node("CallSite", id, &owner, properties))
+}
+
+fn graph_callsite_target(node: &PropertyNode) -> Option<SymbolTarget> {
+    Some(SymbolTarget {
+        name: graph_string_property(node, "target_name")?.to_string(),
+        kind: graph_string_property(node, "target_kind")?.to_string(),
+        path: graph_string_property(node, "target_path")?.to_string(),
+        line_start: graph_integer_property(node, "target_line")? as usize,
+        detail: graph_string_property(node, "target_detail")
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn graph_value_target(node: &PropertyNode) -> Option<SymbolTarget> {
+    graph_callsite_target(node)
+}
+
+fn call_argument_values(line: &str, name: &str) -> Vec<String> {
+    let mut from = 0usize;
+    while let Some(relative) = line.get(from..).and_then(|tail| tail.find(name)) {
+        let start = from + relative;
+        let end = start + name.len();
+        let before_ok = line
+            .get(..start)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_none_or(|ch| !is_identifier_char(ch));
+        let Some(suffix) = line.get(end..) else {
+            break;
+        };
+        let trimmed = suffix.trim_start();
+        if before_ok && trimmed.starts_with('(') {
+            if let Some(arguments) = delimited_argument_values(trimmed) {
+                return arguments;
+            }
+        }
+        from = end.max(from + 1);
+    }
+    Vec::new()
+}
+
+fn delimited_argument_values(value: &str) -> Option<Vec<String>> {
+    if !value.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None::<char>;
+    let mut escaped = false;
+    let mut start = 1usize;
+    let mut arguments = Vec::new();
+    for (index, ch) in value.char_indices() {
+        if index == 0 {
+            depth = 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let argument = value.get(start..index)?.trim();
+                    if !argument.is_empty() {
+                        arguments.push(argument.to_string());
+                    }
+                    return Some(arguments);
+                }
+            }
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if depth == 1 && bracket_depth == 0 && brace_depth == 0 => {
+                arguments.push(value.get(start..index)?.trim().to_string());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn graph_owner_target(node: &PropertyNode) -> Option<SymbolTarget> {
+    Some(SymbolTarget {
+        name: graph_string_property(node, "owner_name")?.to_string(),
+        kind: graph_string_property(node, "owner_kind")?.to_string(),
+        path: graph_string_property(node, "owner_path")?.to_string(),
+        line_start: graph_integer_property(node, "owner_line")? as usize,
+        detail: graph_string_property(node, "owner_detail")
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn virtual_property_edge(
+    source: &str,
+    target: &str,
+    edge_type: &str,
+    properties: BTreeMap<String, GraphScalar>,
+) -> PropertyEdge {
+    PropertyEdge {
+        id: format!("{source}:{edge_type}:{target}"),
+        source: source.to_string(),
+        target: target.to_string(),
+        edge_type: edge_type.to_string(),
+        properties,
+    }
+}
+
+#[derive(Clone)]
+struct SharedStateAccess {
+    owner: SymbolTarget,
+    state: SymbolTarget,
+    relation: &'static str,
+    lines: Vec<usize>,
+    evidence: Vec<String>,
+}
+
+fn symbol_shared_state_accesses(
+    index: &Codebase,
+    owner: &SymbolTarget,
+) -> Result<Vec<SharedStateAccess>> {
+    let Some(file) = index.file(&owner.path) else {
+        return Ok(Vec::new());
+    };
+    let Some(symbol) = symbol_for_target(file, owner) else {
+        return Ok(Vec::new());
+    };
+    let content = index.file_content(file)?;
+    let active = mask_comments(file.language.as_str(), &content);
+    let body = source_line_slice(
+        &active,
+        symbol.line_start,
+        symbol.line_end.max(symbol.line_start),
+    );
+    let identifiers = raw_identifiers(&body).into_iter().collect::<BTreeSet<_>>();
+    let owner_type = enclosing_type_symbol(file, symbol).map(|symbol| symbol.name.clone());
+    let mut states = Vec::<SymbolTarget>::new();
+    for identifier in identifiers {
+        if !is_plausible_shared_state_name(&identifier) {
+            continue;
+        }
+        let mut candidates = index
+            .symbols_named(&identifier)
+            .into_iter()
+            .filter(|(_, candidate)| is_shared_state_symbol(candidate))
+            .filter(|(candidate_file, candidate)| {
+                candidate_file.path == file.path
+                    || owner_type.as_ref().is_some_and(|owner_type| {
+                        enclosing_type_symbol(candidate_file, candidate)
+                            .is_some_and(|candidate_type| candidate_type.name == *owner_type)
+                    })
+            })
+            .map(|(candidate_file, candidate)| target_from_symbol(candidate_file, candidate))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            let global = index
+                .symbols_named(&identifier)
+                .into_iter()
+                .filter(|(_, candidate)| is_shared_state_symbol(candidate))
+                .collect::<Vec<_>>();
+            if global.len() == 1 && body_contains_non_call_member_read(&body, &identifier) {
+                states.push(target_from_symbol(global[0].0, global[0].1));
+            } else if let Some(state) = synthetic_shared_state_target(file, &identifier, &active) {
+                states.push(state);
+            }
+        } else {
+            states.append(&mut candidates);
+        }
+    }
+    states.sort_by_key(symbol_target_key);
+    states.dedup_by(|left, right| symbol_target_key(left) == symbol_target_key(right));
+
+    let mut accesses = Vec::new();
+    for state in states {
+        let mut reads = Vec::new();
+        let mut read_text = Vec::new();
+        let mut writes = Vec::new();
+        let mut write_text = Vec::new();
+        for (offset, line) in body.lines().enumerate() {
+            let code = strip_strings_and_line_comment(line);
+            if !line_contains_identifier_token(&code, &state.name) {
+                continue;
+            }
+            let line_number = symbol.line_start + offset;
+            if line_writes_shared_state(&code, &state.name) {
+                writes.push(line_number);
+                write_text.push(line.trim().to_string());
+            }
+            if line_reads_shared_state(&code, &state.name) {
+                reads.push(line_number);
+                read_text.push(line.trim().to_string());
+            }
+        }
+        if !reads.is_empty() {
+            accesses.push(SharedStateAccess {
+                owner: owner.clone(),
+                state: state.clone(),
+                relation: "READS",
+                lines: reads,
+                evidence: read_text,
+            });
+        }
+        if !writes.is_empty() {
+            accesses.push(SharedStateAccess {
+                owner: owner.clone(),
+                state,
+                relation: "WRITES",
+                lines: writes,
+                evidence: write_text,
+            });
+        }
+    }
+    Ok(accesses)
+}
+
+fn incoming_shared_state_accesses(
+    index: &Codebase,
+    state: &SymbolTarget,
+) -> Result<Vec<SharedStateAccess>> {
+    if let Some(file) = index.file(&state.path) {
+        let state_type =
+            enclosing_type_at_line(file, state.line_start).map(|symbol| symbol.name.clone());
+        let mut local = Vec::new();
+        for symbol in file
+            .symbols
+            .iter()
+            .filter(|symbol| is_context_handoff_source_symbol(symbol))
+            .filter(|symbol| {
+                state_type.as_ref().is_none_or(|state_type| {
+                    enclosing_type_symbol(file, symbol)
+                        .is_some_and(|owner_type| owner_type.name == *state_type)
+                })
+            })
+        {
+            let owner = target_from_symbol(file, symbol);
+            local.extend(
+                symbol_shared_state_accesses(index, &owner)?
+                    .into_iter()
+                    .filter(|access| symbol_target_key(&access.state) == symbol_target_key(state)),
+            );
+        }
+        if !local.is_empty() {
+            return Ok(local);
+        }
+    }
+    let mut owners = BTreeMap::<String, SymbolTarget>::new();
+    for hit in reference_candidates(index, &state.name)? {
+        let Some(scope) = hit.scope else {
+            continue;
+        };
+        let Some(file) = index.file(&hit.path) else {
+            continue;
+        };
+        let Some(symbol) = file.symbols.iter().find(|symbol| {
+            symbol.line_start == scope.start
+                && symbol.line_end == scope.end
+                && symbol.name == scope.name
+                && is_context_handoff_source_symbol(symbol)
+        }) else {
+            continue;
+        };
+        let owner = target_from_symbol(file, symbol);
+        owners.entry(symbol_target_key(&owner)).or_insert(owner);
+    }
+    let mut accesses = Vec::new();
+    for owner in owners.into_values() {
+        accesses.extend(
+            symbol_shared_state_accesses(index, &owner)?
+                .into_iter()
+                .filter(|access| symbol_target_key(&access.state) == symbol_target_key(state)),
+        );
+    }
+    Ok(accesses)
+}
+
+fn enclosing_type_at_line(file: &FileEntry, line: usize) -> Option<&Symbol> {
+    file.symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind.as_str(),
+                "class" | "interface" | "struct" | "record" | "trait" | "impl" | "module"
+            ) && symbol.line_start <= line
+                && line <= symbol.line_end.max(symbol.line_start)
+        })
+        .min_by_key(|symbol| symbol.line_end.saturating_sub(symbol.line_start))
+}
+
+fn is_shared_state_symbol(symbol: &Symbol) -> bool {
+    is_plausible_shared_state_name(&symbol.name)
+        && matches!(
+            symbol.kind.as_str(),
+            "field" | "property" | "static" | "const" | "variable"
+        )
+}
+
+fn is_plausible_shared_state_name(name: &str) -> bool {
+    !matches!(
+        name,
+        "new"
+            | "private"
+            | "public"
+            | "protected"
+            | "internal"
+            | "static"
+            | "readonly"
+            | "const"
+            | "void"
+            | "bool"
+            | "byte"
+            | "sbyte"
+            | "short"
+            | "ushort"
+            | "int"
+            | "uint"
+            | "long"
+            | "ulong"
+            | "float"
+            | "double"
+            | "decimal"
+            | "char"
+            | "string"
+            | "object"
+            | "var"
+            | "this"
+            | "base"
+            | "null"
+            | "true"
+            | "false"
+    )
+}
+
+fn body_contains_non_call_member_read(body: &str, name: &str) -> bool {
+    body.lines().any(|line| {
+        let code = strip_strings_and_line_comment(line);
+        [format!(".{name}"), format!("::{name}")]
+            .into_iter()
+            .any(|needle| {
+                let mut from = 0usize;
+                while let Some(relative) = code.get(from..).and_then(|tail| tail.find(&needle)) {
+                    let end = from + relative + needle.len();
+                    let suffix = code.get(end..).unwrap_or_default().trim_start();
+                    if !suffix.starts_with('(') {
+                        return true;
+                    }
+                    from = end.max(from + 1);
+                }
+                false
+            })
+    })
+}
+
+fn synthetic_shared_state_target(
+    file: &FileEntry,
+    name: &str,
+    active_content: &str,
+) -> Option<SymbolTarget> {
+    for (offset, line) in active_content.lines().enumerate() {
+        let line_number = offset + 1;
+        if !line_contains_identifier_token(line, name)
+            || file.symbols.iter().any(|symbol| {
+                is_context_handoff_source_symbol(symbol)
+                    && symbol.line_start <= line_number
+                    && line_number <= symbol.line_end.max(symbol.line_start)
+            })
+        {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("using ")
+            || trimmed.starts_with("namespace ")
+            || trimmed.contains(" class ")
+            || trimmed.contains(" interface ")
+            || trimmed.contains(" struct ")
+            || (!trimmed.contains(';') && !trimmed.contains("{ get") && !trimmed.contains("=>"))
+        {
+            continue;
+        }
+        return Some(SymbolTarget {
+            name: name.to_string(),
+            kind: "field".to_string(),
+            path: file.path.clone(),
+            line_start: line_number,
+            detail: trimmed.to_string(),
+        });
+    }
+    None
+}
+
+fn line_writes_shared_state(line: &str, name: &str) -> bool {
+    let Some(position) = line.find(name) else {
+        return false;
+    };
+    let suffix = line
+        .get(position + name.len()..)
+        .unwrap_or_default()
+        .trim_start();
+    suffix.starts_with('=')
+        || suffix.starts_with("+=")
+        || suffix.starts_with("-=")
+        || suffix.starts_with("++")
+        || suffix.starts_with("--")
+        || suffix.starts_with(".Add(")
+        || suffix.starts_with(".Remove(")
+        || suffix.starts_with(".Clear(")
+}
+
+fn line_reads_shared_state(line: &str, name: &str) -> bool {
+    if !line_contains_identifier_token(line, name) {
+        return false;
+    }
+    let Some(position) = line.find(name) else {
+        return true;
+    };
+    let suffix = line
+        .get(position + name.len()..)
+        .unwrap_or_default()
+        .trim_start();
+    !suffix.starts_with('=')
+        || line.get(position + name.len()..).is_some_and(|tail| {
+            tail.find('=').is_some_and(|equal| {
+                line.get(position + name.len() + equal + 1..)
+                    .is_some_and(|right| line_contains_identifier_token(right, name))
+            })
+        })
+}
+
+fn property_symbol_node(index: &Codebase, target: &SymbolTarget) -> PropertyNode {
+    let symbol = index
+        .file(&target.path)
+        .and_then(|file| symbol_for_target(file, target));
+    let line_end = symbol
+        .map(|symbol| symbol.line_end.max(symbol.line_start))
+        .unwrap_or(target.line_start);
+    let language = index
+        .file(&target.path)
+        .map(|file| file.language.to_string());
+    let mut properties = BTreeMap::from([
+        ("name".to_string(), GraphScalar::String(target.name.clone())),
+        ("kind".to_string(), GraphScalar::String(target.kind.clone())),
+        ("path".to_string(), GraphScalar::String(target.path.clone())),
+        (
+            "line_start".to_string(),
+            GraphScalar::Integer(target.line_start as i64),
+        ),
+        (
+            "line_end".to_string(),
+            GraphScalar::Integer(line_end as i64),
+        ),
+        (
+            "detail".to_string(),
+            GraphScalar::String(target.detail.clone()),
+        ),
+    ]);
+    if let Some(language) = language {
+        properties.insert("language".to_string(), GraphScalar::String(language));
+    }
+    if let Some(symbol) = symbol
+        && let Some(file) = index.file(&target.path)
+        && let Some(enclosing) = enclosing_type_symbol(file, symbol)
+    {
+        properties.insert(
+            "enclosing_type".to_string(),
+            GraphScalar::String(enclosing.name.clone()),
+        );
+    }
+    let kind_label = graph_kind_label(&target.kind);
+    PropertyNode {
+        id: symbol_target_key(target),
+        labels: vec!["Symbol".to_string(), kind_label],
+        properties,
+    }
+}
+
+fn property_shared_state_node(index: &Codebase, target: &SymbolTarget) -> PropertyNode {
+    let mut node = property_symbol_node(index, target);
+    node.id = format!("state:{}", node.id);
+    node.labels.insert(0, "SharedState".to_string());
+    node
+}
+
+fn property_file_node(
+    index: &Codebase,
+    graph: &crate::graph::CodeGraph,
+    file: &FileEntry,
+) -> PropertyNode {
+    let graph_id = graph.file_graph.id(&file.path);
+    let community = graph_id.and_then(|id| graph.file_graph.community(id));
+    let degree = graph_id.map_or(0, |id| graph.file_graph.degree(id));
+    let boundary_degree = graph_id.map_or(0, |id| {
+        graph
+            .file_graph
+            .neighbor_ids(id)
+            .into_iter()
+            .filter(|neighbor| graph.file_graph.community(*neighbor) != community)
+            .count()
+    });
+    let outgoing_degree = index.deps_for(&file.path).len();
+    let incoming_degree = index.reverse_deps_for(&file.path).len();
+    let mut properties = BTreeMap::from([
+        ("path".to_string(), GraphScalar::String(file.path.clone())),
+        (
+            "language".to_string(),
+            GraphScalar::String(file.language.to_string()),
+        ),
+        (
+            "line_count".to_string(),
+            GraphScalar::Integer(file.line_count as i64),
+        ),
+        (
+            "symbol_count".to_string(),
+            GraphScalar::Integer(file.symbols.len() as i64),
+        ),
+        ("degree".to_string(), GraphScalar::Integer(degree as i64)),
+        (
+            "outgoing_degree".to_string(),
+            GraphScalar::Integer(outgoing_degree as i64),
+        ),
+        (
+            "incoming_degree".to_string(),
+            GraphScalar::Integer(incoming_degree as i64),
+        ),
+        (
+            "boundary_degree".to_string(),
+            GraphScalar::Integer(boundary_degree as i64),
+        ),
+    ]);
+    if let Some(community) = community {
+        properties.insert(
+            "community".to_string(),
+            GraphScalar::Integer(community as i64),
+        );
+    }
+    let mut labels = vec!["File".to_string()];
+    if incoming_degree == 0 && outgoing_degree > 0 {
+        labels.push("EntryFile".to_string());
+    }
+    if boundary_degree > 0 {
+        labels.push("BoundaryFile".to_string());
+    }
+    if outgoing_degree == 0 && incoming_degree > 0 {
+        labels.push("SinkFile".to_string());
+    }
+    PropertyNode {
+        id: format!("file:{}", file.path),
+        labels,
+        properties,
+    }
+}
+
+fn graph_file_community(graph: &crate::graph::CodeGraph, path: &str) -> Option<usize> {
+    graph
+        .file_graph
+        .id(path)
+        .and_then(|id| graph.file_graph.community(id))
+}
+
+fn property_community_nodes(graph: &crate::graph::CodeGraph) -> BTreeMap<usize, PropertyNode> {
+    #[derive(Default)]
+    struct Metrics {
+        size: usize,
+        total_degree: usize,
+        internal_links: usize,
+        boundary_links: usize,
+        representative: Option<(usize, String)>,
+        path_prefix: Option<Vec<String>>,
+    }
+
+    let mut metrics = BTreeMap::<usize, Metrics>::new();
+    for (id, path) in graph.file_graph.paths.iter().enumerate() {
+        let Some(community) = graph.file_graph.community(id) else {
+            continue;
+        };
+        let degree = graph.file_graph.degree(id);
+        let row = metrics.entry(community).or_default();
+        row.size += 1;
+        row.total_degree += degree;
+        let components = path.split('/').map(str::to_string).collect::<Vec<_>>();
+        if let Some(prefix) = &mut row.path_prefix {
+            let shared = prefix
+                .iter()
+                .zip(&components)
+                .take_while(|(left, right)| left == right)
+                .count();
+            prefix.truncate(shared);
+        } else {
+            row.path_prefix = Some(components);
+        }
+        match &row.representative {
+            Some((current_degree, current_path))
+                if *current_degree > degree
+                    || (*current_degree == degree && current_path <= path) => {}
+            _ => row.representative = Some((degree, path.clone())),
+        }
+        for neighbor in graph.file_graph.neighbor_ids(id) {
+            if graph.file_graph.community(neighbor) == Some(community) {
+                row.internal_links += 1;
+            } else {
+                row.boundary_links += 1;
+            }
+        }
+    }
+
+    metrics
+        .into_iter()
+        .map(|(community, metrics)| {
+            let (max_degree, representative_path) = metrics.representative.unwrap_or_default();
+            let name = metrics
+                .path_prefix
+                .filter(|prefix| !prefix.is_empty())
+                .map(|prefix| prefix.join("/"))
+                .unwrap_or_else(|| representative_path.clone());
+            (
+                community,
+                PropertyNode {
+                    id: format!("community:{community}"),
+                    labels: vec!["Community".to_string()],
+                    properties: BTreeMap::from([
+                        ("id".to_string(), GraphScalar::Integer(community as i64)),
+                        ("name".to_string(), GraphScalar::String(name)),
+                        (
+                            "size".to_string(),
+                            GraphScalar::Integer(metrics.size as i64),
+                        ),
+                        (
+                            "total_degree".to_string(),
+                            GraphScalar::Integer(metrics.total_degree as i64),
+                        ),
+                        (
+                            "max_degree".to_string(),
+                            GraphScalar::Integer(max_degree as i64),
+                        ),
+                        (
+                            "internal_links".to_string(),
+                            GraphScalar::Integer(metrics.internal_links as i64),
+                        ),
+                        (
+                            "boundary_links".to_string(),
+                            GraphScalar::Integer(metrics.boundary_links as i64),
+                        ),
+                        (
+                            "representative_path".to_string(),
+                            GraphScalar::String(representative_path),
+                        ),
+                    ]),
+                },
+            )
+        })
+        .collect()
+}
+
+fn property_call_edge(
+    index: &Codebase,
+    source: &SymbolTarget,
+    target: &SymbolTarget,
+    edge: &CallpathEdge,
+) -> PropertyEdge {
+    let mut properties = BTreeMap::from([(
+        "resolution".to_string(),
+        GraphScalar::String(edge.relation.clone()),
+    )]);
+    if let Some(line) = edge.line {
+        properties.insert("line".to_string(), GraphScalar::Integer(line as i64));
+        if let Some(file) = index.file(&source.path)
+            && let Ok(content) = index.file_content(file)
+        {
+            if let Some(guard) = preprocessor_guard_at_line(&content, line) {
+                properties.insert("guard".to_string(), GraphScalar::String(guard));
+                properties.insert("guarded".to_string(), GraphScalar::Boolean(true));
+            } else {
+                properties.insert("guarded".to_string(), GraphScalar::Boolean(false));
+            }
+        }
+    }
+    if let Some(text) = &edge.text {
+        properties.insert("text".to_string(), GraphScalar::String(text.clone()));
+    }
+    property_edge(source, target, "CALLS", properties)
+}
+
+fn property_reference_edge(
+    index: &Codebase,
+    source: &SymbolTarget,
+    target: &SymbolTarget,
+    edge: &CallpathEdge,
+) -> PropertyEdge {
+    let mut result = property_call_edge(index, source, target, edge);
+    result.edge_type = "REFERENCES".to_string();
+    result.id = property_edge_id(source, target, "REFERENCES", edge.line);
+    result
+}
+
+fn property_state_access_edge(source: &SymbolTarget, access: &SharedStateAccess) -> PropertyEdge {
+    let target_id = format!("state:{}", symbol_target_key(&access.state));
+    let mut properties = BTreeMap::new();
+    if let Some(line) = access.lines.first() {
+        properties.insert("line".to_string(), GraphScalar::Integer(*line as i64));
+    }
+    properties.insert(
+        "lines".to_string(),
+        GraphScalar::String(
+            access
+                .lines
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+    properties.insert(
+        "evidence".to_string(),
+        GraphScalar::String(access.evidence.join(" | ")),
+    );
+    PropertyEdge {
+        id: format!(
+            "{}:{}:{}:{}",
+            symbol_target_key(source),
+            access.relation,
+            target_id,
+            access.lines.first().copied().unwrap_or_default()
+        ),
+        source: symbol_target_key(source),
+        target: target_id,
+        edge_type: access.relation.to_string(),
+        properties,
+    }
+}
+
+fn property_edge(
+    source: &SymbolTarget,
+    target: &SymbolTarget,
+    edge_type: &str,
+    properties: BTreeMap<String, GraphScalar>,
+) -> PropertyEdge {
+    let line = properties.get("line").and_then(|value| match value {
+        GraphScalar::Integer(value) => Some(*value as usize),
+        _ => None,
+    });
+    PropertyEdge {
+        id: property_edge_id(source, target, edge_type, line),
+        source: symbol_target_key(source),
+        target: symbol_target_key(target),
+        edge_type: edge_type.to_string(),
+        properties,
+    }
+}
+
+fn property_edge_id(
+    source: &SymbolTarget,
+    target: &SymbolTarget,
+    edge_type: &str,
+    line: Option<usize>,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        symbol_target_key(source),
+        edge_type,
+        symbol_target_key(target),
+        line.unwrap_or_default()
+    )
+}
+
+fn property_file_contains_edge(path: &str, target: &SymbolTarget) -> PropertyEdge {
+    PropertyEdge {
+        id: format!("file:{path}:CONTAINS:{}", symbol_target_key(target)),
+        source: format!("file:{path}"),
+        target: symbol_target_key(target),
+        edge_type: "CONTAINS".to_string(),
+        properties: BTreeMap::new(),
+    }
+}
+
+fn property_file_dependency_edge(source: &str, target: &str) -> PropertyEdge {
+    PropertyEdge {
+        id: format!("file:{source}:DEPENDS_ON:file:{target}"),
+        source: format!("file:{source}"),
+        target: format!("file:{target}"),
+        edge_type: "DEPENDS_ON".to_string(),
+        properties: BTreeMap::from([("count".to_string(), GraphScalar::Integer(1))]),
+    }
+}
+
+fn graph_string_property<'a>(node: &'a PropertyNode, name: &str) -> Option<&'a str> {
+    match node.properties.get(name)? {
+        GraphScalar::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn graph_integer_property(node: &PropertyNode, name: &str) -> Option<i64> {
+    match node.properties.get(name)? {
+        GraphScalar::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn graph_relation_requested(relationship: &GraphRelationshipPattern, relation: &str) -> bool {
+    relationship.types.is_empty()
+        || relationship
+            .types
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(relation))
+}
+
+fn graph_node_matches_pattern(node: &PropertyNode, pattern: &GraphNodePattern) -> bool {
+    pattern
+        .label
+        .as_ref()
+        .is_none_or(|label| node.labels.iter().any(|candidate| candidate == label))
+        && pattern
+            .properties
+            .iter()
+            .all(|(name, value)| node.properties.get(name) == Some(value))
+}
+
+fn graph_kind_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    chars
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_else(|| "Symbol".to_string())
+}
+
+fn graph_sort_and_dedup(values: &mut Vec<(PropertyEdge, PropertyNode)>) {
+    values.sort_by(|left, right| {
+        left.1
+            .id
+            .cmp(&right.1.id)
+            .then_with(|| left.0.edge_type.cmp(&right.0.edge_type))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    values.dedup_by(|left, right| left.0.id == right.0.id && left.1.id == right.1.id);
+}
+
 #[derive(Clone)]
 struct CallpathParent {
     previous: String,
@@ -12464,6 +15911,8 @@ fn callpath_backward_frontier_cost(
 struct CallpathEdge {
     target: SymbolTarget,
     relation: String,
+    line: Option<usize>,
+    text: Option<String>,
 }
 
 fn callpath_graph_corridor(
@@ -12704,6 +16153,7 @@ fn callpath_edges_from_body(
     include_weak_references: bool,
 ) -> Vec<CallpathEdge> {
     let mut edges = BTreeMap::<String, CallpathEdge>::new();
+    let receiver_types = qualified_receiver_type_hints(index, file, symbol, body);
     for lead in symbol_body_qualified_tail_call_leads(index, file, symbol, body, usize::MAX) {
         if allowed_paths.is_some_and(|paths| !paths.contains(&lead.target.path)) {
             continue;
@@ -12715,6 +16165,8 @@ fn callpath_edges_from_body(
             CallpathEdge {
                 target: lead.target,
                 relation: "qualified_call".to_string(),
+                line: Some(lead.line),
+                text: Some(lead.text),
             },
         );
     }
@@ -12722,11 +16174,21 @@ fn callpath_edges_from_body(
         .deps_for(&file.path)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    for line in body.lines() {
+    for (line_offset, line) in body.lines().enumerate() {
         let code_line = strip_strings_and_line_comment(line);
         for token in qualified_member_tokens(&code_line) {
+            let receiver_type = qualified_token_receiver(&token)
+                .and_then(|receiver| receiver_types.get(receiver))
+                .map(String::as_str);
             let Some((target, _)) = resolve_qualified_call_target(
-                index, file, symbol, &deps, &code_line, &token, false,
+                index,
+                file,
+                symbol,
+                &deps,
+                &code_line,
+                &token,
+                false,
+                receiver_type,
             ) else {
                 continue;
             };
@@ -12740,6 +16202,8 @@ fn callpath_edges_from_body(
                 CallpathEdge {
                     target,
                     relation: "qualified_member".to_string(),
+                    line: Some(symbol.line_start + line_offset),
+                    text: Some(line.trim().to_string()),
                 },
             );
         }
@@ -12751,6 +16215,7 @@ fn callpath_edges_from_body(
         body,
         allowed_paths,
         include_weak_references,
+        &receiver_types,
     ) {
         let key = symbol_target_key(&edge.target);
         insert_callpath_edge(&mut edges, key, edge);
@@ -12773,6 +16238,7 @@ fn structural_symbol_callpath_edges(
     body: &str,
     allowed_paths: Option<&BTreeSet<String>>,
     include_weak_references: bool,
+    receiver_types: &BTreeMap<String, String>,
 ) -> Vec<CallpathEdge> {
     let deps = index
         .deps_for(&file.path)
@@ -12785,16 +16251,40 @@ fn structural_symbol_callpath_edges(
         let qualified_call_members = qualified_call_tokens
             .iter()
             .filter(|token| {
-                resolve_qualified_call_target(index, file, symbol, &deps, &code_line, token, true)
-                    .is_some()
+                let receiver_type = qualified_token_receiver(token)
+                    .and_then(|receiver| receiver_types.get(receiver))
+                    .map(String::as_str);
+                resolve_qualified_call_target(
+                    index,
+                    file,
+                    symbol,
+                    &deps,
+                    &code_line,
+                    token,
+                    true,
+                    receiver_type,
+                )
+                .is_some()
             })
             .filter_map(|token| token.rsplit('.').next().map(ToString::to_string))
             .collect::<BTreeSet<_>>();
         let unresolved_static_call_members = qualified_call_tokens
             .iter()
             .filter(|token| {
-                resolve_qualified_call_target(index, file, symbol, &deps, &code_line, token, true)
-                    .is_none()
+                let receiver_type = qualified_token_receiver(token)
+                    .and_then(|receiver| receiver_types.get(receiver))
+                    .map(String::as_str);
+                resolve_qualified_call_target(
+                    index,
+                    file,
+                    symbol,
+                    &deps,
+                    &code_line,
+                    token,
+                    true,
+                    receiver_type,
+                )
+                .is_none()
                     && !qualified_token_has_graph_receiver(file, symbol, token)
             })
             .filter_map(|token| token.rsplit('.').next().map(ToString::to_string))
@@ -12803,6 +16293,55 @@ fn structural_symbol_callpath_edges(
             .into_iter()
             .filter_map(|token| token.rsplit('.').next().map(ToString::to_string))
             .collect::<BTreeSet<_>>();
+        for token in qualified_member_tokens(&code_line) {
+            if qualified_call_tokens.iter().any(|call| call == &token) {
+                continue;
+            }
+            let Some(member) = token.rsplit('.').next() else {
+                continue;
+            };
+            let mut candidates = index
+                .symbols_named(member)
+                .into_iter()
+                .filter(|(candidate_file, candidate_symbol)| {
+                    is_context_handoff_source_symbol(candidate_symbol)
+                        && allowed_paths.is_none_or(|paths| paths.contains(&candidate_file.path))
+                        && qualified_call_qualifier_matches(
+                            index,
+                            &token,
+                            candidate_file,
+                            candidate_symbol,
+                        ) > 0
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                qualified_call_qualifier_matches(index, &token, right.0, right.1)
+                    .cmp(&qualified_call_qualifier_matches(
+                        index, &token, left.0, left.1,
+                    ))
+                    .then_with(|| left.0.path.cmp(&right.0.path))
+                    .then_with(|| left.1.line_start.cmp(&right.1.line_start))
+            });
+            let Some((candidate_file, candidate_symbol)) = candidates.first().copied() else {
+                continue;
+            };
+            let best =
+                qualified_call_qualifier_matches(index, &token, candidate_file, candidate_symbol);
+            if candidates.get(1).is_some_and(|(file, symbol)| {
+                qualified_call_qualifier_matches(index, &token, file, symbol) == best
+            }) {
+                continue;
+            }
+            let target = target_from_symbol(candidate_file, candidate_symbol);
+            edges
+                .entry(symbol_target_key(&target))
+                .or_insert_with(|| CallpathEdge {
+                    target,
+                    relation: "member_reference".to_string(),
+                    line: Some(symbol.line_start + line_offset),
+                    text: Some(line.trim().to_string()),
+                });
+        }
         let mut seen_names = BTreeSet::<String>::new();
         for identifier in raw_identifiers(&code_line) {
             if (line_offset == 0 && identifier == symbol.name)
@@ -12887,6 +16426,8 @@ fn structural_symbol_callpath_edges(
                     } else {
                         "symbol_reference".to_string()
                     },
+                    line: Some(symbol.line_start + line_offset),
+                    text: Some(line.trim().to_string()),
                 });
             }
         }
@@ -12949,8 +16490,58 @@ fn cached_callpath_edges(
         include_weak_references,
         active_content_cache,
     )?;
+    let edges = precise_callpath_edges(target, edges);
     cache.insert(key.to_string(), edges.clone());
     Ok(edges)
+}
+
+fn precise_callpath_edges(source: &SymbolTarget, edges: Vec<CallpathEdge>) -> Vec<CallpathEdge> {
+    let mut precise = Vec::new();
+    let mut direct_groups = BTreeMap::<(Option<usize>, String, String), Vec<CallpathEdge>>::new();
+    for edge in edges {
+        if edge.relation != "direct_call" {
+            precise.push(edge);
+            continue;
+        }
+        direct_groups
+            .entry((
+                edge.line,
+                edge.target.name.clone(),
+                edge.text.clone().unwrap_or_default(),
+            ))
+            .or_default()
+            .push(edge);
+    }
+    for ((_, name, text), mut candidates) in direct_groups {
+        let (unqualified, qualified) = identifier_call_receiver_kinds(&text, &name);
+        if qualified && !unqualified {
+            continue;
+        }
+        candidates.sort_by(|left, right| {
+            symbol_target_key(&left.target).cmp(&symbol_target_key(&right.target))
+        });
+        candidates.dedup_by(|left, right| {
+            symbol_target_key(&left.target) == symbol_target_key(&right.target)
+        });
+        if candidates.len() == 1 {
+            precise.push(candidates.remove(0));
+            continue;
+        }
+        let mut same_file = candidates
+            .into_iter()
+            .filter(|candidate| candidate.target.path == source.path)
+            .collect::<Vec<_>>();
+        if same_file.len() == 1 {
+            precise.push(same_file.remove(0));
+        }
+    }
+    precise.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.relation.cmp(&right.relation))
+            .then_with(|| symbol_target_key(&left.target).cmp(&symbol_target_key(&right.target)))
+    });
+    precise
 }
 
 fn cached_callpath_incoming_edges(
@@ -13011,6 +16602,8 @@ fn cached_callpath_incoming_edges(
             incoming.push(CallpathEdge {
                 target: caller,
                 relation: edge.relation,
+                line: edge.line,
+                text: edge.text,
             });
         }
     }
@@ -15690,6 +19283,79 @@ mod tests {
     }
 
     #[test]
+    fn module_inventory_keeps_a_leaf_group_for_each_broad_graph_root() {
+        let row = |prefix: &str, file_count: usize, score: f32| ContextModuleInventoryRow {
+            prefix: prefix.to_string(),
+            file_count,
+            degree: file_count * 10,
+            outgoing: file_count * 7,
+            incoming: file_count * 3,
+            representatives: vec![format!("{}.cs", prefix.rsplit('/').next().unwrap())],
+            depth: path_component_count(prefix),
+            score,
+        };
+        let mut rows = vec![
+            row("Assets/Scripts/GameAOT/GameStart", 8, 1.0),
+            row("Assets/Scripts/GameAOT/Logic", 12, 1.0),
+        ];
+        for index in 0..8 {
+            rows.push(row(
+                &format!("Packages/com.example.package{index}/Runtime"),
+                100 + index,
+                1_000.0 + index as f32,
+            ));
+            rows.push(row(
+                &format!("Packages/com.example.package{index}/Editor"),
+                80 + index,
+                900.0 + index as f32,
+            ));
+        }
+        let broad_rows = vec![row("Assets/Scripts/GameAOT", 20, 0.1)];
+
+        let groups = select_context_module_inventory_leaf_groups(&rows, &broad_rows);
+
+        assert_eq!(groups.first().unwrap().parent, "Assets/Scripts/GameAOT");
+        assert!(
+            groups[0]
+                .children
+                .iter()
+                .any(|child| child.name == "GameStart")
+        );
+        assert!(!groups[0].children[0].representatives.is_empty());
+    }
+
+    #[test]
+    fn module_inventory_orders_entry_oriented_children_before_shared_libraries() {
+        let rows = vec![
+            ContextModuleInventoryRow {
+                prefix: "Assets/Scripts/App/Common".to_string(),
+                file_count: 20,
+                degree: 1_020,
+                outgoing: 20,
+                incoming: 1_000,
+                representatives: vec!["CommonService.cs".to_string()],
+                depth: 4,
+                score: 100.0,
+            },
+            ContextModuleInventoryRow {
+                prefix: "Assets/Scripts/App/Startup".to_string(),
+                file_count: 10,
+                degree: 210,
+                outgoing: 200,
+                incoming: 10,
+                representatives: vec!["Launcher.cs".to_string()],
+                depth: 4,
+                score: 50.0,
+            },
+        ];
+
+        let children = context_module_inventory_leaf_children_from_rows(&rows);
+
+        assert_eq!(children[0].name, "Startup");
+        assert_eq!(children[0].representatives, vec!["Launcher.cs"]);
+    }
+
+    #[test]
     fn body_exact_reference_terms_keep_member_shapes() {
         let terms = body_exact_reference_terms(
             "return AlphaService.BetaRunner.ExecuteNow(inputValue) && OutputMode.FastPath != mode;",
@@ -16170,6 +19836,8 @@ public class Flow {
         .unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
+        assert!(out.contains("same-file atomicity"));
+        assert!(out.contains("include_connected_ranges=true"));
         assert!(out.contains("outline body follow-up candidates"));
         assert!(out.contains("codedb_symbol name=Middle"));
         assert!(out.contains("body=true"));
@@ -16398,40 +20066,19 @@ public static class Helpers {
         options.respect_gitignore = false;
         let index = Codebase::index(&root, options).unwrap();
 
-        let out = handle_symbol(
+        let out = handle_graph_query(
             &index,
             &json!({
-                "name": "Start",
-                "path": "src/Entry.cs",
-                "body": true,
-                "max_results": 1
-            }),
-        )
-        .unwrap();
-        let continuation = out
-            .split("body lead continuation chains:")
-            .nth(1)
-            .unwrap_or_default();
-        assert!(continuation.contains("StepOne"));
-        assert!(continuation.contains("StepTwo"));
-        assert!(continuation.contains("Finish"));
-        assert!(!continuation.contains("corridor exact body:"));
-
-        let expanded = handle_symbol(
-            &index,
-            &json!({
-                "name": "Start",
-                "path": "src/Entry.cs",
-                "body": true,
-                "expand": true,
-                "max_results": 1
+                "query": "MATCH SHORTEST p=(start:Symbol)-[:CALLS*1..5]->(finish:Symbol) WHERE start.name='Start' AND start.path='src/Entry.cs' AND finish.name='Finish' AND finish.path='src/Third.cs' RETURN p"
             }),
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        assert!(expanded.contains("corridor exact body: src/First.cs"));
-        assert!(expanded.contains("corridor exact body: src/Second.cs"));
-        assert!(expanded.contains("corridor exact body: src/Third.cs"));
+        assert!(out.contains("StepOne"));
+        assert!(out.contains("StepTwo"));
+        assert!(out.contains("Finish"));
+        assert!(out.contains("\"count\": 1"));
+        assert!(!out.contains("active_body"));
     }
 
     #[test]
@@ -16442,12 +20089,17 @@ public static class Helpers {
             root.join("src/Flow.cs"),
             r#"
 public class Flow {
-    public void Start() { Step(); }
+    public void Start() { Other.Select(); Step(); }
     private void Step() { Finish(); }
     private void Finish() { }
     private void Isolated() { }
 }
 "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Other.cs"),
+            "public static class Other { public static void Select() { } }\n",
         )
         .unwrap();
         let mut options = IndexOptions::default();
@@ -16473,6 +20125,7 @@ public class Flow {
         assert!(ranges.contains("members=[Start, Step, Finish]"));
         assert!(ranges.contains("codedb_read path=src/Flow.cs"));
         assert!(ranges.contains("connected_range=true"));
+        assert!(ranges.contains("include_symbol_leads=true"));
         assert!(!ranges.contains("Isolated"));
 
         let read = handle_read(
@@ -16490,6 +20143,687 @@ public class Flow {
         let _ = std::fs::remove_dir_all(&root);
         assert!(read.contains("connected range closure"));
         assert!(read.contains("contained members=[Start, Step, Finish]"));
+        assert!(read.contains("connected range cross-file handoff frontier"));
+        assert!(read.contains("direct handoff: Select"));
+        assert!(read.contains("Other.cs"));
+        assert!(!read.contains("follow-up: codedb_symbol name=Start"));
+    }
+
+    #[test]
+    fn connected_range_emits_each_member_cross_file_frontier_without_name_ranking_loss() {
+        let root = temp_tools_test_dir("connected_range_cross_file_frontier");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Flow.cs"),
+            r#"
+public class Flow {
+    public void Start() { var selected = Api.Select(); Step(); }
+    private void Step() { LongerSpecificMemberName(); }
+    private void LongerSpecificMemberName() { Other.Notify(); }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Api.cs"),
+            "public static class Api { public static int Select() { return 1; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Other.cs"),
+            "public static class Other { public static void Notify() { } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let read = handle_read(
+            &index,
+            &json!({
+                "path": "src/Flow.cs",
+                "line_start": 3,
+                "line_end": 5,
+                "compact": true,
+                "connected_range": true,
+                "include_symbol_leads": true
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(read.contains("connected range cross-file handoff frontier"));
+        assert!(read.contains("Start L3"));
+        assert!(read.contains("value/control boundary: Select -> src/Api.cs"));
+        assert!(read.contains("codedb_symbol name=Select path=src/Api.cs body=true"));
+        assert!(read.contains("LongerSpecificMemberName L5"));
+        assert!(read.contains("Notify -> src/Other.cs"));
+    }
+
+    #[test]
+    fn connected_range_incoming_frontier_preserves_call_site_preprocessor_guards() {
+        let root = temp_tools_test_dir("connected_range_incoming_guards");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Target.cs"),
+            r#"
+public class Target {
+    public void GuardedEntry() { }
+    public void UnguardedEntry() { }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Caller.cs"),
+            r#"
+public class Caller {
+    public void Run() {
+#if OPTIONAL_FEATURE
+        new Target().GuardedEntry();
+#endif
+        new Target().UnguardedEntry();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let read = handle_read(
+            &index,
+            &json!({
+                "path": "src/Target.cs",
+                "line_start": 3,
+                "line_end": 4,
+                "compact": true,
+                "connected_range": true,
+                "include_symbol_leads": true
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(read.contains("connected range incoming call frontier"));
+        assert!(read.contains("GuardedEntry L3 <- src/Caller.cs:5 [#if OPTIONAL_FEATURE]"));
+        assert!(
+            read.contains("UnguardedEntry L4 <- src/Caller.cs:7 [no enclosing preprocessor guard]")
+        );
+    }
+
+    #[test]
+    fn qualified_receiver_declaration_type_disambiguates_same_named_callees() {
+        let root = temp_tools_test_dir("qualified_receiver_declared_type");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Api.cs"),
+            r#"
+public static class Api {
+    private static RuntimeService _service;
+    public static int Load() { return _service.Fetch(); }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/RuntimeService.cs"),
+            "public class RuntimeService { public int Fetch() { return 1; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/WrongService.cs"),
+            "public class WrongService { public int Fetch() { return 2; } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let out = handle_symbol(
+            &index,
+            &json!({
+                "name": "Load",
+                "path": "src/Api.cs",
+                "body": true,
+                "max_results": 1
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(out.contains("Fetch -> src/RuntimeService.cs"));
+        assert!(!out.contains("Fetch -> src/WrongService.cs"));
+    }
+
+    #[test]
+    fn interface_methods_emit_dispatch_branches_without_fake_implementation_chain() {
+        let root = temp_tools_test_dir("interface_dispatch_branches");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/IRunner.cs"),
+            "public interface IRunner { int Execute(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/LiveRunner.cs"),
+            r#"public class LiveRunner : IRunner {
+    public int Execute() {
+        return Execute(1);
+    }
+    private int Execute(int value) {
+        return value;
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/AltRunner.cs"),
+            "public class AltRunner : IRunner { public int Execute() { return 2; } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let out = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (interface:Symbol {name:'Execute', path:'src/IRunner.cs'})-[:DISPATCHES_TO]->(implementation:Symbol) RETURN implementation.path, implementation.line_start, implementation.detail"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(out.contains("src/AltRunner.cs"));
+        assert!(out.contains("src/LiveRunner.cs"));
+        assert!(out.contains("\"count\": 2"));
+        assert!(!out.contains("branch preview"));
+    }
+
+    #[test]
+    fn graph_query_exposes_communities_and_rankable_file_metrics() {
+        let root = temp_tools_test_dir("graph_query_community_metrics");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/entry.js"),
+            "import { run } from './service.js';\nexport function start() { return run(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/service.js"),
+            "import { load } from './store.js';\nexport function run() { return load(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/store.js"),
+            "export function load() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/isolated.js"),
+            "export function isolated() { return 0; }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let communities = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (community:Community) RETURN community.id, community.size, community.representative_path ORDER BY community.size DESC"
+            }),
+        )
+        .unwrap();
+        let files = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (community:Community)-[:CONTAINS]->(file:File) RETURN community.id, file.path, file.degree, file.incoming_degree, file.outgoing_degree ORDER BY file.degree DESC"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(communities.contains("community.representative_path"));
+        assert!(communities.contains("community.size"));
+        assert!(files.contains("src/entry.js"));
+        assert!(files.contains("src/service.js"));
+        assert!(files.contains("file.incoming_degree"));
+        assert!(files.contains("file.outgoing_degree"));
+        assert!(files.contains("\"count\": 4"));
+    }
+
+    #[test]
+    fn graph_query_exposes_topology_file_labels() {
+        let root = temp_tools_test_dir("graph_query_topology_labels");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Entry.cs"),
+            r#"
+using Demo.Services;
+namespace Demo
+{
+    public class Entry
+    {
+        private Service service;
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Service.cs"),
+            r#"
+namespace Demo.Services
+{
+    public class Service
+    {
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let entries = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (file:EntryFile) RETURN file.path, file.outgoing_degree ORDER BY file.outgoing_degree DESC"
+            }),
+        )
+        .unwrap();
+        let sinks = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (file:SinkFile) RETURN file.path, file.incoming_degree ORDER BY file.incoming_degree DESC"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(entries.contains("src/Entry.cs"), "{entries}");
+        assert!(sinks.contains("src/Service.cs"), "{sinks}");
+    }
+
+    #[test]
+    fn graph_query_resolves_incoming_references_from_an_exact_target() {
+        let root = temp_tools_test_dir("graph_query_incoming_reference");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/UIDefine.cs"),
+            "public static class UIDefine { public const string MainPanel = \"main_panel\"; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Entry.cs"),
+            "public class Entry { public void Open() { VIEW.OpenUI(UIDefine.MainPanel); } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let result = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (caller:Symbol)-[reference:REFERENCES]->(target:Symbol) WHERE target.name='MainPanel' AND target.path='src/UIDefine.cs' RETURN caller.name, caller.path, reference.line"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.contains("\"caller.name\": \"Open\""), "{result}");
+        assert!(result.contains("\"caller.path\": \"src/Entry.cs\""));
+        assert!(result.contains("\"count\": 1"));
+    }
+
+    #[test]
+    fn graph_query_seeds_exact_argument_values_and_returns_owners() {
+        let root = temp_tools_test_dir("graph_query_exact_argument_value");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/EventDefine.cs"),
+            "public static class EventDefine { public const int OnInitEnd = 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/EventBus.cs"),
+            r#"
+public static class EventBus {
+    public static void Broadcast(int id) { }
+    public static void AddListener(int id, System.Action action) { }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Flow.cs"),
+            r#"
+public class Flow {
+    public void Publish() { EventBus.Broadcast(EventDefine.OnInitEnd); }
+    public void Subscribe() { Event.Instance.AddListener(this, EventDefine.OnInitEnd, () => OnReady()); }
+    private void OnReady() { }
+}
+"#,
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let result = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (owner:Symbol)-[:HAS_CALLSITE]->(call:CallSite)-[:ARGUMENT]->(value:Value) WHERE value.expression='EventDefine.OnInitEnd' RETURN owner.name, call.name, call.line, value.index ORDER BY owner.name"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.contains("\"owner.name\": \"Publish\""), "{result}");
+        assert!(result.contains("\"owner.name\": \"Subscribe\""));
+        assert!(result.contains("\"call.name\": \"Broadcast\""));
+        assert!(result.contains("\"call.name\": \"AddListener\""));
+        assert!(result.contains("\"value.index\": 1"));
+        assert!(result.contains("\"count\": 2"));
+    }
+
+    #[test]
+    fn forwarding_chain_contracts_into_terminal_dispatch_branch_previews() {
+        let root = temp_tools_test_dir("forwarding_chain_dispatch_preview");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Entry.cs"),
+            r#"public class Entry {
+    public int Run(bool skip) {
+        return Api.Fetch(skip);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Api.cs"),
+            r#"public static class Api {
+    private static Package _package;
+    public static int Fetch(bool skip) {
+        return _package.Fetch(skip);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Package.cs"),
+            r#"public class Package {
+    private IFetchService _service;
+    public int Fetch(bool skip) {
+        return _service.Fetch(skip);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/IFetchService.cs"),
+            "public interface IFetchService { int Fetch(bool skip); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/LiveFetchService.cs"),
+            "public class LiveFetchService : IFetchService { public int Fetch(bool skip) { return skip ? 0 : 1; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/AltFetchService.cs"),
+            "public class AltFetchService : IFetchService { public int Fetch(bool skip) { return 2; } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let out = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH SHORTEST p=(start:Symbol)-[:CALLS*1..4]->(terminal:Symbol), (terminal)-[:DISPATCHES_TO]->(implementation:Symbol) WHERE start.name='Run' AND start.path='src/Entry.cs' AND terminal.name='Fetch' AND terminal.path='src/IFetchService.cs' RETURN p, implementation.path, implementation.detail"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(out.contains("src/Api.cs"));
+        assert!(out.contains("src/Package.cs"));
+        assert!(out.contains("src/IFetchService.cs"));
+        assert!(out.contains("src/LiveFetchService.cs"));
+        assert!(out.contains("src/AltFetchService.cs"));
+        assert!(out.contains("\"count\": 2"));
+    }
+
+    #[test]
+    fn dispatch_preview_emits_parameter_to_control_action_evidence() {
+        let root = temp_tools_test_dir("dispatch_parameter_control_evidence");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/ISelector.cs"),
+            "public interface ISelector { List<Item> Select(string[] tags, bool filter = true); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/HostSelector.cs"),
+            r#"public class HostSelector : ISelector {
+    public List<Item> Select(string[] tags, bool filter = true) {
+        List<Item> selected = new List<Item>();
+        foreach (var item in Items) {
+            if (filter && item.Has(tags)) {
+                continue;
+            }
+            selected.Add(item);
+        }
+        return selected;
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/TagSelector.cs"),
+            r#"public class TagSelector : ISelector {
+    public List<Item> Select(string[] tags, bool filter = true) {
+        List<Item> selected = new List<Item>();
+        foreach (var item in Items) {
+            bool isTagOK = item.Has(tags);
+            if (!isTagOK) continue;
+            selected.Add(item);
+        }
+        return selected;
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let host = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (leaf:Symbol {name:'Select', path:'src/HostSelector.cs'})-[:HAS_PARAMETER]->(parameter:Parameter)-[:USED_IN]->(condition:Condition)-[:TRUE]->(skip:ControlAction)-[:PREVENTS]->(append:CallSite) WHERE parameter.name='tags' AND append.name='Add' RETURN condition.text, condition.negated, skip.kind, append.text"
+            }),
+        )
+        .unwrap();
+        let tag = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (leaf:Symbol {name:'Select', path:'src/TagSelector.cs'})-[:HAS_PARAMETER]->(parameter:Parameter)-[use:USED_IN]->(condition:Condition)-[:TRUE]->(skip:ControlAction)-[:PREVENTS]->(append:CallSite) WHERE parameter.name='tags' AND append.name='Add' RETURN use.via, condition.text, condition.negated, skip.kind, append.text"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(host.contains("item.Has(tags)"));
+        assert!(host.contains("\"condition.negated\": false"));
+        assert!(host.contains("\"skip.kind\": \"continue\""));
+        assert!(host.contains("selected.Add(item)"));
+        assert!(tag.contains("\"use.via\": \"isTagOK\""));
+        assert!(tag.contains("if (!isTagOK) continue;"));
+        assert!(tag.contains("\"condition.negated\": true"));
+        assert!(tag.contains("selected.Add(item)"));
+    }
+
+    #[test]
+    fn connected_range_value_boundary_emits_contracted_terminal_dispatch_preview() {
+        let root = temp_tools_test_dir("connected_range_dispatch_preview");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Flow.cs"),
+            r#"
+public class Flow {
+    public int Run(bool skip) { var selected = Api.Fetch(skip); return selected; }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Api.cs"),
+            r#"public static class Api {
+    private static IFetchService _service;
+    public static int Fetch(bool skip) {
+        return _service.Fetch(skip);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/IFetchService.cs"),
+            "public interface IFetchService { int Fetch(bool skip); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/LiveFetchService.cs"),
+            "public class LiveFetchService : IFetchService { public int Fetch(bool skip) { return skip ? 0 : 1; } }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let read = handle_read(
+            &index,
+            &json!({
+                "path": "src/Flow.cs",
+                "line_start": 3,
+                "line_end": 3,
+                "compact": true,
+                "connected_range": true,
+                "include_symbol_leads": true
+            }),
+        )
+        .unwrap();
+        let graph = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH SHORTEST p=(start:Symbol)-[:CALLS*1..3]->(terminal:Symbol), (terminal)-[:DISPATCHES_TO]->(implementation:Symbol) WHERE start.name='Run' AND start.path='src/Flow.cs' AND terminal.name='Fetch' AND terminal.path='src/IFetchService.cs' RETURN p, implementation.path"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(read.contains("value/control boundary: Fetch -> src/Api.cs"));
+        assert!(!read.contains("contracted leaf corridor"));
+        assert!(graph.contains("src/IFetchService.cs"));
+        assert!(graph.contains("src/LiveFetchService.cs"));
+    }
+
+    #[test]
+    fn value_boundary_contracts_independently_when_body_has_other_cross_file_calls() {
+        let root = temp_tools_test_dir("value_boundary_with_other_calls");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Flow.cs"),
+            r#"public class Flow {
+    public int Run(bool skip) {
+        var selected = Api.Fetch(skip);
+        Audit.Record();
+        return selected;
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Api.cs"),
+            r#"public static class Api {
+    private static IFetchService _service;
+    public static int Fetch(bool skip) {
+        return _service.Fetch(skip);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/IFetchService.cs"),
+            "public interface IFetchService { int Fetch(bool skip); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/LiveFetchService.cs"),
+            "public class LiveFetchService : IFetchService { public int Fetch(bool skip) { return skip ? 0 : 1; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Audit.cs"),
+            "public static class Audit { public static void Record() {} }\n",
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+
+        let out = handle_symbol(
+            &index,
+            &json!({
+                "name": "Run",
+                "path": "src/Flow.cs",
+                "body": true,
+                "max_results": 1
+            }),
+        )
+        .unwrap();
+        let graph = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH SHORTEST p=(start:Symbol)-[:CALLS*1..3]->(terminal:Symbol), (terminal)-[:DISPATCHES_TO]->(implementation:Symbol) WHERE start.name='Run' AND start.path='src/Flow.cs' AND terminal.name='Fetch' AND terminal.path='src/IFetchService.cs' RETURN p, implementation.path"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(out.contains("Fetch -> src/Api.cs"));
+        assert!(out.contains("Record -> src/Audit.cs"));
+        assert!(!out.contains("contracted leaf corridor"));
+        assert!(graph.contains("src/IFetchService.cs"));
+        assert!(graph.contains("src/LiveFetchService.cs"));
     }
 
     #[test]
@@ -16845,7 +21179,7 @@ public class Hero {
 
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.contains("codedb_symbol name=Power"));
-        assert!(!out.contains("codedb_symbol name=Legacy"));
+        assert!(!out.contains("OldService"));
     }
 
     #[test]
@@ -17210,6 +21544,150 @@ pub fn use_four(value: SessionManager) { let _ = value; }
         assert!(out.contains("Hero.power.cs"));
         assert!(out.contains("property Power"));
         assert!(out.contains("_power + equipPower"));
+    }
+
+    #[test]
+    fn graph_query_returns_call_dispatch_guard_and_shared_state_facts() {
+        let root = temp_tools_test_dir("graph_query_semantic_facts");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Flow.cs"),
+            r#"
+public interface IService {
+    void Filter(string[] tags);
+}
+
+public class HostService : IService {
+    public void Filter(string[] tags) {}
+}
+
+public class Flow {
+    private IService service;
+    private object _task;
+
+    public void LoadReady(string[] tags) {
+#if MINI
+        StartMiniUpdate();
+#endif
+        DownBundle();
+        service.Filter(tags);
+    }
+
+    private void StartMiniUpdate() {}
+    private void DownBundle() {}
+    public void Produce() { _task = CreateTask(); }
+    public void Consume() { if (_task != null) Use(_task); }
+    public void Select(string[] tags) {
+        bool isTagOK = HasTag(tags);
+        foreach (var item in tags) {
+            if (!isTagOK) {
+                continue;
+            }
+            results.Add(item);
+        }
+    }
+    private object CreateTask() { return new object(); }
+    private bool HasTag(string[] tags) { return true; }
+    private void Use(object value) {}
+}
+"#,
+        )
+        .unwrap();
+        let mut options = IndexOptions::default();
+        options.storage.enabled = false;
+        options.respect_gitignore = false;
+        let index = Codebase::index(&root, options).unwrap();
+        let consume_target = index
+            .symbols_named("Consume")
+            .into_iter()
+            .map(|(file, symbol)| target_from_symbol(file, symbol))
+            .next()
+            .unwrap();
+        let consume_accesses = symbol_shared_state_accesses(&index, &consume_target).unwrap();
+        assert!(
+            !consume_accesses.is_empty(),
+            "consume accesses missing; symbols={:?}",
+            index
+                .files
+                .values()
+                .flat_map(|file| file
+                    .symbols
+                    .iter()
+                    .map(|symbol| (&symbol.name, symbol.kind.as_str())))
+                .collect::<Vec<_>>()
+        );
+        let task_state = consume_accesses[0].state.clone();
+        let incoming_accesses = incoming_shared_state_accesses(&index, &task_state).unwrap();
+        assert!(
+            !incoming_accesses.is_empty(),
+            "incoming accesses missing for {:?}",
+            task_state.name
+        );
+
+        let calls = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH p=(caller:Symbol)-[:CALLS|DISPATCHES_TO*1..2]->(leaf:Symbol) WHERE caller.name='LoadReady' RETURN p"
+            }),
+        )
+        .unwrap();
+        assert!(calls.contains("DISPATCHES_TO"));
+        assert!(calls.contains("HostService"), "{calls}");
+
+        let binding = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (caller:Symbol)-[:HAS_CALLSITE]->(call:CallSite)-[argument:ARGUMENT]->(value:Value)-[:BINDS_TO]->(parameter:Parameter) WHERE caller.name='LoadReady' AND call.name='Filter' AND value.index=0 RETURN value.expression, argument.index, parameter.name"
+            }),
+        )
+        .unwrap();
+        assert!(
+            binding.contains("\"value.expression\": \"tags\""),
+            "{binding}"
+        );
+        assert!(
+            binding.contains("\"parameter.name\": \"tags\""),
+            "{binding}"
+        );
+
+        let guarded = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (caller:Symbol)-[call:CALLS]->(leaf:Symbol) WHERE caller.name='LoadReady' AND leaf.name='StartMiniUpdate' RETURN call.guard, call.line"
+            }),
+        )
+        .unwrap();
+        assert!(guarded.contains("#if MINI"));
+
+        let unguarded = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (caller:Symbol)-[call:CALLS]->(leaf:Symbol) WHERE caller.name='LoadReady' AND leaf.name='DownBundle' RETURN call.guarded, call.line"
+            }),
+        )
+        .unwrap();
+        assert!(unguarded.contains("\"call.guarded\": false"));
+
+        let control = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (leaf:Symbol)-[:HAS_PARAMETER]->(param:Parameter)-[use:USED_IN]->(cond:Condition)-[:TRUE]->(skip:ControlAction)-[:PREVENTS]->(append:CallSite), (cond)-[:FALSE]->(fallthrough:ControlAction)-[:REACHES]->(append) WHERE leaf.name='Select' AND param.name='tags' AND append.name='Add' RETURN param.name, use.via, cond.text, cond.negated, skip.kind, append.text"
+            }),
+        )
+        .unwrap();
+        assert!(control.contains("\"cond.negated\": true"), "{control}");
+        assert!(control.contains("\"skip.kind\": \"continue\""), "{control}");
+        assert!(control.contains("results.Add(item)"), "{control}");
+
+        let state = handle_graph_query(
+            &index,
+            &json!({
+                "query": "MATCH (consumer:Symbol)-[:READS]->(state:SharedState)<-[:WRITES]-(producer:Symbol) WHERE consumer.name='Consume' AND state.name='_task' RETURN consumer.name, state.name, producer.name"
+            }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(state.contains("\"producer.name\": \"Produce\""), "{state}");
     }
 
     fn temp_tools_test_dir(name: &str) -> PathBuf {

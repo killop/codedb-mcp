@@ -140,6 +140,90 @@ public class PlayerController
     }
 
     #[test]
+    fn csharp_recoverable_method_error_keeps_following_member_declarations() {
+        let parsed = analyze_source(
+            "csharp",
+            r#"
+public class ResourcePackage
+{
+    public int LoadAssetEx(string name, bool async)
+    {
+        return 1;
+    }
+
+    public static (int, string) Parse(string value)
+    {
+        return (1, value);
+    }
+
+    public int GetDownloadListByFilterTags(string[] tags, bool needFilter = true)
+    {
+        return 2;
+    }
+}
+"#,
+        );
+
+        assert!(parsed.symbols.iter().any(|symbol| {
+            symbol.kind == "method" && symbol.name == "GetDownloadListByFilterTags"
+        }));
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|symbol| symbol.kind == "method" && symbol.name == "Parse")
+        );
+        assert!(!parsed.symbols.iter().any(|symbol| symbol.name == "static"));
+    }
+
+    #[test]
+    fn csharp_preprocessor_brace_recovery_keeps_later_members() {
+        let parsed = analyze_source(
+            "csharp",
+            r#"
+public class ResourceCore
+{
+    private void LoadReady()
+    {
+#if USE_LOG
+        foreach (var item in items)
+        {
+#else
+        }
+#endif
+    }
+
+    public void StartMiniUpdate()
+    {
+        LoadReady();
+    }
+
+    internal void DownBundle()
+    {
+        Debug.LogWarning("request");
+    }
+}
+"#,
+        );
+
+        for name in ["LoadReady", "StartMiniUpdate", "DownBundle"] {
+            assert!(
+                parsed
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.kind == "method" && symbol.name == name),
+                "missing recovered member {name}"
+            );
+        }
+        assert!(
+            !parsed
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "LogWarning")
+        );
+    }
+
+    #[test]
     fn java_tree_sitter_extracts_outline_imports_and_package() {
         let parsed = analyze_source(
             "java",

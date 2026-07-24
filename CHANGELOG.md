@@ -2,29 +2,43 @@
 
 [中文版本](CHANGELOG.zh-CN.md)
 
-## Unreleased - 2026-07-23
+## Unreleased - 2026-07-24
 
 ### Changed
 
 - Removed Model2Vec, semantic units, vector stores, embedding configuration, model downloads, and `embeddings.bin` from the runtime and cache schema.
-- Bumped the project cache to v28 and kept graph, dependency, exact text, word, caller, outline, and BM25 sidecars.
-- Reworked `codedb_flow` / `codedb_context` into a query-model-free graph workflow: unscoped calls return a compact atlas; scoped calls select structural roots and community boundaries, apply structural-seed PPR with hub cost, connect anchors through weighted shortest paths, and progressively disclose exact call/dependency/body evidence.
+- Bumped the project cache to v32; C# field declarations are reindexed for receiver-type and shared-state resolution while graph, dependency, exact text, word, caller, outline, and BM25 sidecars remain lazy/persistent as appropriate.
+- Added the atomic read-only `codedb_graph_query` MCP tool with a Cypher-like `MATCH / SHORTEST / WHERE / RETURN / ORDER BY / LIMIT` subset, scalar/property comparisons, typed directed edges, finite variable-length paths, deterministic projection, and bidirectional shortest-connector planning.
+- Added lazy property-graph facts for precise calls, interface dispatch, call sites, arguments, parameter binding, conditions, control actions, call-site preprocessor guards, and shared-state reads/writes.
+- Added queryable `Community` nodes, `Community-CONTAINS-File`, aggregated community dependencies, and sortable file degree/boundary/incoming/outgoing metrics so anchorless discovery and clustering use the graph language.
+- Added topology labels `EntryFile`, `BoundaryFile`, and `SinkFile` so anchorless discovery queries a small structural candidate class instead of projecting thousands of files.
+- Removed flow, caller, call-path, and dependency wrappers from the MCP surface; their graph operations remain available through `codedb_graph_query`, while compatibility commands remain CLI/internal.
 - Removed keyword, synonym, morphology, language, and call-quota guidance from the packaged skill. Multi-phase questions may use as many scoped graph projections as needed to close the evidence chain.
-- Applied `neug`-inspired graph-query mechanics: resident CSR file adjacency, forward/reverse dependency views, bidirectional frontier expansion selected by actual neighbor cost, parent-chain path reconstruction, dependency corridors, and deterministic executable call corridors that stop at branches, terminals, or cycles instead of a fixed traversal depth.
+- Applied `neug`-inspired query separation: pattern binding, ordinary/recursive expansion, filtering, projection, forward/reverse views, bidirectional connector search, and deterministic path reconstruction.
+- Added selective-endpoint path planning: a pattern with an exact right-hand target is reversed for execution and restored for projection, avoiding global left-side scans. Incoming `REFERENCES` now resolves qualified member facts such as `UIDefine.MainPanel`.
+- Removed dispatch previews, contracted leaf corridors, parameter/control prose, and branch-ledger prompting from runtime source output. The equivalent evidence is now queryable as graph nodes and edges.
+- Tightened the exposed atomic schemas: `codedb_symbol` no longer advertises composite `expand`, and `codedb_outline` no longer advertises body-followup expansion.
 - Kept MCP operations atomic: `codedb_bundle` remains internal and is not exposed. `codedb_outline include_connected_ranges=true` can project a same-file call/reference component into one explicit `connected_range=true` read; that read is a complete active-code closure and does not expand another lead bundle.
 
 ### Fixed
 
 - Fixed continuation traversal recursively expanding the original symbol instead of the next symbol.
 - Fixed callpath false edges from comments, strings, repeated identifiers, optional-argument matching, local same-name methods, and unresolved explicit qualifiers falling back to unrelated global definitions.
+- Stopped unresolved qualified calls such as collection `Add`/`Sort` from becoming hundreds of same-name global `CALLS` edges; ambiguous fallbacks are no longer admitted as precise calls.
+- Fixed C# `variable_declaration` traversal so ordinary fields are indexed instead of only recovered special cases.
+- Preserved syntax-certain qualified call sites and their arguments when the callee target cannot be resolved uniquely. These nodes use `resolution="syntax"`; `TARGET` and `BINDS_TO` remain available only when the target is precise, avoiding fabricated call edges while retaining event/listener evidence.
 - Stopped rebuilding a full dependency `HashMap<BTreeSet<_>>` for every callpath corridor; queries now walk the existing forward/reverse dependency indexes and cache only visited neighbor rows.
 
 ### Benchmark And Validation
 
-- Expanded the Rust suite to 68 passing tests, including deterministic multi-hop continuation, connected member ranges, qualified callpaths, optional arguments, and false-edge regressions.
-- Re-ran the startup-to-main-interface MCP/no-MCP scenario: 122,851 vs 224,922 effective tokens, 414.6s vs 732.8s, and 244,291 vs 742,368 tool-output characters.
-- Completed same-model reference runs for world-map marching, hero attributes/power, and alliance rally analysis. Completed MCP samples used 8.8-12.6% fewer effective tokens and 23.0-53.3% fewer tool-output characters than their RG controls, while broad-scenario call count and convergence remained variable.
+- Expanded the Rust suite to 96 passing tests, including selective-endpoint query planning, incoming qualified-member references, exact argument-value seeds, topology labels, ordering/property comparisons, community/file metrics, shortest connectors, call/dispatch/guard facts, argument binding, branch `PREVENTS/REACHES`, shared-state joins, C# fields, and false-edge regressions.
+- Verified the resource-update scenario on the real Unity index: the query path reaches `YooAssets -> ResourcePackage -> IPlayModeServices -> HostPlayModeImpl`; mini filtering has a true `continue` branch that prevents `downloadList.Add`, while lazy-tag filtering uses a negated condition whose false branch reaches `Add`; `InitLazyTag` binds `new[]{ downloader.LazyTag }` to `tags`.
+- Retained the completed pre-property-query startup-to-main-interface MCP/no-MCP baseline: 122,851 vs 224,922 effective tokens, 414.6s vs 732.8s, and 244,291 vs 742,368 tool-output characters. It is a historical control, not a result for the new graph-language planner.
+- Retained same-model pre-property-query reference runs for world-map marching, hero attributes/power, and alliance rally analysis. Completed MCP samples used 8.8-12.6% fewer effective tokens and 23.0-53.3% fewer tool-output characters than their RG controls, while broad-scenario call count and convergence remained variable.
 - Excluded a final consolidated rerun after Codex rejected `gpt-5.6-sol` for the account mid-run; failed turns with no usage record are not reported as benchmark wins.
+- Excluded a 2026-07-24 graph-language startup diagnostic that hit the 20-minute timeout. Its trace showed 104 sequential symbol reads after two reverse graph patterns failed to plan from their exact targets; the planner/reference/schema fixes above address that failure mode, but the aborted run is not reported as a benchmark result.
+- Excluded a second 15-minute diagnostic after the reverse-query fix. It reduced symbol output but one unanchored 5,000-file projection dominated graph output; the topology labels above address that trace. The aborted run is not reported as a benchmark result.
+- Excluded a third 12-minute diagnostic after topology discovery was added. It reached the concrete `EventDefine.OnInitEnd` handoff but stalled while searching argument use through repeated symbol reads; exact `Value.expression` seeding now performs that reverse lookup directly. The aborted run is not reported as a benchmark result.
 
 ## 0.5.0 - 2026-06-03
 

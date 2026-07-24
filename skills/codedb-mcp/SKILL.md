@@ -1,169 +1,213 @@
 ---
 name: codedb-mcp
 description: >-
-  Use the configured codedb MCP server for generic repository understanding,
-  source lookup, symbols, references, dependency graphs, exact code search, and
-  call tracing in repositories with .codedb-mcp. Use it for lifecycle tracing,
-  implementation discovery, architecture questions, and cross-file behavior.
+  Use the configured codedb MCP server whenever an indexed repository needs
+  lifecycle tracing, implementation discovery, call/dispatch analysis,
+  shared-state producer lookup, branch evidence, architecture explanation, or
+  exact source navigation. Prefer declarative graph queries over repeated
+  wrapper reads or task-keyword search.
 ---
 
 # codedb-mcp
 
-Use codedb as the source lookup path for indexed repositories. The server is
-English-first. When the user's task is not English, translate the complete task
-once into concise English before the first codedb call. Preserve identifiers,
-paths, quoted literals, error messages, uncertainty, and code exactly.
+Use codedb as the repository source path when `.codedb-mcp` is configured. The
+server is English-first. Translate a non-English question once into concise
+English, but preserve identifiers, paths, literals, errors, and code exactly.
 
-The server does not interpret natural-language task text. `task` is an opaque
-label. Repository selection comes from the persisted file graph, communities,
-dependency/call edges, and exact evidence chosen by the agent.
+The server does not route from task keywords. `task` is an opaque label.
+Accuracy comes from exact graph facts and source bodies, not synonyms, language
+boosts, query models, call quotas, or output clamps.
 
 ## Workflow
 
-1. Call `codedb_flow` with the complete task and no `path_glob` to get the
-   compact graph atlas: source prefixes, focused groups, and dependency links.
-2. In an atlas row written as `parent: child(count)`, choose the entry leaf
-   `parent/child/**`, not the broad `parent/**`. Call `codedb_flow` again with
-   the same complete task plus that leaf scope.
-3. Read the scoped pack as a graph projection: structural roots, community
-   boundaries, weighted bridges, dependency edges, call edges, traces, and
-   active symbol bodies.
-4. Follow exact returned paths and symbols with `codedb_symbol body=true
-   max_results=1`, `codedb_callpath`, `codedb_callers`, or `codedb_deps`.
-   Prefer a small compact `codedb_read` only when no exact symbol body fits.
-   When both an exact entry and requested final endpoint are known, try one
-   `codedb_callpath` first. A found path includes complete active bodies; fill
-   only real gaps instead of manually expanding every intermediate helper.
-   The default exact body also includes compact deterministic executable
-   corridor paths. Traversal continues without a fixed depth until a real
-   branch, terminal, or cycle. Use `codedb_callpath` when both endpoints are
-   known; use `expand=true` only when a corridor identifies a needed branch
-   whose bodies or deeper references are still missing.
-5. Once an exact body is available, follow its qualified/tail/literal handoff
-   across directories. Do not pre-project later atlas leaves. Repeat scoped
-   `codedb_flow` only when the current evidence has no exact next path. There is
-   no call quota; stop when the chain is supported.
-6. Answer from the shortest complete evidence chain. State real gaps explicitly.
+The MCP server is already bound to the repository.
 
-Same-file atomicity: when the base outline shows several answer-critical
-members in one file, rerun that outline once with
-`include_connected_ranges=true`, then read one returned joint range with
-compact `codedb_read`. Do not request connected ranges preemptively for every
-file, and do not turn one cohesive local component into sequential
-`codedb_symbol` calls. Keep individual symbol bodies for isolated members and
-cross-file handoffs. A returned `connected_range=true` read is a complete
-same-file evidence closure: do not reopen its contained members or overlapping
-ranges unless the active code contradicts another exact body.
+1. Start with `codedb_graph_query`. If no exact anchor is known, query
+   `EntryFile` and `BoundaryFile`; use `Community` nodes only to choose a
+   structural region. Do not list every `File` to discover an entry.
+2. Query cross-community `DEPENDS_ON` edges to identify structural bridges,
+   then use the returned exact files/symbols as anchors. Do not turn the task
+   wording into graph predicates.
+3. Use one declarative pattern to retrieve each evidence chain instead of
+   opening forwarding wrappers separately. Use `MATCH SHORTEST` for a finite
+   connector between exact endpoints. Plain
+   variable-length `MATCH` returns matching paths and is appropriate only when
+   all such paths are actually required.
+4. Read an exact `codedb_symbol body=true max_results=1` only for local behavior
+   not already represented by graph facts. Use `codedb_read` for an exact range
+   when no symbol body fits.
+5. Answer from the shortest complete evidence chain. State a genuine missing
+   dynamic edge explicitly; do not replace it with keyword search or a guessed
+   lifecycle symbol.
 
-Never invent lifecycle symbol names such as `OnInit`, `OnCreate`, `Ready`, or
-`CheckReady`. Call `codedb_symbol` only with a name returned verbatim by a
-previous codedb result. If one exact name is missing in a known file, call
-`codedb_outline` for that file once and choose from its real symbols; do not try
-more guessed siblings.
+## Graph query model
 
-A lifecycle trace is complete when every requested phase has one exact active
-body, every adjacent pair has a direct handoff or graph path, and the final
-visible/readiness lifecycle callback has an exact body. Answer immediately at
-that point. More calls are allowed, but evidence already satisfying this rule is
-not improved by descending into generic framework internals.
+`codedb_graph_query` is an atomic, read-only Cypher-like subset:
 
-Traverse phases once in execution order. Keep a small evidence ledger of
-`phase -> active body -> next handoff`. After a phase is closed, do not return to
-it for extra detail, constants, assets, compile variants, or additional callers
-unless downstream evidence contradicts the established transition. Once the
-final phase closes, draft the answer instead of starting a second verification
-pass.
+- `MATCH`, optional `SHORTEST`, `WHERE`, `RETURN`, `ORDER BY`, optional
+  `LIMIT`;
+- scalar comparisons `=`, `!=`, `<`, `<=`, `>`, `>=`, plus
+  property-to-property comparisons;
+- node labels such as `Community`, `File`, `Symbol`, `SharedState`,
+  `CallSite`, `Value`, `Parameter`, `Condition`, and `ControlAction`;
+- directed typed edges and finite `*min..max` paths;
+- deterministic projection, de-duplication, and output ordering.
 
-The final requested callback/readiness body is a hard stop. Do not inspect
-upstream FSM update plumbing, later server readiness variants, callers,
-compile-time alternatives, or another implementation after it unless the body
-contradicts the established chain or the user explicitly requested that extra
-branch.
+The planner starts a path from the more selective endpoint. Write the natural
+edge direction even for reverse lookup, for example
+`(caller)-[:REFERENCES]->(exactTarget)`; an exact target `name/path` predicate
+avoids a global caller scan.
+
+Discovery properties:
+
+- `Community`: `id`, `name`, `size`, `boundary_links`,
+  `representative_path`;
+- `File`: `path`, `community`, `degree`, `boundary_degree`,
+  `incoming_degree`, `outgoing_degree`;
+- `EntryFile` is a `File` with zero incoming and nonzero outgoing dependency
+  degree; `BoundaryFile` crosses communities; `SinkFile` has incoming but no
+  outgoing dependency;
+- file `DEPENDS_ON.count` is `1`; community `DEPENDS_ON.file_edges` is the
+  aggregated cross-community edge count.
+
+Core relations:
+
+- calls and dispatch: `CALLS`, `DISPATCHES_TO`;
+- explicit call facts: `HAS_CALLSITE`, `TARGET`, `ARGUMENT`, `BINDS_TO`;
+- control facts: `HAS_PARAMETER`, `USED_IN`, `TRUE`, `FALSE`, `PREVENTS`,
+  `REACHES`;
+- state/dependency facts: `READS`, `WRITES`, `CONTAINS`, `DEPENDS_ON`,
+  `REFERENCES`.
+
+Structural discovery without task keywords:
+
+```cypher
+MATCH (file:EntryFile)
+RETURN file.path, file.community, file.outgoing_degree, file.boundary_degree
+ORDER BY file.outgoing_degree DESC, file.boundary_degree DESC
+```
+
+```cypher
+MATCH (community:Community)
+RETURN community.id, community.size, community.boundary_links,
+       community.representative_path
+ORDER BY community.size DESC
+```
+
+```cypher
+MATCH (community:Community)-[:CONTAINS]->(file:File)
+WHERE community.id=7
+RETURN file.path, file.degree, file.boundary_degree,
+       file.incoming_degree, file.outgoing_degree
+ORDER BY file.boundary_degree DESC, file.degree DESC
+```
+
+```cypher
+MATCH (source:File)-[dependency:DEPENDS_ON]->(target:File)
+WHERE source.community != target.community
+RETURN source.path, source.community, dependency,
+       target.path, target.community
+ORDER BY source.boundary_degree DESC
+```
+
+Examples:
+
+```cypher
+MATCH SHORTEST p=(entry:Symbol)-[:CALLS|DISPATCHES_TO*1..8]->(leaf:Symbol)
+WHERE entry.name='LoadReady' AND leaf.path='exact/path/HostImpl.cs'
+RETURN p
+```
+
+```cypher
+MATCH
+  (caller:Symbol)-[:HAS_CALLSITE]->(call:CallSite),
+  (call)-[argument:ARGUMENT]->(value:Value)-[:BINDS_TO]->(parameter:Parameter)
+WHERE caller.name='LoadReady' AND call.name='GetDownloadListByFilterTags'
+RETURN call.line, call.guard, value.index, value.expression, parameter.name
+```
+
+```cypher
+MATCH (owner:Symbol)-[:HAS_CALLSITE]->(call:CallSite)-[:ARGUMENT]->(value:Value)
+WHERE value.expression='EventDefine.OnInitEnd'
+RETURN owner.name, owner.path, call.name, call.line, call.text, value.index
+ORDER BY owner.path
+```
+
+```cypher
+MATCH
+  (leaf:Symbol)-[:HAS_PARAMETER]->(parameter:Parameter)-[use:USED_IN]->(condition:Condition),
+  (condition)-[:TRUE]->(skip:ControlAction)-[:PREVENTS]->(append:CallSite),
+  (condition)-[:FALSE]->(fallthrough:ControlAction)-[:REACHES]->(append)
+WHERE leaf.path='exact/path/HostImpl.cs' AND parameter.name='tags'
+RETURN use.via, condition.text, condition.negated, skip.kind, append.text
+```
+
+```cypher
+MATCH
+  (consumer:Symbol)-[read:READS]->(state:SharedState)<-[write:WRITES]-(producer:Symbol)
+WHERE consumer.name='GetDownTaskData' AND state.name='DownloadTaskMap'
+RETURN consumer, read, state, producer, write
+```
 
 ## Evidence rules
 
-- Treat `spine source` bodies as already read. Fetch the same body again only
-  when a material line outside it is missing.
-- `codedb_symbol body=true` already returns the complete active body. Do not add
-  `format=full`, repeat the same body, or expand every referenced helper. Use
-  `expand=true` only when the body and direct handoffs do not expose the next
-  exact lifecycle link.
-- Verify a claimed primary/current implementation with its active body and at
-  least one active caller, handoff, dependency, or downstream consumer when the
-  repository exposes one.
-- A direct call in an active body already proves that handoff. Do not add a
-  callers/search round merely to re-prove it. Use callers only when direction or
-  runtime ownership is unresolved.
-- Follow `body qualified tail call leads` before search/find. They resolve exact
-  cross-file call tokens taken directly from the active body and are intended to
-  expose the next lifecycle stage without keyword discovery.
-- Read the `exact body evidence` card first. The listed handoffs are candidates,
-  not a checklist: choose only the next requested phase still missing. The body
-  already closes the current phase and direct calls already prove those links.
-- Treat comments, disabled code, generated legacy sources, and deprecated code
-  as historical evidence, not runtime behavior.
-- Follow `outline literal bridge leads` and `body literal bridge leads` when
-  inspected source contains a string-loaded resource, event, module, registry,
-  prefab, or other non-call handoff.
-- Preserve source order. Late completion and transition calls remain part of the
-  chain even when large commented regions occur earlier in the body.
-- Prefer traces corroborated by more than one selected structural root. A long
-  branch from one root can be valid but tangential.
-- Close the normal entry-to-readiness path before expanding failure, retry,
-  reconnect, relaunch, editor, legacy, or alternate-state branches.
-- Inspect one representative failure/retry body per answer-critical asynchronous
-  boundary when the task asks for failures. Do not enumerate every generic
-  resource, configuration, UI manager, or framework helper once its completion
-  contract and next state are proven.
-- For UI readiness, an exact UI-open call plus the target view's show/ready body
-  is sufficient unless the question explicitly asks how the generic UI loader
-  works. Do not descend through panel factories, generated view bindings, or
-  base UI classes after that boundary is proven.
-- For a state machine, registration/order plus each selected state's entry or
-  completion body is sufficient. Do not inspect unrelated state helpers or
-  editor/test entry points after the active runtime chain connects.
-- One supported evidence path per adjacent lifecycle link is sufficient. Do not
-  search the same call as text, inspect its callers, and read both endpoints
-  when an active body already exposes the transition.
-- Continue from exact returned paths, symbols, refs, callers, deps, outlines,
-  traces, previews, or callpaths. Keep follow-ups atomic: consume each result
-  before choosing the next exact body or graph edge.
-- After the first `codedb_*` source lookup, use only `codedb_*` for repository
-  source lookup in that answer.
+- A `CALLS` edge proves a handoff, not the callee's selection, filtering,
+  fallback, retry, or inclusion semantics.
+- Preserve argument roles through `ARGUMENT -> Value -> BINDS_TO -> Parameter`.
+  Do not call an input collection “selected” or “downloaded” until control facts
+  or the exact leaf body establish the branch outcome.
+- `HAS_CALLSITE` can retain a syntax-certain qualified call with
+  `resolution='syntax'` when its callee is not uniquely resolvable. Its
+  `ARGUMENT` facts are valid source evidence, but require `TARGET` before
+  claiming an exact callee or using `BINDS_TO`.
+- Keep interface implementations separate. `DISPATCHES_TO` lists possible
+  implementations; construction/assignment evidence selects the active one.
+- A preprocessor guard belongs only to the call edge carrying it. A sibling
+  guarded call does not guard an independent caller.
+- For `if (...) continue/return`, use the explicit branch facts. `PREVENTS`
+  shows the branch that cannot reach the later operation; `REACHES` shows the
+  fallthrough branch that can.
+- Prefer reverse graph patterns for callers or producers: start from the exact
+  target/state and traverse an incoming edge rather than scanning every symbol.
+- Treat comments, disabled code, generated legacy sources, and deprecated paths
+  as historical unless active evidence selects them.
+- Never invent sibling lifecycle names. After one missing exact name in a known
+  file, inspect that file's outline once.
+
+## Exact source tools
+
+- `codedb_symbol`: one exact definition/body. The body is local evidence; use
+  graph queries for multi-hop navigation, dispatch, arguments, guards, state,
+  and control flow. The MCP schema intentionally has no `expand` option.
+- `codedb_outline`: symbols in one exact file. Request connected ranges only
+  when several answer-critical members in that file must be read together.
+- `codedb_read`: one exact file/range, not a discovery tool.
+- `codedb_status`: health/freshness only when setup or cache state is asked.
+
+Caller, call-path, dependency, flow-atlas, lexical, composite, and
+administrative wrappers remain CLI/internal. Express graph traversal through
+`codedb_graph_query`.
+
+Read `references/tools.md` when syntax or properties are unclear.
 
 ## Query discipline
 
-- Do not derive keyword bags, synonyms, facets, morphology, translations of
-  identifiers, or language/framework/domain-specific boosts from the task.
-- Do not use `codedb_search` for natural-language task text. Use it only for an
-  exact identifier, path, quoted literal, or string already present in returned
-  repository evidence.
-- Do not treat atlas rows or discovery candidates as behavior without active
-  body/read/dependency/caller/callpath evidence.
-- Do not reconstruct a file through overlapping reads. Switch to exact symbols,
-  dependencies, callers, or callpaths after one focused read.
-- Do not use `compact=false` for broad analysis.
-
-## Tool details
-
-Read `references/tools.md` only when a tool argument or output contract is
-unclear.
+- Do not derive keyword bags, synonyms, filename guesses, morphology, or
+  framework/language boosts from the user's task.
+- Do not use shell/rg after codedb source analysis starts unless the user is
+  explicitly benchmarking the no-MCP control.
+- Do not reconstruct files through overlapping reads.
+- Reach argument values from an anchored `CallSite` through `ARGUMENT`, or seed
+  `Value` with an exact `expression` copied from graph/body evidence. Never do
+  an unconstrained `Value` scan.
+- There is no source-call quota. Token reduction should come from finding the
+  evidence chain earlier.
 
 ## Setup boundary
 
-Generated config and index data stay under `.codedb-mcp`. This skill explains
-usage only.
-
-MCP command shape:
+Generated configuration and index data stay under `.codedb-mcp`. This skill is
+for using an installed server, not registering it.
 
 ```text
 <skill-root>\assets\codebase-mcp.exe --config <repo-root>\.codedb-mcp\codedb-mcp.toml mcp <repo-root>
-```
-
-## Token observation
-
-When asked to inspect Codex token usage after a run:
-
-```powershell
-node <skill-root>\scripts\codex-observe.mjs --project <repo-root> --since 24h --top 12
 ```

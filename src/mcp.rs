@@ -21,12 +21,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 const MCP_INSTRUCTIONS: &str = concat!(
-    "Use codedb_* for indexed source lookup. Start broad with unscoped codedb_flow to read the graph atlas, then choose a structural prefix and call scoped codedb_flow with the same opaque task label and path_glob. ",
-    "Atlas rows written as parent: child(count) are leaf choices: scope first to the entry leaf parent/child/**, never to the broad parent/**. Once an exact body is found, follow its qualified/tail handoffs across directories; open another scoped flow only when the current evidence has no exact next path. ",
-    "Follow exact returned paths/symbols/refs/deps/callpaths progressively. Prefer callpath/deps/symbol body before reads. A symbol body includes compact deterministic executable corridor paths, continuing without a fixed traversal depth until a real branch, terminal, or cycle. Use callpath when endpoints are known; use symbol expand=true only when the compact corridor identifies a needed branch whose bodies are still missing. When one outline shows several answer-critical members in the same file, rerun that outline once with include_connected_ranges=true, then execute one returned connected_range read instead of sequential symbol calls. That read is a complete same-file evidence closure: do not reopen contained members or overlapping ranges. Do not request connected ranges preemptively for every file. ",
-    "Follow structural roots, community boundaries, weighted bridges, literal bridge leads, and active-body qualified/tail handoffs before declaring a static gap. Follow an exact qualified call target before search or find. Do not derive keywords, synonyms, facets, morphology, language rules, or repository-specific search terms from the task. ",
-    "Never invent or probe lifecycle symbol names. Request only symbols returned verbatim by flow, outline, body handoffs, callers, search, or callpath; after one missing exact symbol in a known file, call that file's outline once instead of guessing siblings. ",
-    "There is no source-call quota, but stop when every requested phase has one active body, adjacent phases have a direct handoff or graph path, and the final readiness callback has an active body. The final endpoint body is a hard stop: answer immediately. Traverse phases once; do not return to closed phases for constants, assets, compile variants, callers, later readiness variants, or a second verification pass unless downstream evidence contradicts the chain."
+    "Use codedb_graph_query first for discovery and every cross-file continuation; never turn task wording into keywords or guessed identifiers. ",
+    "Without an anchor, query EntryFile and BoundaryFile labels plus Community metrics; do not list every File. With an exact endpoint, use incoming patterns; the planner starts from the more selective endpoint. ",
+    "Use CALLS/DISPATCHES_TO, REFERENCES, argument/parameter, branch, and shared-state edges before reading bodies. Read one exact body only for local semantics absent from graph facts. ",
+    "There is no artificial call, row, output, or token quota; reduce tokens by closing the evidence chain earlier."
 );
 
 pub fn serve(
@@ -238,58 +236,106 @@ fn tools_from_json() -> Result<Vec<Tool>, McpError> {
             None,
         ));
     };
-    serde_json::from_value(tools_value).map_err(|err| {
+    let mut tools: Vec<Tool> = serde_json::from_value(tools_value).map_err(|err| {
         McpError::internal_error(format!("failed to build codedb MCP tool list: {err}"), None)
-    })
+    })?;
+    tools.retain(|tool| mcp_tool_is_exposed(tool.name.as_ref()));
+    tools.sort_by_key(|tool| tool_priority(tool.name.as_ref()));
+    Ok(tools)
+}
+
+fn mcp_tool_is_exposed(name: &str) -> bool {
+    !matches!(
+        name,
+        "codedb_changes"
+            | "codedb_context"
+            | "codedb_diagnostics"
+            | "codedb_edit"
+            | "codedb_find"
+            | "codedb_flow"
+            | "codedb_glob"
+            | "codedb_hot"
+            | "codedb_index"
+            | "codedb_ls"
+            | "codedb_module_atlas"
+            | "codedb_projects"
+            | "codedb_query"
+            | "codedb_remote"
+            | "codedb_search"
+            | "codedb_snapshot"
+            | "codedb_tree"
+            | "codedb_word"
+            | "codedb_callpath"
+            | "codedb_callers"
+            | "codedb_deps"
+    )
+}
+
+fn tool_priority(name: &str) -> usize {
+    match name {
+        // Tool order is part of the agent-facing routing surface: graph
+        // language first, then exact source projection, then explicit health.
+        "codedb_graph_query" => 0,
+        "codedb_symbol" => 1,
+        "codedb_outline" => 2,
+        "codedb_read" => 3,
+        "codedb_status" => 4,
+        _ => usize::MAX,
+    }
 }
 
 fn tools_list() -> Value {
     json!({
         "tools": [
             {
+                "name": "codedb_graph_query",
+                "description": "Atomic Cypher-like read-only graph language: MATCH, optional SHORTEST, WHERE (=, !=, <, <=, >, >=, including property-to-property), RETURN, ORDER BY, optional LIMIT, typed directions, finite *min..max. Labels EntryFile (zero incoming, nonzero outgoing), BoundaryFile, SinkFile, Community, File, Symbol, SharedState, CallSite, Value, Parameter, Condition, ControlAction. Community properties: id/name/size/boundary_links/representative_path. File: path/community/degree/boundary_degree/incoming_degree/outgoing_degree. Main edges: CONTAINS, DEPENDS_ON(count or file_edges), CALLS, DISPATCHES_TO, REFERENCES, HAS_CALLSITE, TARGET, ARGUMENT, BINDS_TO, HAS_PARAMETER, USED_IN, TRUE, FALSE, PREVENTS, REACHES, READS, WRITES. HAS_CALLSITE retains syntax-certain qualified calls with resolution=syntax when no unique target exists; ARGUMENT remains valid, while TARGET/BINDS_TO require precise resolution. Value can be reached through ARGUMENT or seeded by an exact expression predicate.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "Cypher-like structural query over exact graph labels/properties."}}, "required": ["query"]}
+            },
+            {
                 "name": "codedb_tree",
-                "description": "Bounded tree summary; focus with path_prefix/path_glob.",
+                "description": "Internal path orientation after graph evidence or a user-provided exact path.",
                 "inputSchema": {"type": "object", "properties": {"max_depth": {"type": "integer"}, "max_results": {"type": "integer"}, "path_prefix": {"type": "string"}, "path_glob": {"type": "string"}, "include_files": {"type": "boolean"}, "full": {"type": "boolean"}, "project": {"type": "string"}}, "required": []}
             },
             {
                 "name": "codedb_outline",
-                "description": "File symbol outline with structural body candidates and literal bridge leads. If several returned members are needed, rerun once with include_connected_ranges=true to get graph-connected compact read ranges; do not enable it preemptively for every file.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "compact": {"type": "boolean"}, "skeleton": {"type": "boolean"}, "include_body_followups": {"type": "boolean"}, "include_connected_ranges": {"type": "boolean", "description": "Emit same-file call/reference connected components as exact compact read ranges; request only after the base outline shows several needed members."}, "project": {"type": "string"}}, "required": ["path"]}
+                "description": "Outline one exact file returned by graph evidence or supplied by the user. Use its real symbols instead of guessing names. If several returned members are needed, rerun once with include_connected_ranges=true to get graph-connected compact read ranges; do not enable it preemptively for every file.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "compact": {"type": "boolean"}, "skeleton": {"type": "boolean"}, "include_connected_ranges": {"type": "boolean", "description": "Emit same-file call/reference connected components only after the base outline proves several members are required."}}, "required": ["path"]}
             },
             {
                 "name": "codedb_symbol",
-                "description": "Symbol lookup; body=true returns the complete active body first plus direct/tail/literal handoffs and compact deterministic executable corridor paths until a branch, terminal, or cycle. Add expand=true only when those corridor bodies or deeper references are actually needed.",
-                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "prefix": {"type": "string"}, "pattern": {"type": "string"}, "kind": {"type": "string"}, "path": {"type": "string"}, "definition_path": {"type": "string"}, "path_glob": {"type": "string"}, "fuzzy": {"type": "boolean"}, "body": {"type": "boolean"}, "expand": {"type": "boolean", "description": "Add deep reference/continuation evidence after the complete body; default false for progressive disclosure."}, "max_results": {"type": "integer"}, "format": {"type": "string", "enum": ["text", "json"]}, "project": {"type": "string"}}, "required": []}
+                "description": "One exact symbol definition/body for local semantics. Multi-hop calls, callers, references, dispatch, arguments, guards, state, and branches belong in codedb_graph_query.",
+                "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Exact symbol name copied verbatim from graph or outline evidence."}, "kind": {"type": "string"}, "path": {"type": "string"}, "definition_path": {"type": "string"}, "path_glob": {"type": "string"}, "body": {"type": "boolean"}, "max_results": {"type": "integer"}, "format": {"type": "string", "enum": ["text", "json"]}}, "required": ["name"]}
             },
             {
                 "name": "codedb_search",
-                "description": "Definition-first lexical code search: exact/regex text, BM25, symbols, and word-trigram evidence.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "offset": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "paths_only": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string"}, "format": {"type": "string"}, "project": {"type": "string"}}, "required": ["query"]}
+                "description": "Internal lexical fallback only for an exact identifier, quoted literal, or code token copied from prior codedb evidence. Never use natural-language task words, inferred filenames, keyword bags, synonyms, or guessed lifecycle names; start analysis with codedb_graph_query.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "Exact code/literal evidence copied from a prior codedb result, not task wording."}, "max_results": {"type": "integer"}, "offset": {"type": "integer"}, "scope": {"type": "boolean"}, "compact": {"type": "boolean"}, "paths_only": {"type": "boolean"}, "regex": {"type": "boolean"}, "path_glob": {"type": "string", "description": "An exact scope returned by graph/path evidence, not a task-derived filename pattern."}, "format": {"type": "string"}, "project": {"type": "string"}}, "required": ["query"]}
             },
             {
                 "name": "codedb_word",
-                "description": "Exact identifier lookup.",
+                "description": "Exact identifier lookup for a token returned verbatim by prior codedb evidence; not a task-derived discovery entrypoint.",
                 "inputSchema": {"type": "object", "properties": {"word": {"type": "string"}, "project": {"type": "string"}}, "required": ["word"]}
             },
             {
                 "name": "codedb_callers",
-                "description": "Reference/caller sites for a symbol.",
-                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "max_results": {"type": "integer"}, "project": {"type": "string"}}, "required": ["name"]}
+                "description": "Reference/caller sites for an exact symbol returned by graph or body evidence. Use only when runtime ownership or direction remains unresolved.",
+                "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["name"]}
             },
             {
                 "name": "codedb_callpath",
-                "description": "Generic symbol-reference path.",
-                "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "from_path": {"type": "string"}, "to_path": {"type": "string"}, "from_line": {"type": "integer"}, "to_line": {"type": "integer"}, "max_hops": {"type": "integer"}, "project": {"type": "string"}}, "required": ["from", "to"]}
+                "description": "Preferred atomic graph chain when exact endpoint symbols are already known. A found path includes active bodies; do not re-read its nodes unless a concrete gap remains.",
+                "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "from_path": {"type": "string"}, "to_path": {"type": "string"}, "from_line": {"type": "integer"}, "to_line": {"type": "integer"}, "max_hops": {"type": "integer"}}, "required": ["from", "to"]}
             },
             {
                 "name": "codedb_context",
-                "description": "Graph atlas without path_glob; scoped structural roots, community boundaries, weighted bridges, calls, and optional snippets with path_glob. Task text is an opaque label.",
+                "description": "Internal compatibility context pack for an already selected exact scope. Use codedb_graph_query for new source analysis.",
                 "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "max_tokens": {"type": "integer"}, "max_chars": {"type": "integer"}, "max_files": {"type": "integer"}, "path_glob": {"type": "string"}, "include_deps": {"type": "boolean"}, "include_snippets": {"type": "boolean"}, "snippet_radius": {"type": "integer"}, "snippets_per_file": {"type": "integer"}, "include_inventory": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["task"]}
             },
             {
                 "name": "codedb_flow",
-                "description": "Graph atlas without path_glob; scoped structural roots, community boundaries, weighted bridges, calls, and bodies with path_glob. Task text is an opaque label.",
-                "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "max_tokens": {"type": "integer"}, "max_chars": {"type": "integer"}, "max_files": {"type": "integer"}, "path_glob": {"type": "string"}, "include_inventory": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["task"]}
+                "description": "Internal compatibility flow atlas. MCP source analysis uses codedb_graph_query instead.",
+                "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "max_tokens": {"type": "integer"}, "max_chars": {"type": "integer"}, "max_files": {"type": "integer"}, "path_glob": {"type": "string"}, "include_inventory": {"type": "boolean"}}, "required": ["task"]}
             },
             {
                 "name": "codedb_module_atlas",
@@ -308,13 +354,13 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_deps",
-                "description": "File dependencies or reverse dependencies.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "direction": {"type": "string", "enum": ["imported_by", "depends_on"]}, "transitive": {"type": "boolean"}, "max_depth": {"type": "integer"}, "project": {"type": "string"}}, "required": ["path"]}
+                "description": "Graph continuation for an exact file returned by prior evidence: forward or reverse dependencies, optionally transitive.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "direction": {"type": "string", "enum": ["imported_by", "depends_on"]}, "transitive": {"type": "boolean"}, "max_depth": {"type": "integer"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_read",
-                "description": "Read one exact file or line range. Use a connected range command returned by outline as a complete same-file evidence closure; do not reopen its contained members individually.",
-                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "connected_range": {"type": "boolean", "description": "Read the full active-code connected component without the ordinary compact-line cap and emit a closure marker; use only with a range returned by codedb_outline include_connected_ranges=true."}, "include_symbol_leads": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["path"]}
+                "description": "Read one exact graph-returned file/range when no symbol body fits. A connected range closes same-file source; use codedb_graph_query for outgoing calls, dispatch, argument binding, branch facts, shared state, and exact call-site guards instead of preview text or sequential wrapper reads.",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}, "if_hash": {"type": "string"}, "compact": {"type": "boolean"}, "connected_range": {"type": "boolean", "description": "Read the full active-code connected component, emit a closure marker, retain exact cross-file outgoing handoffs, and show exact incoming callers with call-site preprocessor guards; use only with a range returned by codedb_outline include_connected_ranges=true."}, "include_symbol_leads": {"type": "boolean"}}, "required": ["path"]}
             },
             {
                 "name": "codedb_edit",
@@ -328,8 +374,8 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_status",
-                "description": "Index status.",
-                "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": []}
+                "description": "Index health only when the user asks about setup, freshness, or diagnostics. The server is already bound to its repository; never call status before source analysis.",
+                "inputSchema": {"type": "object", "properties": {}, "required": []}
             },
             {
                 "name": "codedb_snapshot",
@@ -343,7 +389,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_projects",
-                "description": "Loaded projects.",
+                "description": "Administrative project listing only when the user explicitly asks. A normal MCP server is already bound to the target repository; never call this before source analysis.",
                 "inputSchema": {"type": "object", "properties": {}, "required": []}
             },
             {
@@ -353,22 +399,22 @@ fn tools_list() -> Value {
             },
             {
                 "name": "codedb_find",
-                "description": "Fuzzy path search.",
-                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["query"]}
+                "description": "Internal fuzzy path resolution only for a user-provided path hint or an exact path fragment returned by codedb evidence. Never derive filenames from the task; start analysis with codedb_graph_query.",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "User-provided or evidence-returned path fragment, not task wording."}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "project": {"type": "string"}}, "required": ["query"]}
             },
             {
                 "name": "codedb_query",
-                "description": "Composable lookup pipeline.",
+                "description": "Administrative composable pipeline. Prefer atomic graph tools for source analysis.",
                 "inputSchema": {"type": "object", "properties": {"pipeline": {"type": "array", "items": {"type": "object"}}, "project": {"type": "string"}}, "required": ["pipeline"]}
             },
             {
                 "name": "codedb_glob",
-                "description": "Glob indexed paths with central summaries.",
-                "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "include_paths": {"type": "boolean"}, "include_actionable_leads": {"type": "boolean"}, "summary_limit": {"type": "integer"}, "project": {"type": "string"}}, "required": ["pattern"]}
+                "description": "Internal exact user-provided or graph-returned path pattern resolution. Never infer filename keywords from the task; start source analysis with codedb_graph_query.",
+                "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Exact user-provided or evidence-returned path pattern, not a task-derived keyword glob."}, "max_results": {"type": "integer"}, "include_symbols": {"type": "boolean"}, "include_paths": {"type": "boolean"}, "include_actionable_leads": {"type": "boolean"}, "summary_limit": {"type": "integer"}, "project": {"type": "string"}}, "required": ["pattern"]}
             },
             {
                 "name": "codedb_ls",
-                "description": "List one directory.",
+                "description": "List one exact user-provided or graph-returned directory. Never use for broad walking or as the first source call.",
                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "project": {"type": "string"}}, "required": []}
             }
         ]
@@ -381,13 +427,121 @@ mod tests {
 
     #[test]
     fn bundle_is_not_exposed_as_an_mcp_tool() {
-        let tools = tools_list();
-        let bundle = tools["tools"]
-            .as_array()
-            .unwrap()
+        let tools = tools_from_json().unwrap();
+        let bundle = tools
             .iter()
-            .find(|tool| tool["name"] == "codedb_bundle");
+            .find(|tool| tool.name.as_ref() == "codedb_bundle");
 
         assert!(bundle.is_none());
+    }
+
+    #[test]
+    fn composite_and_administrative_tools_stay_internal() {
+        let tools = tools_from_json().unwrap();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+
+        for internal in [
+            "codedb_callers",
+            "codedb_callpath",
+            "codedb_changes",
+            "codedb_context",
+            "codedb_deps",
+            "codedb_diagnostics",
+            "codedb_edit",
+            "codedb_find",
+            "codedb_flow",
+            "codedb_glob",
+            "codedb_hot",
+            "codedb_index",
+            "codedb_ls",
+            "codedb_module_atlas",
+            "codedb_projects",
+            "codedb_query",
+            "codedb_remote",
+            "codedb_search",
+            "codedb_snapshot",
+            "codedb_tree",
+            "codedb_word",
+        ] {
+            assert!(!names.contains(&internal), "{internal} must stay internal");
+        }
+    }
+
+    #[test]
+    fn graph_language_replaces_graph_wrapper_tools() {
+        let tools = tools_from_json().unwrap();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names[0], "codedb_graph_query");
+        assert_eq!(names[1], "codedb_symbol");
+        assert_eq!(names.last().copied(), Some("codedb_status"));
+        assert_eq!(names.len(), 5);
+    }
+
+    #[test]
+    fn exposed_tools_are_repository_bound_and_symbol_lookup_is_exact() {
+        let tools = tools_from_json().unwrap();
+        for tool in &tools {
+            let value = serde_json::to_value(tool).unwrap();
+            assert!(value["inputSchema"]["properties"]["project"].is_null());
+        }
+        let symbol = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "codedb_symbol")
+            .unwrap();
+        let value = serde_json::to_value(symbol).unwrap();
+        let properties = &value["inputSchema"]["properties"];
+        assert!(properties["pattern"].is_null());
+        assert!(properties["prefix"].is_null());
+        assert!(properties["expand"].is_null());
+        assert_eq!(value["inputSchema"]["required"][0], "name");
+
+        let outline = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "codedb_outline")
+            .unwrap();
+        let value = serde_json::to_value(outline).unwrap();
+        assert!(value["inputSchema"]["properties"]["include_body_followups"].is_null());
+    }
+
+    #[test]
+    fn lexical_tools_reject_task_derived_discovery_in_their_contracts() {
+        let tools = tools_list();
+        let by_name = |name: &str| {
+            tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+        };
+
+        assert!(
+            by_name("codedb_search")["description"]
+                .as_str()
+                .unwrap()
+                .contains("prior codedb evidence")
+        );
+        assert!(
+            by_name("codedb_find")["description"]
+                .as_str()
+                .unwrap()
+                .contains("Never derive filenames from the task")
+        );
+        assert!(
+            by_name("codedb_glob")["description"]
+                .as_str()
+                .unwrap()
+                .contains("codedb_graph_query")
+        );
+        assert!(MCP_INSTRUCTIONS.contains("Use codedb_graph_query first"));
+        assert!(MCP_INSTRUCTIONS.contains("more selective endpoint"));
+        assert!(MCP_INSTRUCTIONS.contains("no artificial call"));
     }
 }

@@ -2,29 +2,43 @@
 
 [English version](CHANGELOG.md)
 
-## Unreleased - 2026-07-23
+## Unreleased - 2026-07-24
 
 ### 变更
 
 - 从 runtime 和 cache schema 中删除 Model2Vec、semantic units、vector store、embedding 配置、模型下载和 `embeddings.bin`。
-- 项目 cache 升级到 v28，保留 graph、dependency、exact text、word、caller、outline 和 BM25 sidecar。
-- 将 `codedb_flow` / `codedb_context` 改成无查询模型的纯图工作流：无 scope 时返回 compact atlas；有 scope 时选择结构根和 community 边界，运行带 hub cost 的结构 seed PPR，通过 weighted shortest path 连接锚点，再渐进披露精确调用、依赖和 body 证据。
+- 项目 cache 升级到 v32；重新索引 C# field declaration，用于 receiver type 和 shared-state 消歧，同时保留 graph、dependency、exact text、word、caller、outline 和 BM25 sidecar。
+- 新增原子只读 `codedb_graph_query` MCP 工具，支持 Cypher-like `MATCH / SHORTEST / WHERE / RETURN / ORDER BY / LIMIT` 子集、标量/属性比较、typed directed edge、有限变长路径、确定性 projection 和双向 shortest connector planner。
+- 新增 lazy property-graph facts：precise call、interface dispatch、call site、argument、parameter binding、condition、control action、call-site preprocessor guard、shared-state read/write。
+- 新增可查询的 `Community` 节点、`Community-CONTAINS-File`、community 聚合依赖，以及可排序的 file degree/boundary/incoming/outgoing 指标；无锚点发现和聚类改走图查询语言。
+- 新增拓扑标签 `EntryFile`、`BoundaryFile`、`SinkFile`，无锚点发现直接查询较小的结构候选类，不再投影数千个文件。
+- 从 MCP 暴露面移除 flow、caller、call-path 和 dependency wrapper；对应图操作统一由 `codedb_graph_query` 表达，兼容命令保留为 CLI/internal。
 - 从打包 skill 删除关键词、同义词、词形、语言和调用配额指导。多阶段问题可以继续使用 scoped 图投影，直到证据链闭合。
-- 吸收 `neug` 的图查询思路：常驻 CSR 文件邻接、正反 dependency view、按真实邻接成本选择双向 frontier、父链路径重建、dependency corridor，以及遇到分叉/终点/环才停止而不是固定深度的 deterministic executable call corridor。
+- 吸收 `neug` 的查询分层：pattern binding、普通/递归 expand、filter、projection、正反 view、双向 connector search 和确定性路径重建。
+- 新增 selective-endpoint path planning：右端有精确 target 的 pattern 会反向执行、再按原方向投影，避免从左端做全局扫描。Incoming `REFERENCES` 现在可解析 `UIDefine.MainPanel` 这类 qualified member fact。
+- 从 runtime 源码输出移除 dispatch preview、contracted leaf corridor、parameter/control 文案和 branch-ledger prompt；等价证据改由图节点和边查询。
+- 收紧 MCP 原子 schema：`codedb_symbol` 不再暴露复合 `expand`，`codedb_outline` 不再暴露 body-followup 扩展。
 - MCP 操作保持原子化：`codedb_bundle` 仍为内部实现，不对 MCP 暴露。`codedb_outline include_connected_ranges=true` 可以把同文件 call/reference component 投影为一次显式 `connected_range=true` read；该 read 是完整 active-code 闭包，不再扩展另一组 leads。
 
 ### 修复
 
 - 修复 continuation 递归时反复展开原始 symbol、没有沿下一跳继续的问题。
 - 修复 callpath 中由注释、字符串、同行重复 identifier、optional 参数、局部同名方法以及无法解析的显式 qualifier 引入的假边。
+- 不再把无法消歧的 collection `Add`/`Sort` 等 qualified call 连接到全仓库数百个同名 symbol；ambiguous fallback 不再作为 precise `CALLS` 边。
+- 修复 C# `variable_declaration` 遍历，普通 field 现在会被索引，而不只依赖特殊 recovery。
+- callee target 无法唯一解析时，仍保留语法确定的 qualified callsite 及其参数。这类节点标记为 `resolution="syntax"`；只有精确 target 才提供 `TARGET` 和 `BINDS_TO`，既不伪造调用边，也不丢失事件/监听参数证据。
 - callpath corridor 不再每次重建完整 dependency `HashMap<BTreeSet<_>>`，改为遍历已有正反 dependency 索引，并只缓存实际访问的邻接行。
 
 ### Benchmark 与验证
 
-- Rust 测试扩展到 68 项全部通过，覆盖 deterministic 多跳 continuation、connected member range、qualified callpath、optional 参数和假边回归。
-- 重跑“启动到主界面” MCP/no-MCP：122,851 vs 224,922 effective tokens，414.6s vs 732.8s，工具输出字符 244,291 vs 742,368。
-- 完成大地图行军、英雄属性/战力、联盟集结的同模型参考样本。已完成 MCP 样本相对 RG control 的 effective tokens 低 8.8-12.6%，工具输出字符低 23.0-53.3%；宽场景调用数和收敛仍有波动。
+- Rust 测试扩展到 96 项全部通过，覆盖 selective-endpoint query planning、incoming qualified-member reference、exact argument-value seed、拓扑标签、ordering/property comparison、community/file 指标、shortest connector、call/dispatch/guard、argument binding、branch `PREVENTS/REACHES`、shared-state join、C# field 和假边回归。
+- 在真实 Unity 索引验证资源更新场景：查询链能到达 `YooAssets -> ResourcePackage -> IPlayModeServices -> HostPlayModeImpl`；mini filter 的 true 分支 `continue` 并阻断 `downloadList.Add`，lazy-tag 的取反条件在 false 分支到达 `Add`；`InitLazyTag` 把 `new[]{ downloader.LazyTag }` 绑定到 `tags`。
+- 保留 property-query 改造前已完成的“启动到主界面” MCP/no-MCP 历史基线：122,851 vs 224,922 effective tokens，414.6s vs 732.8s，工具输出字符 244,291 vs 742,368；它不是新图查询 planner 的成绩。
+- 保留 property-query 改造前的大地图行军、英雄属性/战力、联盟集结同模型参考样本。已完成 MCP 样本相对 RG control 的 effective tokens 低 8.8-12.6%，工具输出字符低 23.0-53.3%；宽场景调用数和收敛仍有波动。
 - Codex 在最后一次合并重跑中途开始拒绝账号使用 `gpt-5.6-sol`；没有 usage 的失败 turn 被排除，没有当成 benchmark 胜利。
+- 排除 2026-07-24 一次达到 20 分钟超时的图语言启动诊断。trace 显示两条 reverse graph pattern 没有从精确 target 规划，随后退化为 104 次顺序 symbol read；上面的 planner/reference/schema 修复针对该失败模式，但中止样本不作为 benchmark 成绩。
+- 排除 reverse-query 修复后的第二次 15 分钟诊断。symbol 输出已下降，但一次无锚点 5,000-file projection 主导了 graph 输出；上面的拓扑标签针对该 trace。中止样本不作为 benchmark 成绩。
+- 排除加入拓扑发现后的第三次 12 分钟诊断。它已经到达具体的 `EventDefine.OnInitEnd` 交接点，但在通过重复 symbol read 反查参数使用时停滞；现在可用精确 `Value.expression` seed 直接完成该反查。中止样本不作为 benchmark 成绩。
 
 ## 0.5.0 - 2026-06-03
 
